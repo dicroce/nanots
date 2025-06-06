@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NanoTS - High-Performance Embedded Time-Series Database</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        header {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 2px 20px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0;
+        }
+
+        .logo {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #667eea;
+            text-decoration: none;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            text-decoration: none;
+            color: #333;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+
+        .nav-links a:hover {
+            color: #667eea;
+        }
+
+        .hero {
+            padding: 6rem 0 4rem;
+            text-align: center;
+            color: white;
+        }
+
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .hero .subtitle {
+            font-size: 1.3rem;
+            margin-bottom: 2rem;
+            opacity: 0.9;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 24px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: white;
+            color: #667eea;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 2px solid white;
+        }
+
+        .btn-secondary:hover {
+            background: white;
+            color: #667eea;
+        }
+
+        .section {
+            padding: 4rem 0;
+            background: white;
+        }
+
+        .section:nth-child(even) {
+            background: #f8f9fa;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 3rem;
+            color: #333;
+        }
+
+        .performance-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+            margin-bottom: 3rem;
+        }
+
+        .performance-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 2rem;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .performance-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .performance-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .performance-label {
+            font-size: 1rem;
+            opacity: 0.9;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+
+        .feature-card {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            border-left: 4px solid #667eea;
+            transition: transform 0.3s ease;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-3px);
+        }
+
+        .feature-icon {
+            font-size: 2rem;
+            margin-bottom: 1rem;
+        }
+
+        .feature-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: #333;
+        }
+
+        .code-section {
+            background: #1a1a1a;
+            color: #f8f8f2;
+            padding: 4rem 0;
+        }
+
+        .code-container {
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            margin-top: 2rem;
+        }
+
+        .code-block {
+            background: #2d2d2d;
+            border-radius: 8px;
+            padding: 1.5rem;
+            overflow-x: auto;
+            border: 1px solid #404040;
+        }
+
+        .code-title {
+            color: #667eea;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            font-size: 1.1rem;
+        }
+
+        .code-block pre {
+            color: #f8f8f2;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            white-space: pre;
+            overflow-x: auto;
+            margin: 0;
+        }
+
+        .code-block code {
+            white-space: pre;
+        }
+
+        .use-cases {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+        }
+
+        .use-case {
+            text-align: center;
+            padding: 2rem;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .use-case:hover {
+            transform: translateY(-3px);
+        }
+
+        .use-case-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .use-case-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: #333;
+        }
+
+        .architecture-diagram {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            margin: 2rem 0;
+            text-align: center;
+        }
+
+        .diagram {
+            font-family: monospace;
+            background: #f8f9fa;
+            padding: 1.5rem;
+            border-radius: 8px;
+            border: 2px solid #e9ecef;
+            overflow-x: auto;
+        }
+
+        footer {
+            background: #1a1a1a;
+            color: white;
+            padding: 3rem 0;
+            text-align: center;
+        }
+
+        .footer-content {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .footer-section h3 {
+            color: #667eea;
+            margin-bottom: 1rem;
+        }
+
+        .footer-section a {
+            color: #ccc;
+            text-decoration: none;
+            display: block;
+            margin-bottom: 0.5rem;
+        }
+
+        .footer-section a:hover {
+            color: #667eea;
+        }
+
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+
+
+            .cta-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <nav class="container">
+            <a href="#" class="logo">NanoTS</a>
+            <ul class="nav-links">
+                <li><a href="#features">Features</a></li>
+                <li><a href="#performance">Performance</a></li>
+                <li><a href="#quickstart">Quick Start</a></li>
+                <li><a href="#architecture">Architecture</a></li>
+                <li><a href="#faq">FAQ</a></li>
+            </ul>
+        </nav>
+    </header>
+
+    <section class="hero">
+        <div class="container">
+            <h1>NanoTS</h1>
+            <p class="subtitle">High-Performance, Embedded Time-Series Database<br>
+            Optimized for real-time streaming applications like video, finance, and IoT sensor data</p>
+            <div class="cta-buttons">
+                <a href="https://github.com/dicroce/nanots" class="btn btn-primary">View on GitHub</a>
+                <a href="#quickstart" class="btn btn-secondary">Get Started</a>
+            </div>
+        </div>
+    </section>
+
+    <section id="performance" class="section">
+        <div class="container">
+            <h2 class="section-title">Blazing Fast Performance</h2>
+            <div class="performance-grid">
+                <div class="performance-card">
+                    <div class="performance-number">8.83μs</div>
+                    <div class="performance-label">Write time on SSD</div>
+                </div>
+                <div class="performance-card">
+                    <div class="performance-number">113K+</div>
+                    <div class="performance-label">Writes/second sustained</div>
+                </div>
+                <div class="performance-card">
+                    <div class="performance-number">&lt;1μs</div>
+                    <div class="performance-label">Read time on SSD</div>
+                </div>
+                <div class="performance-card">
+                    <div class="performance-number">Lock-free</div>
+                    <div class="performance-label">Storage data structure</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="features" class="section">
+        <div class="container">
+            <h2 class="section-title">Key Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3 class="feature-title">Ultra-Fast Writes</h3>
+                    <p>Memory-mapped storage with lock-free data structures enables maximum throughput with sub-microsecond performance.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔧</div>
+                    <h3 class="feature-title">Configurable Durability</h3>
+                    <p>Trade-off between performance and data safety with configurable block sizes to match your application needs.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔄</div>
+                    <h3 class="feature-title">Crash Recovery</h3>
+                    <p>Automatic detection and recovery from unexpected shutdowns with frame-level atomicity guarantees.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💾</div>
+                    <h3 class="feature-title">Preallocated Storage</h3>
+                    <p>Avoid filesystem fragmentation and administration hassles with auto-recycle mode for continuous operation.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔀</div>
+                    <h3 class="feature-title">Multiple Streams</h3>
+                    <p>Store different data streams in the same database file with independent write contexts and iterators.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔓</div>
+                    <h3 class="feature-title">Open Source</h3>
+                    <p>Free for commercial and non-commercial use under the Apache 2.0 license.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="quickstart" class="code-section">
+        <div class="container">
+            <h2 class="section-title" style="color: white;">Quick Start</h2>
+            <div class="code-container">
+                <div class="code-block">
+                    <div class="code-title">Building</div>
+                    <pre><code>Simply copy the 4 source files from the amalgamated_src/ dir into your projects source directories and add them to your build.
+Or use CMake to build as a static library and link it.</code></pre>
+                </div>
+                <div class="code-block">
+                    <div class="code-title">Writing Data</div>
+                    <pre><code>#include "nanots.h"
+
+// Create database with 1MB blocks, 16 total blocks
+nanots_writer::allocate("video.nts", 1024*1024, 16);
+
+// Open the db in auto recycle mode
+nanots_writer db("video.nts", true);
+
+// Create write context for a stream
+auto wctx = db.create_write_context("camera_1", "stream metadata");
+
+// Write frames
+uint8_t frame_data[] = {/* video frame bytes */};
+db.write(wctx, frame_data, sizeof(frame_data), timestamp_us, flags);</code></pre>
+                </div>
+                <div class="code-block">
+                    <div class="code-title">Reading Data</div>
+                    <pre><code>#include "nanots.h"
+
+// Create iterator for a stream
+nanots_iterator iter("video.nts", "camera_1");
+
+// Iterate through all frames
+while (iter.valid()) {
+    auto& frame = *iter;
+    process_frame(frame.data, frame.size, frame.timestamp, frame.flags);
+    ++iter;
+}
+
+// Or seek to specific timestamp
+if (iter.find(target_timestamp)) {
+    // Found first frame >= target_timestamp
+    auto& frame = *iter;
+    // ... process frame
+}</code></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="architecture" class="section">
+        <div class="container">
+            <h2 class="section-title">Architecture</h2>
+            <div class="architecture-diagram">
+                <h3>Storage Layout</h3>
+                <div class="diagram">
+                    <pre>
+    ┌─────────────┬─────────────┬─────────────┬─────────────┐
+    │File Header  │   Block 1   │   Block 2   │   Block N   │
+    │   (64KB)    │   (1MB+)    │   (1MB+)    │   (1MB+)    │
+    └─────────────┴─────────────┴─────────────┴─────────────┘
+                /                  \
+                /                     \
+    ┌─────────────┬─────────────────┬──────────────────────────┐
+    │Block Header │   Block Index   │        Block Data        │
+    │ (16 bytes)  │   (variable) -> │      <- (variable)       │
+    └─────────────┴─────────────────┴──────────────────────────┘
+                    </pre>
+                </div>
+                <p style="margin-top: 1rem; color: #666;">
+                    Hybrid approach combining SQLite for metadata with memory-mapped binary files for data.
+                    Block size is configurable and tunable for different applications.
+                </p>
+            </div>
+        </div>
+    </section>
+
+    <section class="section">
+        <div class="container">
+            <h2 class="section-title">Use Cases</h2>
+            <div class="use-cases">
+                <div class="use-case">
+                    <div class="use-case-icon">🎥</div>
+                    <h3 class="use-case-title">Video Streaming</h3>
+                    <p>Store video frames with microsecond timestamps, handle variable frame sizes, and seek to specific time positions for playback.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">📊</div>
+                    <h3 class="use-case-title">IoT Sensor Data</h3>
+                    <p>High-frequency sensor readings, efficient storage of numeric telemetry, and time-based queries and analysis.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">💰</div>
+                    <h3 class="use-case-title">Financial Data</h3>
+                    <p>Trade tick data with microsecond precision, market data replay systems, and low-latency historical queries.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="faq" class="section">
+        <div class="container">
+            <h2 class="section-title">Frequently Asked Questions</h2>
+            <div style="max-width: 800px; margin: 0 auto;">
+                <div style="margin-bottom: 2rem; padding: 1.5rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                    <h3 style="color: #667eea; margin-bottom: 1rem;">How durable is NanoTS?</h3>
+                    <p>Durability is configurable through block sizes. Writers sync to disk during block transitions. Smaller blocks provide better durability but may slow writes due to contention. We recommend starting with large blocks (50MB) and adjusting as needed.</p>
+                </div>
+                <div style="margin-bottom: 2rem; padding: 1.5rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                    <h3 style="color: #667eea; margin-bottom: 1rem;">How many writers and readers are supported?</h3>
+                    <p>NanoTS allows any number of writing threads as long as each writes to its own logical stream, plus any number of read threads (1 writer per stream + N readers).</p>
+                </div>
+                <div style="margin-bottom: 2rem; padding: 1.5rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                    <h3 style="color: #667eea; margin-bottom: 1rem;">What about pre-allocated storage?</h3>
+                    <p>NanoTS pre-allocates storage space, which prevents server downtime from disk space issues, enables recycling of oldest data when full, and eliminates filesystem fragmentation concerns.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h3>NanoTS</h3>
+                    <p>High-performance embedded time-series database for real-time applications.</p>
+                </div>
+                <div class="footer-section">
+                    <h3>Links</h3>
+                    <a href="https://github.com/dicroce/nanots">GitHub Repository</a>
+                    <a href="https://github.com/dicroce/nanots/releases">Releases</a>
+                    <a href="https://github.com/dicroce/nanots/issues">Issues</a>
+                </div>
+                <div class="footer-section">
+                    <h3>Support</h3>
+                    <a href="mailto:dicroce@gmail.com">Contact: dicroce@gmail.com</a>
+                    <a href="https://github.com/dicroce/nanots/discussions">Discussions</a>
+                </div>
+            </div>
+            <div style="border-top: 1px solid #333; padding-top: 2rem; margin-top: 2rem;">
+                <p>&copy; 2025 NanoTS. Licensed under Apache 2.0.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // Smooth scrolling for navigation links
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+
+        // Add scroll effect to performance cards
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.style.opacity = '1';
+                    entry.target.style.transform = 'translateY(0)';
+                }
+            });
+        }, observerOptions);
+
+        // Initially hide cards for animation
+        document.querySelectorAll('.performance-card, .feature-card, .use-case').forEach(card => {
+            card.style.opacity = '0';
+            card.style.transform = 'translateY(20px)';
+            card.style.transition = 'opacity 0.6s ease, transform 0.6s ease';
+            observer.observe(card);
+        });
+    </script>
+</body>
+</html>

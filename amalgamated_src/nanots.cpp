@@ -949,7 +949,7 @@ static void _validate_blocks(const std::string& file_name) {
       "SELECT sb.id, sb.block_idx, sb.uuid, s.stream_tag "
       "FROM segment_blocks sb "
       "JOIN segments s ON sb.segment_id = s.id "
-      "WHERE sb.end_ts = 0");
+      "WHERE sb.end_timestamp = 0");
 
   for (auto& row : result) {
     int block_idx = std::stoi(row["block_idx"].value());
@@ -971,7 +971,7 @@ static void _validate_blocks(const std::string& file_name) {
     int last_valid = -1;
     for (int i = n_valid_indexes - 1; i >= 0; i--) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
-      uint64_t timestamp = *(uint64_t*)index_p;
+      int64_t timestamp = *(int64_t*)index_p;
       uint32_t offset = *(uint32_t*)(index_p + 8);
 
       if (timestamp == 0 || offset == 0)
@@ -1000,11 +1000,11 @@ static void _validate_blocks(const std::string& file_name) {
       nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
         uint8_t* last_index_p =
             block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
-        uint64_t actual_last_ts = *(uint64_t*)last_index_p;
+        int64_t actual_last_timestamp = *(int64_t*)last_index_p;
         auto stmt = conn.prepare(
-            "UPDATE segment_blocks SET end_ts = ? WHERE block_idx = ? AND uuid "
+            "UPDATE segment_blocks SET end_timestamp = ? WHERE block_idx = ? AND uuid "
             "= ?");
-        stmt.bind(1, actual_last_ts)
+        stmt.bind(1, actual_last_timestamp)
             .bind(2, block_idx)
             .bind(3, uuid_hex)
             .exec_no_result();
@@ -1053,13 +1053,13 @@ static void _upgrade_db(const nts_sqlite_conn& conn) {
 
 static std::optional<block> _db_reclaim_oldest_used_block(
     const nts_sqlite_conn& conn) {
-  // Find oldest finalized segment_block (end_ts != 0)
+  // Find oldest finalized segment_block (end_timestamp != 0)
   auto result = conn.exec(
       "SELECT sb.block_id, b.idx, sb.id as segment_block_id, b.status "
       "FROM segment_blocks sb "
       "JOIN blocks b ON sb.block_id = b.id "
-      "WHERE sb.end_ts != 0 AND (b.status = 'used' OR b.status = 'reserved') "
-      "ORDER BY sb.end_ts ASC, b.reserved_at ASC "
+      "WHERE sb.end_timestamp != 0 AND (b.status = 'used' OR b.status = 'reserved') "
+      "ORDER BY sb.end_timestamp ASC, b.reserved_at ASC "
       "LIMIT 1");
 
   if (result.empty())
@@ -1120,8 +1120,8 @@ static std::optional<segment_block> _db_create_segment_block(
     int sequence,
     int block_id,
     int block_idx,
-    uint64_t start_ts,
-    uint64_t end_ts,
+    int64_t start_timestamp,
+    int64_t end_timestamp,
     const uint8_t* uuid) {
   auto stmt = conn.prepare(
       "INSERT INTO segment_blocks ("
@@ -1129,8 +1129,8 @@ static std::optional<segment_block> _db_create_segment_block(
       "sequence, "
       "block_id, "
       "block_idx, "
-      "start_ts, "
-      "end_ts, "
+      "start_timestamp, "
+      "end_timestamp, "
       "uuid"
       ") VALUES (?, ?, ?, ?, ?, ?, ?)");
 
@@ -1140,8 +1140,8 @@ static std::optional<segment_block> _db_create_segment_block(
       .bind(2, sequence)
       .bind(3, block_id)
       .bind(4, block_idx)
-      .bind(5, start_ts)
-      .bind(6, end_ts)
+      .bind(5, start_timestamp)
+      .bind(6, end_timestamp)
       .bind(7, hex_uuid)
       .exec_no_result();
 
@@ -1151,8 +1151,8 @@ static std::optional<segment_block> _db_create_segment_block(
   sb.sequence = sequence;
   sb.block_id = block_id;
   sb.block_idx = block_idx;
-  sb.start_ts = start_ts;
-  sb.end_ts = end_ts;
+  sb.start_timestamp = start_timestamp;
+  sb.end_timestamp = end_timestamp;
   memcpy(sb.uuid, uuid, 16);
 
   return sb;
@@ -1160,8 +1160,8 @@ static std::optional<segment_block> _db_create_segment_block(
 
 static void _db_finalize_block(const nts_sqlite_conn& conn,
                                int segment_block_id,
-                               uint64_t timestamp) {
-  auto stmt = conn.prepare("UPDATE segment_blocks SET end_ts = ? WHERE id = ?");
+                               int64_t timestamp) {
+  auto stmt = conn.prepare("UPDATE segment_blocks SET end_timestamp = ? WHERE id = ?");
   stmt.bind(1, timestamp).bind(2, segment_block_id).exec_no_result();
 }
 
@@ -1174,11 +1174,11 @@ static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
   conn.exec(query);
 }
 
-static void _recycle_block(write_context& wctx, uint64_t timestamp) {
+static void _recycle_block(write_context& wctx, int64_t timestamp) {
   uint8_t* p = (uint8_t*)wctx.mm.map();
 
   // write the new timestamp
-  *(uint64_t*)p = timestamp;
+  *(int64_t*)p = timestamp;
   p += sizeof(uint64_t);
 
   uint32_t old_n_valid_indexes = *(uint32_t*)p;
@@ -1201,12 +1201,12 @@ static void _recycle_block(write_context& wctx, uint64_t timestamp) {
 }
 
 write_context::~write_context() {
-  if (last_ts && current_block) {
+  if (last_timestamp && current_block) {
     auto db_name = _database_name(file_name);
     nts_sqlite_conn conn(db_name, true, true);
 
     nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
-      _db_finalize_block(conn, current_block->id, last_ts.value());
+      _db_finalize_block(conn, current_block->id, last_timestamp.value());
     });
   }
 }
@@ -1257,9 +1257,9 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
 void nanots_writer::write(write_context& wctx,
                           const uint8_t* data,
                           size_t size,
-                          uint64_t timestamp,
+                          int64_t timestamp,
                           uint8_t flags) {
-  if (wctx.last_ts && timestamp <= wctx.last_ts.value())
+  if (wctx.last_timestamp && timestamp <= wctx.last_timestamp.value())
     throw std::runtime_error("r_nanots: timestamp is not monotonic.");
 
   if (size >
@@ -1323,7 +1323,7 @@ void nanots_writer::write(write_context& wctx,
     wctx.mm.flush(wctx.mm.map(), _block_size, true);
 
     nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
-      _db_finalize_block(conn, wctx.current_block->id, wctx.last_ts.value());
+      _db_finalize_block(conn, wctx.current_block->id, wctx.last_timestamp.value());
     });
 
     wctx.current_block = std::nullopt;
@@ -1340,19 +1340,19 @@ void nanots_writer::write(write_context& wctx,
 
   uint8_t* index_p =
       block_p + BLOCK_HEADER_SIZE + (n_valid_indexes * INDEX_ENTRY_SIZE);
-  *(uint64_t*)index_p = timestamp;
+  *(int64_t*)index_p = timestamp;
   *(uint32_t*)(index_p + 8) = new_block_ofs;
 
   FULL_MEM_BARRIER();
 
   (*(uint32_t*)(block_p + 8))++;
 
-  wctx.last_ts = timestamp;
+  wctx.last_timestamp = timestamp;
 }
 
 void nanots_writer::free_blocks(const std::string& stream_tag,
-                                uint64_t start_ts,
-                                uint64_t end_ts) {
+                                int64_t start_timestamp,
+                                int64_t end_timestamp) {
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn conn(db_name, true, true);
 
@@ -1363,11 +1363,11 @@ void nanots_writer::free_blocks(const std::string& stream_tag,
         "FROM segment_blocks sb "
         "JOIN segments s ON sb.segment_id = s.id "
         "WHERE s.stream_tag = ? "
-        "AND sb.start_ts >= ? "
-        "AND sb.end_ts <= ? "
-        "AND sb.end_ts != 0");
+        "AND sb.start_timestamp >= ? "
+        "AND sb.end_timestamp <= ? "
+        "AND sb.end_timestamp != 0");
     auto blocks_to_delete =
-        stmt.bind(1, stream_tag).bind(2, start_ts).bind(3, end_ts).exec();
+        stmt.bind(1, stream_tag).bind(2, start_timestamp).bind(3, end_timestamp).exec();
 
     for (auto& block_row : blocks_to_delete) {
       int segment_block_id = std::stoi(block_row["segment_block_id"].value());
@@ -1451,8 +1451,8 @@ void nanots_writer::allocate(const std::string& file_name,
       "sequence INTEGER, "
       "block_id INTEGER, "
       "block_idx INTEGER, "
-      "start_ts INTEGER, "
-      "end_ts INTEGER, "
+      "start_timestamp INTEGER, "
+      "end_timestamp INTEGER, "
       "uuid STRING, "
       "FOREIGN KEY (segment_id) REFERENCES segments(id)"
       ");";
@@ -1477,7 +1477,7 @@ void nanots_writer::allocate(const std::string& file_name,
   db.exec(query);
 
   query =
-      "CREATE INDEX idx_segment_blocks_time_range ON segment_blocks(start_ts);";
+      "CREATE INDEX idx_segment_blocks_time_range ON segment_blocks(start_timestamp);";
   db.exec(query);
 
   query = "CREATE INDEX idx_segments_stream_tag ON segments(stream_tag);";
@@ -1515,23 +1515,23 @@ nanots_reader::nanots_reader(const std::string& file_name)
 }
 
 static int _compare_index_entry_timestamp(uint8_t* index_entry_p,
-                                          uint8_t* target_ts_p) {
-  uint64_t entry_ts = *(uint64_t*)index_entry_p;
-  uint64_t target_ts = *(uint64_t*)target_ts_p;
+                                          uint8_t* target_timestamp_p) {
+  int64_t entry_timestamp = *(int64_t*)index_entry_p;
+  int64_t target_timestamp = *(int64_t*)target_timestamp_p;
 
-  if (entry_ts < target_ts)
+  if (entry_timestamp < target_timestamp)
     return -1;
-  if (entry_ts > target_ts)
+  if (entry_timestamp > target_timestamp)
     return 1;
   return 0;
 }
 
 void nanots_reader::read(
     const std::string& stream_tag,
-    uint64_t start_ts,
-    uint64_t end_ts,
+    int64_t start_timestamp,
+    int64_t end_timestamp,
     const std::function<
-        void(const uint8_t*, size_t, uint8_t, uint64_t, uint64_t)>& callback) {
+        void(const uint8_t*, size_t, uint8_t, int64_t, uint64_t)>& callback) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   auto stmt = db.prepare(
@@ -1539,23 +1539,23 @@ void nanots_reader::read(
       "s.metadata as metadata, "
       "sb.sequence as block_sequence, "
       "sb.block_idx as block_idx, "
-      "sb.start_ts as block_start_ts, "
-      "sb.end_ts as block_end_ts, "
+      "sb.start_timestamp as block_start_timestamp, "
+      "sb.end_timestamp as block_end_timestamp, "
       "sb.uuid as uuid "
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
       "WHERE s.stream_tag = ? "
-      "AND sb.start_ts <= ? "
-      "AND (sb.end_ts >= ? OR sb.end_ts = 0) "
+      "AND sb.start_timestamp <= ? "
+      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
       "ORDER BY sb.sequence ASC;");
   auto results =
-      stmt.bind(1, stream_tag).bind(2, end_ts).bind(3, start_ts).exec();
+      stmt.bind(1, stream_tag).bind(2, end_timestamp).bind(3, start_timestamp).exec();
 
   bool need_binary_search = true;
 
   for (auto& row : results) {
     std::string metadata = row["metadata"].value();
-    uint64_t block_sequence = std::stoull(row["block_sequence"].value());
+    int64_t block_sequence = std::stoll(row["block_sequence"].value());
     uint64_t block_idx = std::stoull(row["block_idx"].value());
     std::string uuid_hex = row["uuid"].value();
 
@@ -1574,11 +1574,11 @@ void nanots_reader::read(
     uint8_t* index_start = block_p + BLOCK_HEADER_SIZE;
     uint8_t* index_end = index_start + (n_valid_indexes * INDEX_ENTRY_SIZE);
 
-    uint64_t start_index = 0;
+    int64_t start_index = 0;
 
     if (need_binary_search) {
       uint8_t* first_entry =
-          lower_bound_bytes(index_start, index_end, (uint8_t*)&start_ts,
+          lower_bound_bytes(index_start, index_end, (uint8_t*)&start_timestamp,
                             INDEX_ENTRY_SIZE, _compare_index_entry_timestamp);
 
       start_index = (first_entry - index_start) / INDEX_ENTRY_SIZE;
@@ -1588,11 +1588,11 @@ void nanots_reader::read(
     // Iterate through frames in this block
     for (size_t i = start_index; i < n_valid_indexes; i++) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
-      uint64_t timestamp = *(uint64_t*)index_p;
+      int64_t timestamp = *(int64_t*)index_p;
       uint32_t offset = *(uint32_t*)(index_p + 8);
 
       // Check if we've passed the end time
-      if (timestamp > end_ts)
+      if (timestamp > end_timestamp)
         return;  // All done!
 
       // Validate frame header
@@ -1613,8 +1613,8 @@ void nanots_reader::read(
 
 std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
     const std::string& stream_tag,
-    uint64_t start_ts,
-    uint64_t end_ts) {
+    int64_t start_timestamp,
+    int64_t end_timestamp) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   // Create a grouping key by subtracting sequence from row number
@@ -1625,23 +1625,23 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
       "SELECT "
       "sb.segment_id, "
       "sb.sequence, "
-      "sb.start_ts, "
-      "sb.end_ts, "
+      "sb.start_timestamp, "
+      "sb.end_timestamp, "
       "ROW_NUMBER() "
       "OVER (PARTITION BY sb.segment_id ORDER BY sb.sequence) - sb.sequence AS "
       "group_key "
       "FROM segment_blocks sb "
       "JOIN segments s ON sb.segment_id = s.id "
-      "WHERE sb.start_ts <= ? "
-      "AND sb.end_ts >= ? "
+      "WHERE sb.start_timestamp <= ? "
+      "AND sb.end_timestamp >= ? "
       "AND s.stream_tag = ? "
       "), "
       "region_boundaries AS ( "
       "SELECT "
       "segment_id, "
       "group_key, "
-      "MIN(start_ts) AS region_start, "
-      "MAX(end_ts) AS region_end, "
+      "MIN(start_timestamp) AS region_start, "
+      "MAX(end_timestamp) AS region_end, "
       "COUNT(*) AS block_count "
       "FROM contiguous_groups "
       "GROUP BY segment_id, group_key "
@@ -1654,15 +1654,15 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
       "FROM region_boundaries "
       "ORDER BY segment_id, region_start;");
   auto results =
-      stmt.bind(1, end_ts).bind(2, start_ts).bind(3, stream_tag).exec();
+      stmt.bind(1, end_timestamp).bind(2, start_timestamp).bind(3, stream_tag).exec();
 
   std::vector<contiguous_segment> segments;
 
   for (auto& row : results) {
     contiguous_segment segment;
     segment.segment_id = std::stoi(row["segment_id"].value());
-    segment.start_ts = std::stoull(row["region_start"].value());
-    segment.end_ts = std::stoull(row["region_end"].value());
+    segment.start_timestamp = std::stoull(row["region_start"].value());
+    segment.end_timestamp = std::stoull(row["region_end"].value());
     segments.push_back(segment);
   }
 
@@ -1690,7 +1690,7 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
   reset();
 }
 
-block_info* nanots_iterator::_get_block_by_sequence(uint64_t sequence) {
+block_info* nanots_iterator::_get_block_by_sequence(int64_t sequence) {
   auto it = _block_cache.find(sequence);
   if (it != _block_cache.end()) {
     return &it->second;
@@ -1705,8 +1705,8 @@ block_info* nanots_iterator::_get_block_by_sequence(uint64_t sequence) {
       "s.metadata as metadata, "
       "sb.sequence as block_sequence, "
       "sb.block_idx as block_idx, "
-      "sb.start_ts as start_ts, "
-      "sb.end_ts as end_ts, "
+      "sb.start_timestamp as start_timestamp, "
+      "sb.end_timestamp as end_timestamp, "
       "sb.uuid as uuid "
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
@@ -1723,8 +1723,8 @@ block_info* nanots_iterator::_get_block_by_sequence(uint64_t sequence) {
   block.metadata = row["metadata"].value();
   block.block_sequence = std::stoull(row["block_sequence"].value());
   block.block_idx = std::stoi(row["block_idx"].value());
-  block.start_ts = std::stoull(row["start_ts"].value());
-  block.end_ts = std::stoull(row["end_ts"].value());
+  block.start_timestamp = std::stoull(row["start_timestamp"].value());
+  block.end_timestamp = std::stoull(row["end_timestamp"].value());
   block.uuid_hex = row["uuid"].value();
 
   auto result = _block_cache.emplace(sequence, std::move(block));
@@ -1748,11 +1748,11 @@ block_info* nanots_iterator::_get_first_block() {
   if (results.empty())
     return nullptr;
 
-  uint64_t first_sequence = std::stoull(results[0]["sequence"].value());
+  int64_t first_sequence = std::stoll(results[0]["sequence"].value());
   return _get_block_by_sequence(first_sequence);
 }
 
-block_info* nanots_iterator::_get_next_block(uint64_t current_sequence) {
+block_info* nanots_iterator::_get_next_block(int64_t current_sequence) {
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn db(db_name, false, true);
 
@@ -1769,11 +1769,11 @@ block_info* nanots_iterator::_get_next_block(uint64_t current_sequence) {
   if (results.empty())
     return nullptr;
 
-  uint64_t next_sequence = std::stoull(results[0]["sequence"].value());
+  int64_t next_sequence = std::stoll(results[0]["sequence"].value());
   return _get_block_by_sequence(next_sequence);
 }
 
-block_info* nanots_iterator::_get_prev_block(uint64_t current_sequence) {
+block_info* nanots_iterator::_get_prev_block(int64_t current_sequence) {
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn db(db_name, false, true);
 
@@ -1790,11 +1790,11 @@ block_info* nanots_iterator::_get_prev_block(uint64_t current_sequence) {
   if (results.empty())
     return nullptr;
 
-  uint64_t prev_sequence = std::stoull(results[0]["sequence"].value());
+  int64_t prev_sequence = std::stoll(results[0]["sequence"].value());
   return _get_block_by_sequence(prev_sequence);
 }
 
-block_info* nanots_iterator::_find_block_for_timestamp(uint64_t timestamp) {
+block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn db(db_name, false, true);
 
@@ -1804,8 +1804,8 @@ block_info* nanots_iterator::_find_block_for_timestamp(uint64_t timestamp) {
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
       "WHERE s.stream_tag = ? "
-      "AND sb.start_ts <= ? "
-      "AND (sb.end_ts >= ? OR sb.end_ts = 0) "
+      "AND sb.start_timestamp <= ? "
+      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
       "ORDER BY sb.sequence ASC "
       "LIMIT 1");
 
@@ -1813,18 +1813,18 @@ block_info* nanots_iterator::_find_block_for_timestamp(uint64_t timestamp) {
       stmt.bind(1, _stream_tag).bind(2, timestamp).bind(3, timestamp).exec();
 
   if (!results.empty()) {
-    uint64_t sequence = std::stoull(results[0]["sequence"].value());
+    int64_t sequence = std::stoll(results[0]["sequence"].value());
     return _get_block_by_sequence(sequence);
   }
 
-  // If no block contains the timestamp, find the first block with start_ts >=
+  // If no block contains the timestamp, find the first block with start_timestamp >=
   // timestamp
   stmt = db.prepare(
       "SELECT sb.sequence "
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
       "WHERE s.stream_tag = ? "
-      "AND sb.start_ts >= ? "
+      "AND sb.start_timestamp >= ? "
       "ORDER BY sb.sequence ASC "
       "LIMIT 1");
 
@@ -1833,7 +1833,7 @@ block_info* nanots_iterator::_find_block_for_timestamp(uint64_t timestamp) {
   if (results.empty())
     return nullptr;  // No blocks at all, or timestamp is after everything
 
-  uint64_t sequence = std::stoull(results[0]["sequence"].value());
+  int64_t sequence = std::stoll(results[0]["sequence"].value());
   return _get_block_by_sequence(sequence);
 }
 
@@ -1877,7 +1877,7 @@ bool nanots_iterator::_load_current_frame() {
   // Get frame info from index
   uint8_t* index_p = block->block_p + BLOCK_HEADER_SIZE +
                      (_current_frame_idx * INDEX_ENTRY_SIZE);
-  uint64_t timestamp = *(uint64_t*)index_p;
+  int64_t timestamp = *(int64_t*)index_p;
   uint32_t offset = *(uint32_t*)(index_p + 8);
 
   // Validate frame header
@@ -1955,7 +1955,7 @@ nanots_iterator& nanots_iterator::operator--() {
   return *this;
 }
 
-bool nanots_iterator::find(uint64_t timestamp) {
+bool nanots_iterator::find(int64_t timestamp) {
   auto* block = _find_block_for_timestamp(timestamp);
   if (!block) {
     _valid = false;
@@ -2069,7 +2069,7 @@ nanots_result_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
-                                    uint64_t timestamp,
+                                    int64_t timestamp,
                                     uint8_t flags) {
   if (!writer || !writer->writer) {
     return NANOTS_INVALID_HANDLE;
@@ -2100,14 +2100,14 @@ nanots_result_t nanots_writer_write(nanots_writer_t writer,
 
 nanots_result_t nanots_writer_free_blocks(nanots_writer_t writer,
                                           const char* stream_tag,
-                                          uint64_t start_ts,
-                                          uint64_t end_ts) {
+                                          int64_t start_timestamp,
+                                          int64_t end_timestamp) {
   if (!writer || !writer->writer) {
     return NANOTS_INVALID_HANDLE;
   }
 
   try {
-    writer->writer->free_blocks(std::string(stream_tag), start_ts, end_ts);
+    writer->writer->free_blocks(std::string(stream_tag), start_timestamp, end_timestamp);
     return NANOTS_OK;
   } catch (...) {
     return NANOTS_ERROR;
@@ -2145,8 +2145,8 @@ struct nanots_callback_context {
 
 nanots_result_t nanots_reader_read(nanots_reader_t reader,
                                    const char* stream_tag,
-                                   uint64_t start_ts,
-                                   uint64_t end_ts,
+                                   int64_t start_timestamp,
+                                   int64_t end_timestamp,
                                    nanots_read_callback_t callback,
                                    void* user_data) {
   if (!reader || !reader->reader) {
@@ -2158,9 +2158,9 @@ nanots_result_t nanots_reader_read(nanots_reader_t reader,
 
   try {
     nanots_callback_context ctx{callback, user_data};
-    reader->reader->read(std::string(stream_tag), start_ts, end_ts,
+    reader->reader->read(std::string(stream_tag), start_timestamp, end_timestamp,
                          [&ctx](const uint8_t* data, size_t size, uint8_t flags,
-                                uint64_t timestamp, uint64_t block_sequence) {
+                                int64_t timestamp, int64_t block_sequence) {
                            ctx.callback(data, size, flags, timestamp,
                                         block_sequence, ctx.user_data);
                          });
@@ -2173,8 +2173,8 @@ nanots_result_t nanots_reader_read(nanots_reader_t reader,
 nanots_result_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
-    uint64_t start_ts,
-    uint64_t end_ts,
+    int64_t start_timestamp,
+    int64_t end_timestamp,
     nanots_contiguous_segment_t** segments,
     size_t* count) {
   if (!reader || !reader->reader) {
@@ -2186,7 +2186,7 @@ nanots_result_t nanots_reader_query_contiguous_segments(
 
   try {
     auto cpp_segments = reader->reader->query_contiguous_segments(
-        std::string(stream_tag), start_ts, end_ts);
+        std::string(stream_tag), start_timestamp, end_timestamp);
 
     *count = cpp_segments.size();
     if (*count == 0) {
@@ -2202,8 +2202,8 @@ nanots_result_t nanots_reader_query_contiguous_segments(
 
     for (size_t i = 0; i < *count; i++) {
       (*segments)[i].segment_id = cpp_segments[i].segment_id;
-      (*segments)[i].start_ts = cpp_segments[i].start_ts;
-      (*segments)[i].end_ts = cpp_segments[i].end_ts;
+      (*segments)[i].start_timestamp = cpp_segments[i].start_timestamp;
+      (*segments)[i].end_timestamp = cpp_segments[i].end_timestamp;
     }
 
     return NANOTS_OK;
@@ -2291,7 +2291,7 @@ nanots_result_t nanots_iterator_prev(nanots_iterator_t iterator) {
 }
 
 nanots_result_t nanots_iterator_find(nanots_iterator_t iterator,
-                                     uint64_t timestamp) {
+                                     int64_t timestamp) {
   if (!iterator || !iterator->iterator) {
     return NANOTS_INVALID_HANDLE;
   }
@@ -2317,7 +2317,7 @@ nanots_result_t nanots_iterator_reset(nanots_iterator_t iterator) {
   }
 }
 
-uint64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator) {
+int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator) {
   if (!iterator || !iterator->iterator) {
     return 0;
   }

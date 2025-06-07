@@ -19,13 +19,13 @@
 #define FRAME_SIZE_OFFSET 17
 
 struct block_header {
-  uint64_t block_start_ts{0};
+  int64_t block_start_timestamp{0};
   uint32_t n_valid_indexes{0};
   uint32_t reserved{0};
 };
 
 struct index_entry {
-  uint64_t timestamp;
+  int64_t timestamp;
   uint32_t offset;
 };
 
@@ -47,8 +47,8 @@ struct segment_block {
   int sequence{0};
   int block_id{0};
   int block_idx{0};
-  uint64_t start_ts{0};
-  uint64_t end_ts{0};
+  int64_t start_timestamp{0};
+  int64_t end_timestamp{0};
   uint8_t uuid[16];
 };
 
@@ -63,7 +63,7 @@ struct write_context final {
 
   std::string metadata;
   std::string stream_tag;
-  std::optional<uint64_t> last_ts;
+  std::optional<int64_t> last_timestamp;
   std::optional<segment> current_segment;
   std::optional<segment_block> current_block;
   nts_memory_map mm;
@@ -85,12 +85,12 @@ class nanots_writer {
   void write(write_context& wctx,
              const uint8_t* data,
              size_t size,
-             uint64_t timestamp,
+             int64_t timestamp,
              uint8_t flags);
 
   void free_blocks(const std::string& stream_tag,
-                   uint64_t start_ts,
-                   uint64_t end_ts);
+                   int64_t start_timestamp,
+                   int64_t end_timestamp);
 
   static void allocate(const std::string& file_name,
                        uint32_t block_size,
@@ -109,8 +109,8 @@ class nanots_writer {
 
 struct contiguous_segment {
   int segment_id{0};
-  uint64_t start_ts{0};
-  uint64_t end_ts{0};
+  int64_t start_timestamp{0};
+  int64_t end_timestamp{0};
 };
 
 class nanots_reader {
@@ -124,15 +124,15 @@ class nanots_reader {
 
   void read(
       const std::string& stream_tag,
-      uint64_t start_ts,
-      uint64_t end_ts,
+      int64_t start_timestamp,
+      int64_t end_timestamp,
       const std::function<
-          void(const uint8_t*, size_t, uint8_t, uint64_t, uint64_t)>& callback);
+          void(const uint8_t*, size_t, uint8_t, int64_t, uint64_t)>& callback);
 
   std::vector<contiguous_segment> query_contiguous_segments(
       const std::string& stream_tag,
-      uint64_t start_ts,
-      uint64_t end_ts);
+      int64_t start_timestamp,
+      int64_t end_timestamp);
 
  private:
   std::string _file_name;
@@ -145,17 +145,17 @@ struct frame_info {
   const uint8_t* data{nullptr};
   size_t size{0};
   uint8_t flags{0};
-  uint64_t timestamp{0};
-  uint64_t block_sequence{0};
+  int64_t timestamp{0};
+  int64_t block_sequence{0};
 };
 
 struct block_info {
   int block_idx{0};
-  uint64_t block_sequence{0};
+  int64_t block_sequence{0};
   std::string metadata;
   std::string uuid_hex;
-  uint64_t start_ts{0};
-  uint64_t end_ts{0};
+  int64_t start_timestamp{0};
+  int64_t end_timestamp{0};
 
   // Loaded block data
   nts_memory_map mm;
@@ -182,18 +182,18 @@ class nanots_iterator {
   // Navigation
   nanots_iterator& operator++();  // Move to next frame
   nanots_iterator& operator--();  // Move to previous frame
-  bool find(uint64_t timestamp);  // Find first frame >= timestamp
+  bool find(int64_t timestamp);  // Find first frame >= timestamp
   void reset();                   // Go to first frame
 
   // Utility
-  uint64_t current_block_sequence() const { return _current_block_sequence; }
+  int64_t current_block_sequence() const { return _current_block_sequence; }
 
  private:
-  block_info* _get_block_by_sequence(uint64_t sequence);
+  block_info* _get_block_by_sequence(int64_t sequence);
   block_info* _get_first_block();
-  block_info* _get_next_block(uint64_t current_sequence);
-  block_info* _get_prev_block(uint64_t current_sequence);
-  block_info* _find_block_for_timestamp(uint64_t timestamp);
+  block_info* _get_next_block(int64_t current_sequence);
+  block_info* _get_prev_block(int64_t current_sequence);
+  block_info* _find_block_for_timestamp(int64_t timestamp);
 
   bool _load_block_data(block_info& block);
   bool _load_current_frame();
@@ -204,11 +204,11 @@ class nanots_iterator {
   uint32_t _block_size;
 
   // Current position
-  uint64_t _current_block_sequence;
+  int64_t _current_block_sequence;
   size_t _current_frame_idx;
 
   // Cache of visited blocks (sequence -> block_info)
-  std::unordered_map<uint64_t, block_info> _block_cache;
+  std::unordered_map<int64_t, block_info> _block_cache;
 
   // Cached current frame
   frame_info _current_frame;
@@ -236,23 +236,23 @@ typedef enum {
 
 typedef struct {
   int segment_id;
-  uint64_t start_ts;
-  uint64_t end_ts;
+  int64_t start_timestamp;
+  int64_t end_timestamp;
 } nanots_contiguous_segment_t;
 
 typedef struct {
   const uint8_t* data;
   size_t size;
   uint8_t flags;
-  uint64_t timestamp;
-  uint64_t block_sequence;
+  int64_t timestamp;
+  int64_t block_sequence;
 } nanots_frame_info_t;
 
 typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        size_t size,
                                        uint8_t flags,
-                                       uint64_t timestamp,
-                                       uint64_t block_sequence,
+                                       int64_t timestamp,
+                                       int64_t block_sequence,
                                        void* user_data);
 
 nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
@@ -269,13 +269,13 @@ nanots_result_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
-                                    uint64_t timestamp,
+                                    int64_t timestamp,
                                     uint8_t flags);
 
 nanots_result_t nanots_writer_free_blocks(nanots_writer_t writer,
                                           const char* stream_tag,
-                                          uint64_t start_ts,
-                                          uint64_t end_ts);
+                                          int64_t start_timestamp,
+                                          int64_t end_timestamp);
 
 nanots_result_t nanots_writer_allocate_file(const char* file_name,
                                             uint32_t block_size,
@@ -287,16 +287,16 @@ void nanots_reader_destroy(nanots_reader_t reader);
 
 nanots_result_t nanots_reader_read(nanots_reader_t reader,
                                    const char* stream_tag,
-                                   uint64_t start_ts,
-                                   uint64_t end_ts,
+                                   int64_t start_timestamp,
+                                   int64_t end_timestamp,
                                    nanots_read_callback_t callback,
                                    void* user_data);
 
 nanots_result_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
-    uint64_t start_ts,
-    uint64_t end_ts,
+    int64_t start_timestamp,
+    int64_t end_timestamp,
     nanots_contiguous_segment_t** segments,
     size_t* count);
 
@@ -317,11 +317,11 @@ nanots_result_t nanots_iterator_next(nanots_iterator_t iterator);
 nanots_result_t nanots_iterator_prev(nanots_iterator_t iterator);
 
 nanots_result_t nanots_iterator_find(nanots_iterator_t iterator,
-                                     uint64_t timestamp);
+                                     int64_t timestamp);
 
 nanots_result_t nanots_iterator_reset(nanots_iterator_t iterator);
 
-uint64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
+int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 
 #ifdef __cplusplus
 }

@@ -66,13 +66,13 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
   struct callback_data {
     vector<string> frames;
     vector<uint8_t> flags;
-    vector<uint64_t> timestamps;
-    vector<uint64_t> block_sequences;
+    vector<int64_t> timestamps;
+    vector<int64_t> block_sequences;
   } cb_data;
 
   // Define callback function
   auto callback = [](const uint8_t* data, size_t size, uint8_t flags,
-                     uint64_t timestamp, uint64_t block_sequence,
+                     int64_t timestamp, int64_t block_sequence,
                      void* user_data) {
     callback_data* cb = static_cast<callback_data*>(user_data);
     cb->frames.emplace_back(reinterpret_cast<const char*>(data), size);
@@ -145,7 +145,7 @@ void test_nanots_c_api::test_c_api_iterator_functionality() {
                        frame_info.size);
     RTF_ASSERT(actual_data == expected_data);
     RTF_ASSERT(frame_info.flags == frame_count);
-    RTF_ASSERT(frame_info.timestamp == (uint64_t)(1000 + frame_count * 100));
+    RTF_ASSERT(frame_info.timestamp == (int64_t)(1000 + frame_count * 100));
 
     frame_count++;
     if (frame_count < 5) {
@@ -234,8 +234,8 @@ void test_nanots_c_api::test_c_api_contiguous_segments() {
   RTF_ASSERT(result == NANOTS_OK);
   RTF_ASSERT(count > 0);
   RTF_ASSERT(segments != nullptr);
-  RTF_ASSERT(segments[0].start_ts <= 1000);
-  RTF_ASSERT(segments[0].end_ts >= 1200);
+  RTF_ASSERT(segments[0].start_timestamp <= 1000);
+  RTF_ASSERT(segments[0].end_timestamp >= 1200);
 
   // Clean up
   nanots_free_segments(segments);
@@ -321,7 +321,7 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
   // Test stream1
   vector<string> stream1_data;
   auto callback1 = [](const uint8_t* data, size_t size, uint8_t flags,
-                      uint64_t timestamp, uint64_t block_sequence,
+                      int64_t timestamp, int64_t block_sequence,
                       void* user_data) {
     vector<string>* frames = static_cast<vector<string>*>(user_data);
     frames->emplace_back(reinterpret_cast<const char*>(data), size);

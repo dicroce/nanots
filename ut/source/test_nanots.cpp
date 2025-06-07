@@ -143,18 +143,18 @@ void test_nanots::test_nanots_multiple_streams() {
 
     // Write interleaved data to different streams
     for (int i = 0; i < 5; i++) {
-      uint64_t base_ts = 1000 + (i * 100);
+      uint64_t base_timestamp = 1000 + (i * 100);
 
       std::string video_data = "video_frame_" + std::to_string(i);
       std::string audio_data = "audio_sample_" + std::to_string(i);
       std::string meta_data = "sensor_" + std::to_string(i);
 
       db.write(video_ctx, (uint8_t*)video_data.c_str(),
-               (uint32_t)video_data.size(), base_ts, 0x01);
+               (uint32_t)video_data.size(), base_timestamp, 0x01);
       db.write(audio_ctx, (uint8_t*)audio_data.c_str(),
-               (uint32_t)audio_data.size(), base_ts + 10, 0x02);
+               (uint32_t)audio_data.size(), base_timestamp + 10, 0x02);
       db.write(metadata_ctx, (uint8_t*)meta_data.c_str(),
-               (uint32_t)meta_data.size(), base_ts + 20, 0x03);
+               (uint32_t)meta_data.size(), base_timestamp + 20, 0x03);
     }
   }
 
@@ -322,7 +322,7 @@ void test_nanots::test_nanots_large_frames() {
 
     size_t expected_size = 1024 * (i + 1);
     RTF_ASSERT(iter->size == expected_size);
-    RTF_ASSERT(iter->timestamp == (uint64_t)(1000 + (i * 1000)));
+    RTF_ASSERT(iter->timestamp == (int64_t)(1000 + (i * 1000)));
     RTF_ASSERT(iter->flags == (uint8_t)i);
 
     // Verify data pattern
@@ -453,7 +453,7 @@ void test_nanots::test_nanots_performance_baseline() {
   while (iter.valid()) {
     // Verify frame integrity
     RTF_ASSERT(iter->size == frame_size);
-    RTF_ASSERT(iter->timestamp == (uint64_t)(1000 + frames_read));
+    RTF_ASSERT(iter->timestamp == (int64_t)(1000 + frames_read));
 
     frames_read++;
     ++iter;
@@ -508,7 +508,7 @@ void test_nanots::test_nanots_concurrent_readers() {
     auto& reader = *readers[reader_idx];
 
     // Each reader starts at different position
-    uint64_t start_timestamp =
+    int64_t start_timestamp =
         1000 + (reader_idx * 2000);  // 1000, 3000, 5000, etc.
     RTF_ASSERT(reader.find(start_timestamp));
 
@@ -648,8 +648,8 @@ void test_nanots::test_nanots_block_filling_and_transition() {
   nanots_iterator iter("nanots_test_4mb.nts", "block_fill_stream");
 
   int frames_read = 0;
-  uint64_t prev_timestamp = 0;
-  uint64_t prev_block_sequence = 0;
+  int64_t prev_timestamp = 0;
+  int64_t prev_block_sequence = 0;
   int block_transitions = 0;
 
   while (iter.valid()) {
@@ -659,10 +659,10 @@ void test_nanots::test_nanots_block_filling_and_transition() {
     // Count block transitions
     if (iter->block_sequence != prev_block_sequence && frames_read > 0) {
       block_transitions++;
-      printf("Block transition %d at frame %d (block sequence %llu -> %llu)\n",
+      printf("Block transition %d at frame %d (block sequence %lld -> %lld)\n",
              block_transitions, frames_read,
-             static_cast<unsigned long long>(prev_block_sequence),
-             static_cast<unsigned long long>(iter->block_sequence));
+             static_cast<long long>(prev_block_sequence),
+             static_cast<long long>(iter->block_sequence));
     }
 
     // Verify data integrity
@@ -714,10 +714,10 @@ void test_nanots::test_nanots_sparse_timestamp_seeking() {
   };
 
   for (auto& test : seek_tests) {
-    uint64_t seek_ts = test.first;
+    uint64_t seek_timestamp = test.first;
     int expected_frame = static_cast<int>(test.second);
 
-    bool found = iter.find(seek_ts);
+    bool found = iter.find(seek_timestamp);
 
     if (expected_frame == -1) {
       RTF_ASSERT(!found);
@@ -812,18 +812,18 @@ void test_nanots::test_nanots_multiple_streams_separate_writers() {
 
     // Write to different streams (this is the intended usage)
     for (int i = 0; i < 5; i++) {
-      uint64_t base_ts = 1000 + (i * 100);
+      uint64_t base_timestamp = 1000 + (i * 100);
 
       std::string video_data = "video_" + std::to_string(i);
       std::string audio_data = "audio_" + std::to_string(i);
       std::string sensor_data = "sensor_" + std::to_string(i);
 
       db.write(video_ctx, (uint8_t*)video_data.c_str(), video_data.size(),
-               base_ts, 0x01);
+               base_timestamp, 0x01);
       db.write(audio_ctx, (uint8_t*)audio_data.c_str(), audio_data.size(),
-               base_ts + 10, 0x02);
+               base_timestamp + 10, 0x02);
       db.write(data_ctx, (uint8_t*)sensor_data.c_str(), sensor_data.size(),
-               base_ts + 20, 0x03);
+               base_timestamp + 20, 0x03);
     }
   }
 
@@ -1169,7 +1169,7 @@ void test_nanots::test_nanots_high_frequency_writes() {
   nanots_iterator iter("nanots_test_4mb.nts", "high_freq_stream");
 
   int frames_read = 0;
-  uint64_t expected_timestamp = 1000000;
+  int64_t expected_timestamp = 1000000;
 
   while (iter.valid()) {
     RTF_ASSERT(iter->timestamp == expected_timestamp);
@@ -1235,35 +1235,35 @@ void test_nanots::test_nanots_timestamp_precision() {
   for (size_t i = 0; i < 8; i++) {
     RTF_ASSERT(iter.valid());
 
-    uint64_t expected_ts = 1000000000ULL;
+    int64_t expected_timestamp = 1000000000LL;
     switch (i) {
       case 0:
-        expected_ts += 0;
+        expected_timestamp += 0;
         break;
       case 1:
-        expected_ts += 1;
+        expected_timestamp += 1;
         break;
       case 2:
-        expected_ts += 10;
+        expected_timestamp += 10;
         break;
       case 3:
-        expected_ts += 100;
+        expected_timestamp += 100;
         break;
       case 4:
-        expected_ts += 1000;
+        expected_timestamp += 1000;
         break;
       case 5:
-        expected_ts += 10000;
+        expected_timestamp += 10000;
         break;
       case 6:
-        expected_ts += 100000;
+        expected_timestamp += 100000;
         break;
       case 7:
-        expected_ts += 1000000;
+        expected_timestamp += 1000000;
         break;
     }
 
-    RTF_ASSERT(iter->timestamp == expected_ts);
+    RTF_ASSERT(iter->timestamp == expected_timestamp);
     RTF_ASSERT(iter->flags == (uint8_t)i);
 
     std::string expected_data = "precise_" + std::to_string(i);
@@ -1305,16 +1305,16 @@ void test_nanots::test_nanots_free_blocks() {
   auto db_name = _database_name("nanots_test_2048_4k_blocks.nts");
   nts_sqlite_conn debug_conn(db_name, false, true);
   auto debug_result = debug_conn.exec(
-      "SELECT sb.start_ts, sb.end_ts, sb.block_idx, s.stream_tag "
+      "SELECT sb.start_timestamp, sb.end_timestamp, sb.block_idx, s.stream_tag "
       "FROM segment_blocks sb "
       "JOIN segments s ON sb.segment_id = s.id "
       "WHERE s.stream_tag = 'delete_stream' "
-      "ORDER BY sb.start_ts");
+      "ORDER BY sb.start_timestamp");
 
   printf("Blocks in database before deletion:\n");
   for (auto& row : debug_result) {
-    printf("  start_ts=%s, end_ts=%s, block_idx=%s\n",
-           row["start_ts"].value().c_str(), row["end_ts"].value().c_str(),
+    printf("  start_timestamp=%s, end_timestamp=%s, block_idx=%s\n",
+           row["start_timestamp"].value().c_str(), row["end_timestamp"].value().c_str(),
            row["block_idx"].value().c_str());
   }
 
@@ -1324,16 +1324,16 @@ void test_nanots::test_nanots_free_blocks() {
 
   // Debug: Check what blocks exist after deletion
   debug_result = debug_conn.exec(
-      "SELECT sb.start_ts, sb.end_ts, sb.block_idx, s.stream_tag "
+      "SELECT sb.start_timestamp, sb.end_timestamp, sb.block_idx, s.stream_tag "
       "FROM segment_blocks sb "
       "JOIN segments s ON sb.segment_id = s.id "
       "WHERE s.stream_tag = 'delete_stream' "
-      "ORDER BY sb.start_ts");
+      "ORDER BY sb.start_timestamp");
 
   printf("Blocks in database after deletion:\n");
   for (auto& row : debug_result) {
-    printf("  start_ts=%s, end_ts=%s, block_idx=%s\n",
-           row["start_ts"].value().c_str(), row["end_ts"].value().c_str(),
+    printf("  start_timestamp=%s, end_timestamp=%s, block_idx=%s\n",
+           row["start_timestamp"].value().c_str(), row["end_timestamp"].value().c_str(),
            row["block_idx"].value().c_str());
   }
 
@@ -1357,15 +1357,15 @@ void test_nanots::test_nanots_free_blocks() {
   // instead of looking for a specific number we just look for a large gap in
   // the timestamps.
 
-  uint64_t last_ts = 0;
+  uint64_t last_timestamp = 0;
   bool large_gap_found = false;
   for (auto ts : remaining_timestamps) {
-    if (last_ts != 0) {
-      if (ts - last_ts > 100) {
+    if (last_timestamp != 0) {
+      if (ts - last_timestamp > 100) {
         large_gap_found = true;
       }
     }
-    last_ts = ts;
+    last_timestamp = ts;
   }
 
   RTF_ASSERT(large_gap_found);
@@ -1388,6 +1388,6 @@ void test_nanots::test_nanots_query_contiguous_segments() {
   auto segments = reader.query_contiguous_segments("test_stream", 1, 1024);
 
   RTF_ASSERT(segments.size() == 2);
-  RTF_ASSERT(segments[0].start_ts == 1);
-  RTF_ASSERT(segments[1].end_ts == 1023);
+  RTF_ASSERT(segments[0].start_timestamp == 1);
+  RTF_ASSERT(segments[1].end_timestamp == 1023);
 }

@@ -21,7 +21,7 @@ using namespace std;
 
 vector<shared_ptr<test_fixture>> _test_fixtures;
 
-#ifdef IS_WINDOWS
+#ifdef _WIN32
 int64_t GetSystemTimeAsUnixTime() {
   // Get the number of seconds since January 1, 1970 12:00am UTC
   // Code released into public domain; no attribution required.
@@ -46,11 +46,10 @@ int64_t GetSystemTimeAsUnixTime() {
 #endif
 
 void rtf_usleep(unsigned int usec) {
-#ifdef IS_LINUX
-  usleep(usec);
-#endif
-#ifdef IS_WINDOWS
+#ifdef _WIN32
   Sleep(usec / 1000);
+#else
+  usleep(usec);
 #endif
 }
 
@@ -144,26 +143,7 @@ bool rtf_ends_with(const string& a, const string& b) {
 vector<string> rtf_regular_files_in_dir(const string& dir) {
   vector<string> names;
 
-#ifdef IS_LINUX
-  DIR* d = opendir(dir.c_str());
-  if (!d)
-    throw std::runtime_error("Unable to open directory");
-
-  struct dirent* e = readdir(d);
-
-  if (e) {
-    do {
-      string name(e->d_name);
-      if (e->d_type == DT_REG && name != "." && name != "..")
-        names.push_back(name);
-      e = readdir(d);
-    } while (e);
-  }
-
-  closedir(d);
-#endif
-
-#ifdef IS_WINDOWS
+#ifdef _WIN32
   WIN32_FIND_DATA ffd;
   TCHAR szDir[1024];
   HANDLE hFind;
@@ -184,6 +164,23 @@ vector<string> rtf_regular_files_in_dir(const string& dir) {
   } while (FindNextFileA(hFind, &ffd) != 0);
 
   FindClose(hFind);
+#else
+  DIR* d = opendir(dir.c_str());
+  if (!d)
+    throw std::runtime_error("Unable to open directory");
+
+  struct dirent* e = readdir(d);
+
+  if (e) {
+    do {
+      string name(e->d_name);
+      if (e->d_type == DT_REG && name != "." && name != "..")
+        names.push_back(name);
+      e = readdir(d);
+    } while (e);
+  }
+
+  closedir(d);
 #endif
 
   return names;
@@ -197,10 +194,9 @@ int main(int argc, char* argv[]) {
   if (argc > 1)
     fixture_name = argv[1];
 
-#ifdef IS_WINDOWS
+#ifdef _WIN32
   srand((unsigned int)GetSystemTimeAsUnixTime());
-#endif
-#ifdef IS_LINUX
+#else
   srand(time(0));
 #endif
 

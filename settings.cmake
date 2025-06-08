@@ -31,7 +31,6 @@ endif()
 
 # Apply build flags per platform and configuration
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
-    add_compile_definitions(IS_LINUX _GLIBCXX_ASSERTIONS)
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -69,7 +68,6 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     endif()
 
 elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")
-    add_compile_definitions(IS_WINDOWS)
     add_compile_options(/W4 /MP /permissive- /Zc:preprocessor)
 
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")

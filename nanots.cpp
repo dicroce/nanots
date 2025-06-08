@@ -72,9 +72,18 @@ static void _validate_blocks(const std::string& file_name) {
         nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
 
     uint8_t* block_p = (uint8_t*)mm.map();
-    uint32_t n_valid_indexes = *(uint32_t*)(block_p + 8);
 
+    auto valid_counter = (uint32_t*)(block_p + 8);
+
+    #ifdef _WIN32
+        uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
+        _ReadWriteBarrier(); // compiler barrier (not mem)
+    #else
+        uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
+    #endif
+    
     // Scan backwards to find last valid frame
+
     int last_valid = -1;
     for (int i = n_valid_indexes - 1; i >= 0; i--) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
@@ -291,7 +300,15 @@ static void _recycle_block(write_context& wctx, int64_t timestamp) {
   uint32_t old_n_valid_indexes = *(uint32_t*)p;
 
   // zero out the n_valid_indexes
-  *(uint32_t*)p = 0;
+  auto valid_counter = (uint32_t*)p;
+
+#ifdef _WIN32
+  std::atomic_thread_fence(std::memory_order_release);
+  *reinterpret_cast<volatile uint32_t*>(valid_counter) = 0;
+#else
+  __atomic_store_n(valid_counter, 0, std::memory_order_release);
+#endif
+
   p += sizeof(uint32_t);
 
   // zero out the reserved field
@@ -452,9 +469,13 @@ void nanots_writer::write(write_context& wctx,
   *(int64_t*)index_p = timestamp;
   *(uint32_t*)(index_p + 8) = new_block_ofs;
 
-  FULL_MEM_BARRIER();
+  auto valid_counter = (uint32_t*)(block_p + 8);
 
-  (*(uint32_t*)(block_p + 8))++;
+#ifdef _WIN32
+  _InterlockedIncrement(reinterpret_cast<volatile long*>(valid_counter));
+#else
+  __atomic_fetch_add(valid_counter, 1, std::memory_order_release);
+#endif
 
   wctx.last_timestamp = timestamp;
 }
@@ -678,7 +699,14 @@ void nanots_reader::read(
 
     auto block_p = (uint8_t*)mm.map();
 
-    uint32_t n_valid_indexes = *(uint32_t*)(block_p + 8);
+    auto valid_counter = (uint32_t*)(block_p + 8);
+
+#ifdef _WIN32
+    uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
+    _ReadWriteBarrier(); // compiler barrier (not mem)
+#else
+    uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
+#endif
 
     uint8_t* index_start = block_p + BLOCK_HEADER_SIZE;
     uint8_t* index_end = index_start + (n_valid_indexes * INDEX_ENTRY_SIZE);
@@ -957,7 +985,15 @@ bool nanots_iterator::_load_block_data(block_info& block) {
       nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
 
   block.block_p = (uint8_t*)block.mm.map();
-  block.n_valid_indexes = *(uint32_t*)(block.block_p + 8);
+
+  auto valid_counter = (uint32_t*)(block.block_p + 8);
+
+#ifdef _WIN32
+    block.n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
+    _ReadWriteBarrier(); // compiler barrier (not mem)
+#else
+    block.n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
+#endif
 
   // Convert UUID std::string to bytes
   s_to_entropy_id(block.uuid_hex, block.uuid);

@@ -18,7 +18,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
+#include <atomic>
 
 #ifdef _WIN32
 #include <Rpc.h>

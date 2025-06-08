@@ -314,6 +314,8 @@ write_context::~write_context() {
 
     nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
       _db_finalize_block(conn, current_block->id, last_timestamp.value());
+      // This is a maintenance task that needs to be done periodically.
+      _db_trans_finalize_reserved_blocks(conn);
     });
   }
 }

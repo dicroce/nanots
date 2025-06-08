@@ -1066,8 +1066,8 @@ static std::optional<block> _db_reclaim_oldest_used_block(
     return std::nullopt;
 
   auto row = result.front();
-  int block_id = std::stoi(row["block_id"].value());
-  int segment_block_id = std::stoi(row["segment_block_id"].value());
+  int64_t block_id = std::stoll(row["block_id"].value());
+  int64_t segment_block_id = std::stoll(row["segment_block_id"].value());
 
   // Delete the segment_block entry (trigger will clean up empty segments)
   auto stmt = conn.prepare("DELETE FROM segment_blocks WHERE id = ?");
@@ -1079,7 +1079,7 @@ static std::optional<block> _db_reclaim_oldest_used_block(
       "WHERE id = ?");
   stmt.bind(1, block_id).exec_no_result();
 
-  return block{block_id, std::stoi(row["idx"].value())};
+  return block{block_id, std::stoll(row["idx"].value())};
 }
 
 static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
@@ -1089,13 +1089,13 @@ static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
 
   if (!result.empty()) {
     auto row = result.front();
-    int block_id = std::stoi(row["id"].value());
+    int64_t block_id = std::stoll(row["id"].value());
 
     auto stmt =
         conn.prepare("UPDATE blocks SET status = 'reserved' WHERE id = ?");
     stmt.bind(1, block_id).exec_no_result();
 
-    return block{block_id, std::stoi(row["idx"].value())};
+    return block{block_id, std::stoll(row["idx"].value())};
   }
 
   if (auto_reclaim)
@@ -1111,15 +1111,15 @@ static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
       conn.prepare("INSERT INTO segments (stream_tag, metadata) VALUES (?, ?)");
   stmt.bind(1, stream_tag).bind(2, metadata).exec_no_result();
 
-  return segment{std::stoi(conn.last_insert_id()), stream_tag, metadata, 0};
+  return segment{std::stoll(conn.last_insert_id()), stream_tag, metadata, 0};
 }
 
 static std::optional<segment_block> _db_create_segment_block(
     const nts_sqlite_conn& conn,
-    int segment_id,
-    int sequence,
-    int block_id,
-    int block_idx,
+    int64_t segment_id,
+    int64_t sequence,
+    int64_t block_id,
+    int64_t block_idx,
     int64_t start_timestamp,
     int64_t end_timestamp,
     const uint8_t* uuid) {
@@ -1146,7 +1146,7 @@ static std::optional<segment_block> _db_create_segment_block(
       .exec_no_result();
 
   struct segment_block sb;
-  sb.id = std::stoi(conn.last_insert_id());
+  sb.id = std::stoll(conn.last_insert_id());
   sb.segment_id = segment_id;
   sb.sequence = sequence;
   sb.block_id = block_id;
@@ -1159,7 +1159,7 @@ static std::optional<segment_block> _db_create_segment_block(
 }
 
 static void _db_finalize_block(const nts_sqlite_conn& conn,
-                               int segment_block_id,
+                               int64_t segment_block_id,
                                int64_t timestamp) {
   auto stmt = conn.prepare("UPDATE segment_blocks SET end_timestamp = ? WHERE id = ?");
   stmt.bind(1, timestamp).bind(2, segment_block_id).exec_no_result();
@@ -1370,8 +1370,8 @@ void nanots_writer::free_blocks(const std::string& stream_tag,
         stmt.bind(1, stream_tag).bind(2, start_timestamp).bind(3, end_timestamp).exec();
 
     for (auto& block_row : blocks_to_delete) {
-      int segment_block_id = std::stoi(block_row["segment_block_id"].value());
-      int block_id = std::stoi(block_row["block_id"].value());
+      int64_t segment_block_id = std::stoll(block_row["segment_block_id"].value());
+      int64_t block_id = std::stoll(block_row["block_id"].value());
 
       // Remove segment_block entry (trigger will clean up empty segments)
       stmt = conn.prepare("DELETE FROM segment_blocks WHERE id = ?");
@@ -1660,7 +1660,7 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
 
   for (auto& row : results) {
     contiguous_segment segment;
-    segment.segment_id = std::stoi(row["segment_id"].value());
+    segment.segment_id = std::stoll(row["segment_id"].value());
     segment.start_timestamp = std::stoll(row["region_start"].value());
     segment.end_timestamp = std::stoll(row["region_end"].value());
     segments.push_back(segment);
@@ -1720,13 +1720,13 @@ block_info* nanots_iterator::_get_block_by_sequence(int64_t sequence) {
 
   auto& row = results[0];
   block_info block;
+  block.block_idx = std::stoll(row["block_idx"].value());
+  block.block_sequence = std::stoll(row["block_sequence"].value());
   block.metadata = row["metadata"].value();
-  block.block_sequence = std::stoull(row["block_sequence"].value());
-  block.block_idx = std::stoi(row["block_idx"].value());
-  block.start_timestamp = std::stoull(row["start_timestamp"].value());
-  block.end_timestamp = std::stoull(row["end_timestamp"].value());
   block.uuid_hex = row["uuid"].value();
-
+  block.start_timestamp = std::stoll(row["start_timestamp"].value());
+  block.end_timestamp = std::stoll(row["end_timestamp"].value());
+  
   auto result = _block_cache.emplace(sequence, std::move(block));
   return &result.first->second;
 }

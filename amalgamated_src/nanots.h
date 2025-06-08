@@ -373,23 +373,23 @@ struct index_entry {
 };
 
 struct block {
-  int id{0};
-  int idx{0};
+  int64_t id{0};
+  int64_t idx{0};
 };
 
 struct segment {
-  int id{0};
+  int64_t id{0};
   std::string stream_tag;
   std::string metadata;
-  int sequence{0};
+  int64_t sequence{0};
 };
 
 struct segment_block {
-  int id{0};
-  int segment_id{0};
-  int sequence{0};
-  int block_id{0};
-  int block_idx{0};
+  int64_t id{0};
+  int64_t segment_id{0};
+  int64_t sequence{0};
+  int64_t block_id{0};
+  int64_t block_idx{0};
   int64_t start_timestamp{0};
   int64_t end_timestamp{0};
   uint8_t uuid[16];
@@ -451,7 +451,7 @@ class nanots_writer {
 };
 
 struct contiguous_segment {
-  int segment_id{0};
+  int64_t segment_id{0};
   int64_t start_timestamp{0};
   int64_t end_timestamp{0};
 };
@@ -493,7 +493,7 @@ struct frame_info {
 };
 
 struct block_info {
-  int block_idx{0};
+  int64_t block_idx{0};
   int64_t block_sequence{0};
   std::string metadata;
   std::string uuid_hex;
@@ -578,7 +578,7 @@ typedef enum {
 } nanots_result_t;
 
 typedef struct {
-  int segment_id;
+  int64_t segment_id;
   int64_t start_timestamp;
   int64_t end_timestamp;
 } nanots_contiguous_segment_t;

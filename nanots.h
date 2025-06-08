@@ -127,7 +127,7 @@ class nanots_reader {
       int64_t start_timestamp,
       int64_t end_timestamp,
       const std::function<
-          void(const uint8_t*, size_t, uint8_t, int64_t, uint64_t)>& callback);
+          void(const uint8_t*, size_t, uint8_t, int64_t, int64_t)>& callback);
 
   std::vector<contiguous_segment> query_contiguous_segments(
       const std::string& stream_tag,

@@ -286,7 +286,7 @@ static void _recycle_block(write_context& wctx, int64_t timestamp) {
 
   // write the new timestamp
   *(int64_t*)p = timestamp;
-  p += sizeof(uint64_t);
+  p += sizeof(int64_t);
 
   uint32_t old_n_valid_indexes = *(uint32_t*)p;
 
@@ -638,7 +638,7 @@ void nanots_reader::read(
     int64_t start_timestamp,
     int64_t end_timestamp,
     const std::function<
-        void(const uint8_t*, size_t, uint8_t, int64_t, uint64_t)>& callback) {
+        void(const uint8_t*, size_t, uint8_t, int64_t, int64_t)>& callback) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   auto stmt = db.prepare(
@@ -663,7 +663,7 @@ void nanots_reader::read(
   for (auto& row : results) {
     std::string metadata = row["metadata"].value();
     int64_t block_sequence = std::stoll(row["block_sequence"].value());
-    uint64_t block_idx = std::stoull(row["block_idx"].value());
+    int64_t block_idx = std::stoll(row["block_idx"].value());
     std::string uuid_hex = row["uuid"].value();
 
     uint8_t uuid[16];
@@ -768,8 +768,8 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
   for (auto& row : results) {
     contiguous_segment segment;
     segment.segment_id = std::stoi(row["segment_id"].value());
-    segment.start_timestamp = std::stoull(row["region_start"].value());
-    segment.end_timestamp = std::stoull(row["region_end"].value());
+    segment.start_timestamp = std::stoll(row["region_start"].value());
+    segment.end_timestamp = std::stoll(row["region_end"].value());
     segments.push_back(segment);
   }
 

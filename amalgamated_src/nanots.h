@@ -409,6 +409,7 @@ struct write_context final {
   std::optional<int64_t> last_timestamp;
   std::optional<segment> current_segment;
   std::optional<segment_block> current_block;
+  nts_file file;
   nts_memory_map mm;
   std::string file_name;
 };

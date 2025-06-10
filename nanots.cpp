@@ -414,8 +414,10 @@ void nanots_writer::write(write_context& wctx,
       wctx.current_segment->sequence++;
     });
 
+    wctx.file = nts_file::open(_file_name, "r+");
+
     wctx.mm = nts_memory_map(
-        filenum(_file),
+        filenum(wctx.file),
         FILE_HEADER_BLOCK_SIZE + (wctx.current_block->block_idx * _block_size),
         _block_size,
         nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,

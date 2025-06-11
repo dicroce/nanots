@@ -8,6 +8,7 @@ class test_nanots_c_api : public test_fixture {
   TEST(test_nanots_c_api::test_c_api_contiguous_segments);
   TEST(test_nanots_c_api::test_c_api_error_handling);
   TEST(test_nanots_c_api::test_c_api_multiple_streams);
+  TEST(test_nanots_c_api::test_c_api_query_stream_tags);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots_c_api() throw() {}
@@ -20,4 +21,5 @@ class test_nanots_c_api : public test_fixture {
   void test_c_api_contiguous_segments();
   void test_c_api_error_handling();
   void test_c_api_multiple_streams();
+  void test_c_api_query_stream_tags();
 };

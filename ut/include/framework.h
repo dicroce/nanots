@@ -111,9 +111,14 @@ class test_fixture {
 
   virtual ~test_fixture() throw() {}
 
-  void run_tests() {
+  void run_tests(const std::string& test_filter = "") {
     std::vector<struct test_host>::iterator i = _tests.begin();
     for (; i != _tests.end(); i++) {
+      // Skip test if filter is specified and doesn't match
+      if (!test_filter.empty() && i->test_name != test_filter) {
+        continue;
+      }
+
       setup();
 
       try {
@@ -128,7 +133,7 @@ class test_fixture {
         (*i).passed = false;
       }
 
-      printf("[%s] %-50s\n", (_something_failed) ? "F" : "P",
+      printf("[%s] %-50s\n", (!i->passed) ? "F" : "P",
              (*i).test_name.c_str());
 
       teardown();

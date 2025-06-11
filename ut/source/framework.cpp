@@ -190,9 +190,34 @@ int main(int argc, char* argv[]) {
   set_terminate(handle_terminate);
 
   std::string fixture_name = "";
+  std::string test_name = "";
 
-  if (argc > 1)
-    fixture_name = argv[1];
+  // Parse command line arguments
+  if (argc > 1) {
+    std::string arg1 = argv[1];
+    
+    // Check if it's in "fixture::test" format
+    size_t pos = arg1.find("::");
+    if (pos != std::string::npos) {
+      fixture_name = arg1.substr(0, pos);
+      test_name = arg1.substr(pos + 2);
+    } else {
+      fixture_name = arg1;
+      // Check for separate test name argument
+      if (argc > 2) {
+        test_name = argv[2];
+      }
+    }
+  }
+
+  // Print usage info if both fixture and test specified
+  if (!fixture_name.empty() && !test_name.empty()) {
+    printf("Running specific test: %s::%s\n", fixture_name.c_str(), test_name.c_str());
+  } else if (!fixture_name.empty()) {
+    printf("Running fixture: %s\n", fixture_name.c_str());
+  } else {
+    printf("Running all tests\n");
+  }
 
 #ifdef _WIN32
   srand((unsigned int)GetSystemTimeAsUnixTime());
@@ -207,7 +232,7 @@ int main(int argc, char* argv[]) {
       if (tf->get_name() != fixture_name)
         continue;
 
-    tf->run_tests();
+    tf->run_tests(test_name);
 
     if (tf->something_failed()) {
       something_failed = true;

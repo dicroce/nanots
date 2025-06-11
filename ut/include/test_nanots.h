@@ -29,6 +29,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_timestamp_precision);
   TEST(test_nanots::test_nanots_free_blocks);
   TEST(test_nanots::test_nanots_query_contiguous_segments);
+  TEST(test_nanots::test_nanots_query_stream_tags);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -62,4 +63,5 @@ class test_nanots : public test_fixture {
   void test_nanots_timestamp_precision();
   void test_nanots_free_blocks();
   void test_nanots_query_contiguous_segments();
+  void test_nanots_query_stream_tags();
 };

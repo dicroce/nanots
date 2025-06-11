@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <mutex>
+#include <set>
 
 #ifdef _WIN32
 #include <Rpc.h>

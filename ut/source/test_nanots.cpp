@@ -853,69 +853,27 @@ void test_nanots::test_nanots_invalid_multiple_writers_same_stream() {
   // Test what happens if someone tries to create multiple writers for same
   // stream This should either be prevented or handled gracefully
   nanots_writer db("nanots_test_4mb.nts", false);
+  
+  auto ctx1 = db.create_write_context("shared_stream", "first writer");
+  db.write(ctx1, (uint8_t*)"frame1", 6, 1000, 0x01);
 
+  bool second_writer_threw = false;
+  nanots_ec_t ec = NANOTS_EC_OK;
+
+  try
   {
-    auto ctx1 = db.create_write_context("shared_stream", "first writer");
-    db.write(ctx1, (uint8_t*)"frame1", 6, 1000, 0x01);
-
     // Create second context for same stream (this violates the design)
     auto ctx2 = db.create_write_context("shared_stream", "second writer");
-
-    // This might work but creates separate segments
-    // The behavior here depends on your implementation
-    db.write(ctx2, (uint8_t*)"frame2", 6, 2000, 0x02);
-
-    // Continue with first context
-    db.write(ctx1, (uint8_t*)"frame3", 6, 3000, 0x03);
-
-    // Continue with second context
-    db.write(ctx2, (uint8_t*)"frame4", 6, 4000, 0x04);
+  }
+  catch(nanots_exception& ex)
+  {
+    second_writer_threw = true;
+    ec = ex.get_ec();
+    printf("%s\n",ex.what());
   }
 
-  // See what the reader gets - might be unpredictable
-  nanots_reader reader("nanots_test_4mb.nts");
-
-  std::vector<std::pair<uint64_t, std::string>> frames;
-  reader.read("shared_stream", 0, 10000,
-              [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence) {
-                std::string frame_data((char*)data, size);
-                frames.push_back({timestamp, frame_data});
-              });
-
-  printf("Multiple writers resulted in %d frames\n", (int)frames.size());
-  for (auto& frame : frames) {
-    printf("  %llu: %s\n", static_cast<unsigned long long>(frame.first),
-           frame.second.c_str());
-  }
-
-  // We should get all 4 frames
-  RTF_ASSERT(frames.size() == 4);
-
-  // However, they might not be in timestamp order due to segment ordering
-  // The reader orders by segment block sequence, not timestamp
-  // So with multiple segments, frames from each segment are grouped together
-
-  // Verify we got all the expected frames (regardless of order)
-  std::set<std::string> expected_frames = {"frame1", "frame2", "frame3",
-                                           "frame4"};
-  std::set<uint64_t> expected_timestamps = {1000, 2000, 3000, 4000};
-
-  std::set<std::string> actual_frames;
-  std::set<uint64_t> actual_timestamps;
-
-  for (auto& frame : frames) {
-    actual_frames.insert(frame.second);
-    actual_timestamps.insert(frame.first);
-  }
-
-  RTF_ASSERT(actual_frames == expected_frames);
-  RTF_ASSERT(actual_timestamps == expected_timestamps);
-
-  printf("NOTE: Multiple writers for same stream creates separate segments.\n");
-  printf(
-      "Reader returns frames grouped by segment, not strict timestamp "
-      "order.\n");
+  RTF_ASSERT(second_writer_threw);
+  RTF_ASSERT(ec == NANOTS_EC_DUPLICATE_STREAM_TAG);
 }
 
 void test_nanots::test_nanots_multiple_segments_same_stream() {
@@ -1390,4 +1348,76 @@ void test_nanots::test_nanots_query_contiguous_segments() {
   RTF_ASSERT(segments.size() == 2);
   RTF_ASSERT(segments[0].start_timestamp == 1);
   RTF_ASSERT(segments[1].end_timestamp == 1023);
+}
+
+void test_nanots::test_nanots_query_stream_tags() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Create multiple streams with data in different time ranges
+  {
+    auto video_ctx = db.create_write_context("video", "h264 1080p stream");
+    auto audio_ctx = db.create_write_context("audio", "aac 44.1khz stereo");
+    auto metadata_ctx = db.create_write_context("metadata", "sensor data");
+
+    // Write video frames: 1000-5000
+    for (int i = 0; i < 5; i++) {
+      std::string data = "video_frame_" + std::to_string(i);
+      uint64_t timestamp = 1000 + (i * 1000);
+      db.write(video_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x01);
+    }
+
+    // Write audio samples: 2000-6000 (overlaps with video)
+    for (int i = 0; i < 5; i++) {
+      std::string data = "audio_sample_" + std::to_string(i);
+      uint64_t timestamp = 2000 + (i * 1000);
+      db.write(audio_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x02);
+    }
+
+    // Write metadata: 8000-12000 (non-overlapping)
+    for (int i = 0; i < 5; i++) {
+      std::string data = "sensor_" + std::to_string(i);
+      uint64_t timestamp = 8000 + (i * 1000);
+      db.write(metadata_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x03);
+    }
+  }
+
+  nanots_reader reader("nanots_test_4mb.nts");
+
+  // Test query_stream_tags for different time ranges
+  
+  // Query range that includes all streams (1000-12000)
+  auto all_tags = reader.query_stream_tags(1000, 12000);
+  std::set<std::string> all_tags_set(all_tags.begin(), all_tags.end());
+  RTF_ASSERT(all_tags_set.size() == 3);
+  RTF_ASSERT(all_tags_set.count("video") == 1);
+  RTF_ASSERT(all_tags_set.count("audio") == 1);
+  RTF_ASSERT(all_tags_set.count("metadata") == 1);
+
+  // Query range that includes only video and audio (2000-6000)
+  auto video_audio_tags = reader.query_stream_tags(2000, 6000);
+  std::set<std::string> video_audio_set(video_audio_tags.begin(), video_audio_tags.end());
+  RTF_ASSERT(video_audio_set.size() == 2);
+  RTF_ASSERT(video_audio_set.count("video") == 1);
+  RTF_ASSERT(video_audio_set.count("audio") == 1);
+  RTF_ASSERT(video_audio_set.count("metadata") == 0);
+
+  // Query range that includes only metadata (8000-12000)
+  auto metadata_tags = reader.query_stream_tags(8000, 12000);
+  std::set<std::string> metadata_set(metadata_tags.begin(), metadata_tags.end());
+  RTF_ASSERT(metadata_set.size() == 1);
+  RTF_ASSERT(metadata_set.count("metadata") == 1);
+  RTF_ASSERT(metadata_set.count("video") == 0);
+  RTF_ASSERT(metadata_set.count("audio") == 0);
+
+  // Query range with no data (20000-25000)
+  auto empty_tags = reader.query_stream_tags(20000, 25000);
+  RTF_ASSERT(empty_tags.empty());
+
+  // Query range that includes only video (1000-1500)
+  auto video_only_tags = reader.query_stream_tags(1000, 1500);
+  std::set<std::string> video_only_set(video_only_tags.begin(), video_only_tags.end());
+  RTF_ASSERT(video_only_set.size() == 1);
+  RTF_ASSERT(video_only_set.count("video") == 1);
+  RTF_ASSERT(video_only_set.count("audio") == 0);
+  RTF_ASSERT(video_only_set.count("metadata") == 0);
 }

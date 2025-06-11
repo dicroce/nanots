@@ -27,6 +27,8 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <mutex>
+#include <set>
 
 #ifdef _WIN32
 #include <Rpc.h>
@@ -347,8 +349,45 @@ void s_to_entropy_id(const std::string& idS, uint8_t* id);
 #define NANOTS_H
 
 
-// TODO: Keep track of active stream_tag's and disallow multiple writers for any
-// single stream_tag.
+extern "C" {
+
+enum nanots_ec_t {
+  NANOTS_EC_OK = 0,
+  NANOTS_EC_CANT_OPEN = 1,
+  NANOTS_EC_SCHEMA = 2,
+  NANOTS_EC_NO_FREE_BLOCKS = 3,
+  NANOTS_EC_INVALID_BLOCK_SIZE = 4,
+  NANOTS_EC_DUPLICATE_STREAM_TAG = 5,
+  NANOTS_EC_UNABLE_TO_CREATE_SEGMENT = 6,
+  NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK = 7,
+  NANOTS_EC_NON_MONOTONIC_TIMESTAMP = 8,
+  NANOTS_EC_ROW_SIZE_TOO_BIG = 9,
+  NANOTS_EC_UNABLE_TO_ALLOCATE_FILE = 10,
+  NANOTS_EC_INVALID_ARGUMENT = 11,
+  NANOTS_EC_UNKNOWN = 12
+};
+
+}
+
+class nanots_exception : public std::exception {
+public:
+  nanots_exception(nanots_ec_t ec, const std::string& message, const std::string& file, int line) : _ec(ec), _message(message), _file(file), _line(line) {}
+  nanots_exception(const nanots_exception& other) = default;
+  nanots_exception& operator=(const nanots_exception& other) = default;
+  nanots_exception(nanots_exception&& other) noexcept = default;
+  nanots_exception& operator=(nanots_exception&& other) noexcept = default;
+  nanots_ec_t get_ec() const { return _ec; }
+  const char* what() const noexcept override {
+    _formatted_message = format_s("%s:%d: %d(%s)", _file.c_str(), _line, _ec, _message.c_str());
+    return _formatted_message.c_str();
+  }
+private:
+  nanots_ec_t _ec;
+  std::string _message;
+  mutable std::string _formatted_message;
+  std::string _file;
+  int _line;
+};
 
 #define FILE_HEADER_BLOCK_SIZE 65536
 // 8 + 4 + 4 bytes (with padding)
@@ -449,6 +488,7 @@ class nanots_writer {
   uint32_t _block_size;
   uint32_t _n_blocks;
   bool _auto_reclaim;
+  std::set<std::string> _active_stream_tags;
 };
 
 struct contiguous_segment {
@@ -472,6 +512,8 @@ class nanots_reader {
       int64_t end_timestamp,
       const std::function<
           void(const uint8_t*, size_t, uint8_t, int64_t, int64_t)>& callback);
+  
+  std::vector<std::string> query_stream_tags(int64_t start_timestamp, int64_t end_timestamp);
 
   std::vector<contiguous_segment> query_contiguous_segments(
       const std::string& stream_tag,
@@ -569,15 +611,6 @@ typedef struct nanots_write_context_handle* nanots_write_context_t;
 typedef struct nanots_reader_handle* nanots_reader_t;
 typedef struct nanots_iterator_handle* nanots_iterator_t;
 
-typedef enum {
-  NANOTS_OK = 0,
-  NANOTS_ERROR = -1,
-  NANOTS_INVALID_HANDLE = -2,
-  NANOTS_INVALID_TIMESTAMP = -3,
-  NANOTS_FRAME_TOO_LARGE = -4,
-  NANOTS_NO_FREE_BLOCKS = -5
-} nanots_result_t;
-
 typedef struct {
   int64_t segment_id;
   int64_t start_timestamp;
@@ -599,6 +632,12 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        int64_t block_sequence,
                                        void* user_data);
 
+typedef void (*nanots_stream_tag_callback_t)(const char* stream_tag,
+                                             void* user_data);
+
+nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
+
+// writer
 nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
 
 void nanots_writer_destroy(nanots_writer_t writer);
@@ -609,34 +648,37 @@ nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
 
 void nanots_write_context_destroy(nanots_write_context_t context);
 
-nanots_result_t nanots_writer_write(nanots_writer_t writer,
+nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
                                     int64_t timestamp,
                                     uint8_t flags);
 
-nanots_result_t nanots_writer_free_blocks(nanots_writer_t writer,
-                                          const char* stream_tag,
-                                          int64_t start_timestamp,
-                                          int64_t end_timestamp);
+nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
+                                      const char* stream_tag,
+                                      int64_t start_timestamp,
+                                      int64_t end_timestamp);
 
-nanots_result_t nanots_writer_allocate_file(const char* file_name,
-                                            uint32_t block_size,
-                                            uint32_t n_blocks);
-
+// reader
 nanots_reader_t nanots_reader_create(const char* file_name);
 
 void nanots_reader_destroy(nanots_reader_t reader);
 
-nanots_result_t nanots_reader_read(nanots_reader_t reader,
-                                   const char* stream_tag,
-                                   int64_t start_timestamp,
-                                   int64_t end_timestamp,
-                                   nanots_read_callback_t callback,
-                                   void* user_data);
+nanots_ec_t nanots_reader_read(nanots_reader_t reader,
+                               const char* stream_tag,
+                               int64_t start_timestamp,
+                               int64_t end_timestamp,
+                               nanots_read_callback_t callback,
+                               void* user_data);
 
-nanots_result_t nanots_reader_query_contiguous_segments(
+nanots_ec_t nanots_reader_query_stream_tags(nanots_reader_t reader,
+                                            int64_t start_timestamp,
+                                            int64_t end_timestamp,
+                                            nanots_stream_tag_callback_t callback,
+                                            void* user_data);
+
+nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
@@ -644,26 +686,27 @@ nanots_result_t nanots_reader_query_contiguous_segments(
     nanots_contiguous_segment_t** segments,
     size_t* count);
 
-void nanots_free_segments(nanots_contiguous_segment_t* segments);
+void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
 
+// iterator
 nanots_iterator_t nanots_iterator_create(const char* file_name,
                                          const char* stream_tag);
 void nanots_iterator_destroy(nanots_iterator_t iterator);
 
 int nanots_iterator_valid(nanots_iterator_t iterator);
 
-nanots_result_t nanots_iterator_get_current_frame(
+nanots_ec_t nanots_iterator_get_current_frame(
     nanots_iterator_t iterator,
     nanots_frame_info_t* frame_info);
 
-nanots_result_t nanots_iterator_next(nanots_iterator_t iterator);
+nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
 
-nanots_result_t nanots_iterator_prev(nanots_iterator_t iterator);
+nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
 
-nanots_result_t nanots_iterator_find(nanots_iterator_t iterator,
+nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
 
-nanots_result_t nanots_iterator_reset(nanots_iterator_t iterator);
+nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 
 int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 

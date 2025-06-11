@@ -896,6 +896,9 @@ void s_to_entropy_id(const std::string& idS, uint8_t* id) {
 /* NANOTS */
 
 
+std::mutex current_stream_tags_lok;
+std::set<std::string> current_stream_tags;
+
 static uint32_t _round_to_64k_boundary(uint32_t requested_size) {
   const uint32_t BOUNDARY = 65536;  // 64KB
 
@@ -929,7 +932,7 @@ static void _validate_blocks(const std::string& file_name) {
   auto f = nts_file::open(file_name, "r+");
 
   if (!f)
-    throw std::runtime_error("r_nanots: unable to open file.");
+    throw nanots_exception(NANOTS_EC_CANT_OPEN, "Unable to open file.", __FILE__, __LINE__);
 
   uint32_t block_size = 0;
 
@@ -1032,12 +1035,9 @@ static void _validate_blocks(const std::string& file_name) {
 static int _get_db_version(const nts_sqlite_conn& conn) {
   auto result = conn.exec("PRAGMA user_version;");
   if (result.empty())
-    throw std::runtime_error("Unable to query database version.");
+    throw nanots_exception(NANOTS_EC_SCHEMA, "Unable to query database version.", __FILE__, __LINE__);
 
   auto row = result.front();
-  if (row.empty())
-    throw std::runtime_error(
-        "Invalid result from database query while fetching db version.");
 
   return std::stoi(row.begin()->second.value());
 }
@@ -1110,7 +1110,7 @@ static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
   if (auto_reclaim)
     return _db_reclaim_oldest_used_block(conn);
   else
-    throw std::runtime_error("r_nanots: unable to get free block.");
+    throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
 }
 
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
@@ -1218,6 +1218,9 @@ static void _recycle_block(write_context& wctx, int64_t timestamp) {
 }
 
 write_context::~write_context() {
+  std::lock_guard<std::mutex> g(current_stream_tags_lok);
+  current_stream_tags.erase(stream_tag);
+
   if (last_timestamp && current_block) {
     auto db_name = _database_name(file_name);
     nts_sqlite_conn conn(db_name, true, true);
@@ -1243,9 +1246,10 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       _file_header_p((uint8_t*)_file_header_mm.map()),
       _block_size(*(uint32_t*)_file_header_p),
       _n_blocks(*(uint32_t*)(_file_header_p + sizeof(uint32_t))),
-      _auto_reclaim(auto_reclaim) {
+      _auto_reclaim(auto_reclaim),
+      _active_stream_tags() {
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
-    throw std::runtime_error("r_nanots: invalid block size in file header");
+    throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn db(db_name, true, true);
@@ -1255,6 +1259,11 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
 
 write_context nanots_writer::create_write_context(const std::string& stream_tag,
                                                   const std::string& metadata) {
+
+  std::lock_guard<std::mutex> g(current_stream_tags_lok);
+  if(current_stream_tags.find(stream_tag) != current_stream_tags.end())
+    throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Only one current writer per active stream tag.", __FILE__, __LINE__);
+
   write_context wctx;
   wctx.metadata = metadata;
   wctx.stream_tag = stream_tag;
@@ -1264,11 +1273,16 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
 
   nts_sqlite_conn conn(db_name.c_str(), true, true);
 
+  if(_active_stream_tags.find(stream_tag) != _active_stream_tags.end())
+    throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Stream tag already exists.", __FILE__, __LINE__);
+
   nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
     wctx.current_segment = _db_create_segment(conn, stream_tag, metadata);
     if (!wctx.current_segment)
-      throw std::runtime_error("r_nanots: unable to create segment.");
+      throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
   });
+
+  current_stream_tags.insert(stream_tag);
 
   return wctx;
 }
@@ -1279,12 +1293,11 @@ void nanots_writer::write(write_context& wctx,
                           int64_t timestamp,
                           uint8_t flags) {
   if (wctx.last_timestamp && timestamp <= wctx.last_timestamp.value())
-    throw std::runtime_error("r_nanots: timestamp is not monotonic.");
+    throw nanots_exception(NANOTS_EC_NON_MONOTONIC_TIMESTAMP, "Timestamp is not monotonic.", __FILE__, __LINE__);
 
   if (size >
       _block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE))
-    throw std::runtime_error(
-        "r_nanots: frame size is too large. Use a much larger block size.");
+    throw nanots_exception(NANOTS_EC_ROW_SIZE_TOO_BIG, "Frame size is too large. Use a much larger block size.", __FILE__, __LINE__);
 
   if (!wctx.current_block) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
@@ -1292,7 +1305,7 @@ void nanots_writer::write(write_context& wctx,
     nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
       auto block = _db_get_block(conn, _auto_reclaim);
       if (!block)
-        throw std::runtime_error("r_nanots: unable to get free block.");
+        throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
 
       uint8_t uuid[16];
       generate_entropy_id(uuid);
@@ -1302,7 +1315,7 @@ void nanots_writer::write(write_context& wctx,
           block->id, block->idx, timestamp, 0, uuid);
 
       if (!wctx.current_block)
-        throw std::runtime_error("r_nanots: unable to create segment block.");
+        throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
 
       wctx.current_segment->sequence++;
     });
@@ -1423,7 +1436,7 @@ void nanots_writer::allocate(const std::string& file_name,
     auto f = nts_file::open(file_name, "w+");
 
     if (fallocate(f, file_size) < 0)
-      throw std::runtime_error("r_nanots: unable to allocate file.");
+      throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE, "Unable to allocate file.", __FILE__, __LINE__);
   }
 
   {
@@ -1641,6 +1654,26 @@ void nanots_reader::read(
                timestamp, block_sequence);
     }
   }
+}
+
+std::vector<std::string> nanots_reader::query_stream_tags(int64_t start_timestamp, int64_t end_timestamp) {
+  nts_sqlite_conn db(_database_name(_file_name), false, true);
+
+  auto stmt = db.prepare(
+      "SELECT DISTINCT s.stream_tag "
+      "FROM segments s "
+      "JOIN segment_blocks sb ON s.id = sb.segment_id "
+      "WHERE sb.start_timestamp <= ? AND sb.end_timestamp >= ?;");
+  auto results =
+      stmt.bind(1, end_timestamp).bind(2, start_timestamp).exec();
+
+  std::vector<std::string> stream_tags;
+
+  for (auto& row : results) {
+      stream_tags.push_back(row["stream_tag"].value());
+  }
+
+  return stream_tags;
 }
 
 std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
@@ -2072,6 +2105,17 @@ struct nanots_iterator_handle {
   ~nanots_iterator_handle() { delete iterator; }
 };
 
+nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks) {
+  try {
+    nanots_writer::allocate(std::string(file_name), block_size, n_blocks);
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (...) {
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
 nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim) {
   try {
     auto* writer = new nanots_writer(std::string(file_name), auto_reclaim != 0);
@@ -2105,63 +2149,44 @@ void nanots_write_context_destroy(nanots_write_context_t context) {
   delete context;
 }
 
-nanots_result_t nanots_writer_write(nanots_writer_t writer,
-                                    nanots_write_context_t context,
-                                    const uint8_t* data,
-                                    size_t size,
-                                    int64_t timestamp,
-                                    uint8_t flags) {
+nanots_ec_t nanots_writer_write(nanots_writer_t writer,
+                                nanots_write_context_t context,
+                                const uint8_t* data,
+                                size_t size,
+                                int64_t timestamp,
+                                uint8_t flags) {
   if (!writer || !writer->writer) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
   if (!context) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     writer->writer->write(context->context, data, size, timestamp, flags);
-    return NANOTS_OK;
-  } catch (const std::runtime_error& e) {
-    std::string msg = e.what();
-    if (msg.find("timestamp is not monotonic") != std::string::npos) {
-      return NANOTS_INVALID_TIMESTAMP;
-    }
-    if (msg.find("frame size is too large") != std::string::npos) {
-      return NANOTS_FRAME_TOO_LARGE;
-    }
-    if (msg.find("unable to get free block") != std::string::npos) {
-      return NANOTS_NO_FREE_BLOCKS;
-    }
-    return NANOTS_ERROR;
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_writer_free_blocks(nanots_writer_t writer,
+nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
                                           int64_t end_timestamp) {
   if (!writer || !writer->writer) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     writer->writer->free_blocks(std::string(stream_tag), start_timestamp, end_timestamp);
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
   } catch (...) {
-    return NANOTS_ERROR;
-  }
-}
-
-nanots_result_t nanots_writer_allocate_file(const char* file_name,
-                                            uint32_t block_size,
-                                            uint32_t n_blocks) {
-  try {
-    nanots_writer::allocate(std::string(file_name), block_size, n_blocks);
-    return NANOTS_OK;
-  } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
@@ -2183,17 +2208,17 @@ struct nanots_callback_context {
   void* user_data;
 };
 
-nanots_result_t nanots_reader_read(nanots_reader_t reader,
-                                   const char* stream_tag,
-                                   int64_t start_timestamp,
-                                   int64_t end_timestamp,
-                                   nanots_read_callback_t callback,
-                                   void* user_data) {
+nanots_ec_t nanots_reader_read(nanots_reader_t reader,
+                               const char* stream_tag,
+                               int64_t start_timestamp,
+                               int64_t end_timestamp,
+                               nanots_read_callback_t callback,
+                               void* user_data) {
   if (!reader || !reader->reader) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
   if (!callback) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
@@ -2204,13 +2229,40 @@ nanots_result_t nanots_reader_read(nanots_reader_t reader,
                            ctx.callback(data, size, flags, timestamp,
                                         block_sequence, ctx.user_data);
                          });
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_reader_query_contiguous_segments(
+nanots_ec_t nanots_reader_query_stream_tags(nanots_reader_t reader,
+                                            int64_t start_timestamp,
+                                            int64_t end_timestamp,
+                                            nanots_stream_tag_callback_t callback,
+                                            void* user_data) {
+  if (!reader || !reader->reader) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+  if (!callback) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+
+  try {
+    auto stream_tags = reader->reader->query_stream_tags(start_timestamp, end_timestamp);
+    for (const auto& tag : stream_tags) {
+      callback(tag.c_str(), user_data);
+    }
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (...) {
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
+nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
@@ -2218,10 +2270,10 @@ nanots_result_t nanots_reader_query_contiguous_segments(
     nanots_contiguous_segment_t** segments,
     size_t* count) {
   if (!reader || !reader->reader) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
   if (!segments || !count) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
@@ -2231,13 +2283,13 @@ nanots_result_t nanots_reader_query_contiguous_segments(
     *count = cpp_segments.size();
     if (*count == 0) {
       *segments = nullptr;
-      return NANOTS_OK;
+      return NANOTS_EC_OK;
     }
 
     *segments = (nanots_contiguous_segment_t*)malloc(
         *count * sizeof(nanots_contiguous_segment_t));
     if (!*segments) {
-      return NANOTS_ERROR;
+      return NANOTS_EC_UNKNOWN;
     }
 
     for (size_t i = 0; i < *count; i++) {
@@ -2246,13 +2298,15 @@ nanots_result_t nanots_reader_query_contiguous_segments(
       (*segments)[i].end_timestamp = cpp_segments[i].end_timestamp;
     }
 
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-void nanots_free_segments(nanots_contiguous_segment_t* segments) {
+void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments) {
   free(segments);
 }
 
@@ -2278,17 +2332,17 @@ int nanots_iterator_valid(nanots_iterator_t iterator) {
   return iterator->iterator->valid() ? 1 : 0;
 }
 
-nanots_result_t nanots_iterator_get_current_frame(
+nanots_ec_t nanots_iterator_get_current_frame(
     nanots_iterator_t iterator,
     nanots_frame_info_t* frame_info) {
   if (!iterator || !iterator->iterator) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
   if (!frame_info) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
   if (!iterator->iterator->valid()) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
@@ -2298,62 +2352,62 @@ nanots_result_t nanots_iterator_get_current_frame(
     frame_info->flags = frame.flags;
     frame_info->timestamp = frame.timestamp;
     frame_info->block_sequence = frame.block_sequence;
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_iterator_next(nanots_iterator_t iterator) {
+nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator) {
   if (!iterator || !iterator->iterator) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     ++(*iterator->iterator);
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_iterator_prev(nanots_iterator_t iterator) {
+nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator) {
   if (!iterator || !iterator->iterator) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     --(*iterator->iterator);
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_iterator_find(nanots_iterator_t iterator,
+nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp) {
   if (!iterator || !iterator->iterator) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     bool found = iterator->iterator->find(timestamp);
-    return found ? NANOTS_OK : NANOTS_ERROR;
+    return found ? NANOTS_EC_OK : NANOTS_EC_INVALID_ARGUMENT;
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
-nanots_result_t nanots_iterator_reset(nanots_iterator_t iterator) {
+nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator) {
   if (!iterator || !iterator->iterator) {
-    return NANOTS_INVALID_HANDLE;
+    return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
     iterator->iterator->reset();
-    return NANOTS_OK;
+    return NANOTS_EC_OK;
   } catch (...) {
-    return NANOTS_ERROR;
+    return NANOTS_EC_UNKNOWN;
   }
 }
 
@@ -2368,6 +2422,7 @@ int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator) {
     return 0;
   }
 }
+
 }
 
 /* NANOTS */

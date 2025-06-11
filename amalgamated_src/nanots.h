@@ -392,13 +392,13 @@ private:
 #define FILE_HEADER_BLOCK_SIZE 65536
 // 8 + 4 + 4 bytes (with padding)
 #define BLOCK_HEADER_SIZE 16
-// 8 + 4 bytes
-#define INDEX_ENTRY_SIZE 12
+// 8 + 8 bytes
+#define INDEX_ENTRY_SIZE 16
 // 16 + 1 + 4 bytes
 #define FRAME_HEADER_SIZE 21
 #define FRAME_UUID_OFFSET 0
-#define FRAME_FLAGS_OFFSET 16
-#define FRAME_SIZE_OFFSET 17
+#define FRAME_SIZE_OFFSET 16
+#define FRAME_FLAGS_OFFSET 20
 
 struct block_header {
   int64_t block_start_timestamp{0};
@@ -632,9 +632,6 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        int64_t block_sequence,
                                        void* user_data);
 
-typedef void (*nanots_stream_tag_callback_t)(const char* stream_tag,
-                                             void* user_data);
-
 nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
 
 // writer
@@ -672,12 +669,6 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
                                nanots_read_callback_t callback,
                                void* user_data);
 
-nanots_ec_t nanots_reader_query_stream_tags(nanots_reader_t reader,
-                                            int64_t start_timestamp,
-                                            int64_t end_timestamp,
-                                            nanots_stream_tag_callback_t callback,
-                                            void* user_data);
-
 nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
@@ -687,6 +678,12 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     size_t* count);
 
 void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
+
+nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
+                                                  int64_t start_timestamp,
+                                                  int64_t end_timestamp);
+
+const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);
 
 // iterator
 nanots_iterator_t nanots_iterator_create(const char* file_name,

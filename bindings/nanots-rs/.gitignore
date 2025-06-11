@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Ignore auto-copied sources (they get regenerated)
+src/nanots/
+
+# But keep the directory structure and README
+!src/nanots/
+!src/nanots/README.md

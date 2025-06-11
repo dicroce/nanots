@@ -916,10 +916,11 @@ static bool _validate_frame_header(const uint8_t* frame_p,
   if (memcmp(frame_p + FRAME_UUID_OFFSET, expected_uuid, 16) != 0)
     return false;
 
-  if (flags_out)
-    *flags_out = *(frame_p + FRAME_FLAGS_OFFSET);
   if (size_out)
     *size_out = *(uint32_t*)(frame_p + FRAME_SIZE_OFFSET);
+
+  if (flags_out)
+    *flags_out = *(frame_p + FRAME_FLAGS_OFFSET);
 
   return true;
 }
@@ -1336,19 +1337,25 @@ void nanots_writer::write(write_context& wctx,
 
   uint32_t n_valid_indexes = *(uint32_t*)(block_p + 8);
 
-  uint32_t index_end =
+  uint64_t index_end =
       BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
 
-  uint32_t new_block_ofs = (uint32_t)(_block_size - (size + FRAME_HEADER_SIZE));
+  // Calculate padded frame size for 8-byte alignment (required for ARM compatibility)
+  uint32_t total_frame_size = FRAME_HEADER_SIZE + size;
+  uint32_t padded_frame_size = (total_frame_size + 7) & ~7;  // Round up to multiple of 8
+
+  uint64_t new_block_ofs = (uint64_t)(_block_size - padded_frame_size);
 
   if (n_valid_indexes > 0) {
     uint8_t* last_index_p = block_p + BLOCK_HEADER_SIZE +
                             ((n_valid_indexes - 1) * INDEX_ENTRY_SIZE);
-    uint32_t last_frame_offset = *(uint32_t*)(last_index_p + 8);
-    uint32_t needed_size = (uint32_t)(size + FRAME_HEADER_SIZE);
-    new_block_ofs = (last_frame_offset > needed_size)
-                        ? (last_frame_offset - needed_size)
-                        : index_end;
+    uint64_t last_frame_offset = *(uint64_t*)(last_index_p + 8);
+    if (last_frame_offset >= padded_frame_size) {
+      uint64_t candidate_ofs = last_frame_offset - padded_frame_size;
+      new_block_ofs = (candidate_ofs >= index_end) ? candidate_ofs : index_end;
+    } else {
+      new_block_ofs = index_end;  // Force rollover to new block
+    }
   }
 
   if (index_end >= new_block_ofs) {
@@ -1368,14 +1375,14 @@ void nanots_writer::write(write_context& wctx,
 
   uint8_t* frame_p = block_p + new_block_ofs;
   memcpy(frame_p, wctx.current_block->uuid, 16);
-  *(frame_p + 16) = flags;
-  *(uint32_t*)(frame_p + 17) = (uint32_t)size;
+  *(uint32_t*)(frame_p + 16) = (uint32_t)size;
+  *(frame_p + 20) = flags;
   memcpy(frame_p + FRAME_HEADER_SIZE, data, size);
 
   uint8_t* index_p =
       block_p + BLOCK_HEADER_SIZE + (n_valid_indexes * INDEX_ENTRY_SIZE);
   *(int64_t*)index_p = timestamp;
-  *(uint32_t*)(index_p + 8) = new_block_ofs;
+  *(uint64_t*)(index_p + 8) = new_block_ofs;
 
   auto valid_counter = (uint32_t*)(block_p + 8);
 
@@ -1634,7 +1641,7 @@ void nanots_reader::read(
     for (size_t i = start_index; i < n_valid_indexes; i++) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
       int64_t timestamp = *(int64_t*)index_p;
-      uint32_t offset = *(uint32_t*)(index_p + 8);
+      uint64_t offset = *(uint64_t*)(index_p + 8);
 
       // Check if we've passed the end time
       if (timestamp > end_timestamp)
@@ -1663,7 +1670,7 @@ std::vector<std::string> nanots_reader::query_stream_tags(int64_t start_timestam
       "SELECT DISTINCT s.stream_tag "
       "FROM segments s "
       "JOIN segment_blocks sb ON s.id = sb.segment_id "
-      "WHERE sb.start_timestamp <= ? AND sb.end_timestamp >= ?;");
+      "WHERE sb.start_timestamp <= ? AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0);");
   auto results =
       stmt.bind(1, end_timestamp).bind(2, start_timestamp).exec();
 
@@ -1698,7 +1705,7 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
       "FROM segment_blocks sb "
       "JOIN segments s ON sb.segment_id = s.id "
       "WHERE sb.start_timestamp <= ? "
-      "AND sb.end_timestamp >= ? "
+      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
       "AND s.stream_tag = ? "
       "), "
       "region_boundaries AS ( "
@@ -1710,7 +1717,7 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
       "COUNT(*) AS block_count "
       "FROM contiguous_groups "
       "GROUP BY segment_id, group_key "
-      ") "  // <-- REMOVED THE COMMA HERE
+      ") "
       "SELECT "
       "segment_id, "
       "region_start, "
@@ -1951,7 +1958,7 @@ bool nanots_iterator::_load_current_frame() {
   uint8_t* index_p = block->block_p + BLOCK_HEADER_SIZE +
                      (_current_frame_idx * INDEX_ENTRY_SIZE);
   int64_t timestamp = *(int64_t*)index_p;
-  uint32_t offset = *(uint32_t*)(index_p + 8);
+  uint64_t offset = *(uint64_t*)(index_p + 8);
 
   // Validate frame header
   uint8_t flags;
@@ -2095,7 +2102,9 @@ struct nanots_write_context_handle {
 
 struct nanots_reader_handle {
   nanots_reader* reader;
-  nanots_reader_handle(nanots_reader* r) : reader(r) {}
+  std::vector<std::string> cached_stream_tags;
+  size_t stream_tags_iterator;
+  nanots_reader_handle(nanots_reader* r) : reader(r), stream_tags_iterator(0) {}
   ~nanots_reader_handle() { delete reader; }
 };
 
@@ -2237,31 +2246,6 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
   }
 }
 
-nanots_ec_t nanots_reader_query_stream_tags(nanots_reader_t reader,
-                                            int64_t start_timestamp,
-                                            int64_t end_timestamp,
-                                            nanots_stream_tag_callback_t callback,
-                                            void* user_data) {
-  if (!reader || !reader->reader) {
-    return NANOTS_EC_INVALID_ARGUMENT;
-  }
-  if (!callback) {
-    return NANOTS_EC_INVALID_ARGUMENT;
-  }
-
-  try {
-    auto stream_tags = reader->reader->query_stream_tags(start_timestamp, end_timestamp);
-    for (const auto& tag : stream_tags) {
-      callback(tag.c_str(), user_data);
-    }
-    return NANOTS_EC_OK;
-  } catch (const nanots_exception& e) {
-    return e.get_ec();
-  } catch (...) {
-    return NANOTS_EC_UNKNOWN;
-  }
-}
-
 nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
@@ -2308,6 +2292,38 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
 
 void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments) {
   free(segments);
+}
+
+nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
+                                                  int64_t start_timestamp,
+                                                  int64_t end_timestamp) {
+  if (!reader || !reader->reader) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+
+  try {
+    reader->cached_stream_tags = reader->reader->query_stream_tags(start_timestamp, end_timestamp);
+    reader->stream_tags_iterator = 0;
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (...) {
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
+const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader) {
+  if (!reader || !reader->reader) {
+    return nullptr;
+  }
+
+  if (reader->stream_tags_iterator >= reader->cached_stream_tags.size()) {
+    return nullptr;
+  }
+
+  const char* result = reader->cached_stream_tags[reader->stream_tags_iterator].c_str();
+  reader->stream_tags_iterator++;
+  return result;
 }
 
 nanots_iterator_t nanots_iterator_create(const char* file_name,

@@ -1,0 +1,4 @@
+include nanots.pyx
+recursive-include ../../amlagamated_src *.cpp
+recursive-include ../../amlagamated_src *.h
+recursive-include ../../amlagamated_src *.c

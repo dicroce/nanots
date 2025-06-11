@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "cython>=0.29.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanots"
+version = "0.1.0"
+description = "Python bindings for nanots embedded time series database"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/dicroce/nanots"
+Repository = "https://github.com/dicroce/nanots"
+Issues = "https://github.com/dicroce/nanots/issues"
+
+[tool.setuptools]
+# For single module extensions, don't specify packages
+py-modules = ["nanots"]
+
+[tool.setuptools.package-data]
+"*" = ["*.pyx", "*.pxd"]

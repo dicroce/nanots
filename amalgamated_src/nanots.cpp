@@ -1002,7 +1002,7 @@ static void _validate_blocks(const std::string& file_name) {
     for (int i = n_valid_indexes - 1; i >= 0; i--) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
       int64_t timestamp = *(int64_t*)index_p;
-      uint32_t offset = *(uint32_t*)(index_p + 8);
+      uint64_t offset = *(uint64_t*)(index_p + 8);
 
       if (timestamp == 0 || offset == 0)
         continue;  // Skip zeroed entries

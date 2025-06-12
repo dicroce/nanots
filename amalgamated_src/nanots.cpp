@@ -602,7 +602,24 @@ int fallocate(FILE* file, uint64_t size) {
     return -1;
   SetEndOfFile((HANDLE)_get_osfhandle(filenum(file)));
   return 0;
-  // return ( _chsize_s( filenum( file ), size ) == 0) ? 0 : -1;
+#elif defined(__APPLE__)
+  // macOS: Use fcntl with F_PREALLOCATE for actual space allocation
+  fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, (off_t)size, 0};
+  int fd = filenum(file);
+  
+  // Try contiguous allocation first
+  int result = fcntl(fd, F_PREALLOCATE, &store);
+  if (result == -1) {
+    // Fall back to non-contiguous allocation
+    store.fst_flags = F_ALLOCATEALL;
+    result = fcntl(fd, F_PREALLOCATE, &store);
+  }
+  
+  if (result == -1)
+    return -1;
+    
+  // Set the file size
+  return ftruncate(fd, size);
 #else
   return posix_fallocate64(filenum(file), 0, size);
 #endif
@@ -1341,7 +1358,7 @@ void nanots_writer::write(write_context& wctx,
       BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
 
   // Calculate padded frame size for 8-byte alignment (required for ARM compatibility)
-  uint32_t total_frame_size = FRAME_HEADER_SIZE + size;
+  uint32_t total_frame_size = (uint32_t)(FRAME_HEADER_SIZE + size);
   uint32_t padded_frame_size = (total_frame_size + 7) & ~7;  // Round up to multiple of 8
 
   uint64_t new_block_ofs = (uint64_t)(_block_size - padded_frame_size);

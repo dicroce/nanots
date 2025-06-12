@@ -16,15 +16,16 @@ jobs:
       # Set fail-fast to false to ensure that feedback is delivered for all matrix combinations. Consider changing this to true when your workflow is stable.
       fail-fast: false
 
-      # Set up a matrix to run the following 2 configurations:
+      # Set up a matrix to run the following 3 configurations:
       # 1. <Windows, Release, latest MSVC compiler toolchain on the default runner image, default generator>
       # 2. <Linux, Release, latest GCC compiler toolchain on the default runner image, default generator>
+      # 3. <macOS, Release, latest Clang compiler toolchain on the default runner image, default generator>
       #
       # To add more build types (Release, Debug, RelWithDebInfo, etc.) customize the build_type list.
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         build_type: [Release]
-        c_compiler: [gcc, cl]
+        c_compiler: [gcc, cl, clang]
         include:
           - os: windows-latest
             c_compiler: cl
@@ -32,10 +33,21 @@ jobs:
           - os: ubuntu-latest
             c_compiler: gcc
             cpp_compiler: g++
+          - os: macos-latest
+            c_compiler: clang
+            cpp_compiler: clang++
         exclude:
           - os: windows-latest
             c_compiler: gcc
+          - os: windows-latest
+            c_compiler: clang
           - os: ubuntu-latest
+            c_compiler: cl
+          - os: ubuntu-latest
+            c_compiler: clang
+          - os: macos-latest
+            c_compiler: gcc
+          - os: macos-latest
             c_compiler: cl
 
     steps:
@@ -73,3 +85,35 @@ jobs:
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
       # For multi-config generators, CMake puts the executable in a subdirectory matching the build type.
       run: ut/${{ matrix.build_type }}/nanots_ut.exe
+
+    - name: Test on macOS
+      if: runner.os == 'macOS'
+      working-directory: ${{ steps.strings.outputs.build-output-dir }}
+      # Run tests from the build directory
+      run: ut/nanots_ut
+
+  build-wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v2.16.5  # Updated to latest version
+      env:
+        # Build for Python 3.8-3.12
+        CIBW_BUILD: cp38-* cp39-* cp310-* cp311-* cp312-*
+        # Skip 32-bit builds and PyPy
+        CIBW_SKIP: "*-win32 *-manylinux_i686 pp*"
+      with:
+        package-dir: ./bindings/nanots_python
+        output-dir: wheelhouse
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+        path: ./wheelhouse/*.whl

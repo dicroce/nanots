@@ -448,7 +448,7 @@ void nanots_writer::write(write_context& wctx,
       BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
 
   // Calculate padded frame size for 8-byte alignment (required for ARM compatibility)
-  uint32_t total_frame_size = FRAME_HEADER_SIZE + size;
+  uint32_t total_frame_size = (uint32_t)(FRAME_HEADER_SIZE + size);
   uint32_t padded_frame_size = (total_frame_size + 7) & ~7;  // Round up to multiple of 8
 
   uint64_t new_block_ofs = (uint64_t)(_block_size - padded_frame_size);

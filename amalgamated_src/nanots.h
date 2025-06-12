@@ -438,8 +438,8 @@ struct write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;
   write_context& operator=(const write_context&) = delete;
-  write_context(write_context&& other) noexcept = default;
-  write_context& operator=(write_context&& other) noexcept = default;
+  write_context(write_context&& other) = default;
+  write_context& operator=(write_context&& other) = default;
 
   ~write_context();
 

@@ -598,7 +598,24 @@ int fallocate(FILE* file, uint64_t size) {
     return -1;
   SetEndOfFile((HANDLE)_get_osfhandle(filenum(file)));
   return 0;
-  // return ( _chsize_s( filenum( file ), size ) == 0) ? 0 : -1;
+#elif defined(__APPLE__)
+  // macOS: Use fcntl with F_PREALLOCATE for actual space allocation
+  fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, (off_t)size, 0};
+  int fd = filenum(file);
+  
+  // Try contiguous allocation first
+  int result = fcntl(fd, F_PREALLOCATE, &store);
+  if (result == -1) {
+    // Fall back to non-contiguous allocation
+    store.fst_flags = F_ALLOCATEALL;
+    result = fcntl(fd, F_PREALLOCATE, &store);
+  }
+  
+  if (result == -1)
+    return -1;
+    
+  // Set the file size
+  return ftruncate(fd, size);
 #else
   return posix_fallocate64(filenum(file), 0, size);
 #endif

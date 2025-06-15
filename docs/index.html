@@ -396,6 +396,34 @@
         </div>
     </section>
 
+    <section class="section">
+        <div class="container">
+            <h2 class="section-title">Use Cases</h2>
+            <div class="use-cases">
+                <div class="use-case">
+                    <div class="use-case-icon">🤖</div>
+                    <h3 class="use-case-title">Robotic Vision</h3>
+                    <p>Perfect for embedded robotics systems with continuous camera feeds. Pre-allocated storage eliminates administration - just set your buffer size and always have the newest frames for real-time processing.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">🚗</div>
+                    <h3 class="use-case-title">Self-Driving Cars</h3>
+                    <p>Ultra-fast writes handle multiple camera streams in real-time. Fixed storage allocation ensures consistent performance without filesystem administration in safety-critical autonomous systems.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">📊</div>
+                    <h3 class="use-case-title">IoT Sensor Data</h3>
+                    <p>High-frequency sensor readings, efficient storage of numeric telemetry, and time-based queries and analysis.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">💰</div>
+                    <h3 class="use-case-title">Financial Data</h3>
+                    <p>Trade tick data with microsecond precision, market data replay systems, and low-latency historical queries.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <section id="features" class="section">
         <div class="container">
             <h2 class="section-title">Key Features</h2>
@@ -406,6 +434,11 @@
                     <p>Memory-mapped storage with lock-free data structures enables maximum throughput with sub-microsecond performance.</p>
                 </div>
                 <div class="feature-card">
+                    <div class="feature-icon">💾</div>
+                    <h3 class="feature-title">Preallocated Storage</h3>
+                    <p>Avoid filesystem fragmentation and administration hassles with auto-recycle mode for continuous operation.</p>
+                </div>
+                <div class="feature-card">
                     <div class="feature-icon">🔧</div>
                     <h3 class="feature-title">Configurable Durability</h3>
                     <p>Trade-off between performance and data safety with configurable block sizes to match your application needs.</p>
@@ -414,11 +447,6 @@
                     <div class="feature-icon">🔄</div>
                     <h3 class="feature-title">Crash Recovery</h3>
                     <p>Automatic detection and recovery from unexpected shutdowns with frame-level atomicity guarantees.</p>
-                </div>
-                <div class="feature-card">
-                    <div class="feature-icon">💾</div>
-                    <h3 class="feature-title">Preallocated Storage</h3>
-                    <p>Avoid filesystem fragmentation and administration hassles with auto-recycle mode for continuous operation.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">🔀</div>
@@ -513,34 +541,6 @@ if (iter.find(target_timestamp)) {
                     Hybrid approach combining SQLite for metadata with memory-mapped binary files for data.
                     Block size is configurable and tunable for different applications.
                 </p>
-            </div>
-        </div>
-    </section>
-
-    <section class="section">
-        <div class="container">
-            <h2 class="section-title">Use Cases</h2>
-            <div class="use-cases">
-                <div class="use-case">
-                    <div class="use-case-icon">🤖</div>
-                    <h3 class="use-case-title">Robotic Vision</h3>
-                    <p>Perfect for embedded robotics systems with continuous camera feeds. Pre-allocated storage eliminates administration - just set your buffer size and always have the newest frames for real-time processing.</p>
-                </div>
-                <div class="use-case">
-                    <div class="use-case-icon">🚗</div>
-                    <h3 class="use-case-title">Self-Driving Cars</h3>
-                    <p>Ultra-fast writes handle multiple camera streams in real-time. Fixed storage allocation ensures consistent performance without filesystem administration in safety-critical autonomous systems.</p>
-                </div>
-                <div class="use-case">
-                    <div class="use-case-icon">📊</div>
-                    <h3 class="use-case-title">IoT Sensor Data</h3>
-                    <p>High-frequency sensor readings, efficient storage of numeric telemetry, and time-based queries and analysis.</p>
-                </div>
-                <div class="use-case">
-                    <div class="use-case-icon">💰</div>
-                    <h3 class="use-case-title">Financial Data</h3>
-                    <p>Trade tick data with microsecond precision, market data replay systems, and low-latency historical queries.</p>
-                </div>
             </div>
         </div>
     </section>

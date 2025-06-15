@@ -7,6 +7,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  release:
+    types: [published]
 
 jobs:
   build:
@@ -117,3 +119,40 @@ jobs:
       with:
         name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
         path: ./wheelhouse/*.whl
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build sdist
+      run: pipx run build --sdist
+      working-directory: ./bindings/nanots_python
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: cibw-sdist
+        path: ./bindings/nanots_python/dist/*.tar.gz
+
+  upload-to-pypi:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    # Only run on release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nanots  # Replace 'nanots' with your actual package name
+    permissions:
+      id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-*
+        path: dist
+        merge-multiple: true
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1

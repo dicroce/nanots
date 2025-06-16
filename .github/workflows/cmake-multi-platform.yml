@@ -109,7 +109,9 @@ jobs:
       run: |
         VERSION=${GITHUB_REF#refs/tags/v}
         echo "Setting version to: $VERSION"
-        sed -i 's/version = "[^"]*"/version = "'$VERSION'"/' ./bindings/nanots_python/pyproject.toml
+        # Use cross-platform sed syntax
+        sed -i.bak 's/version = "[^"]*"/version = "'$VERSION'"/' ./bindings/nanots_python/pyproject.toml
+        rm ./bindings/nanots_python/pyproject.toml.bak
         cat ./bindings/nanots_python/pyproject.toml | grep version
 
     - name: Build wheels
@@ -139,7 +141,9 @@ jobs:
       run: |
         VERSION=${GITHUB_REF#refs/tags/v}
         echo "Setting version to: $VERSION"
-        sed -i 's/version = "[^"]*"/version = "'$VERSION'"/' ./bindings/nanots_python/pyproject.toml
+        # Use cross-platform sed syntax
+        sed -i.bak 's/version = "[^"]*"/version = "'$VERSION'"/' ./bindings/nanots_python/pyproject.toml
+        rm ./bindings/nanots_python/pyproject.toml.bak
         cat ./bindings/nanots_python/pyproject.toml | grep version
 
     - name: Build sdist

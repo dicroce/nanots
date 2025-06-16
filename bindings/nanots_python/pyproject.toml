@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "cython>=0.29.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm", "cython>=0.29.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanots"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Python bindings for nanots embedded time series database"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}
@@ -37,3 +37,7 @@ py-modules = ["nanots"]
 
 [tool.setuptools.package-data]
 "*" = ["*.pyx", "*.pxd"]
+
+[tool.setuptools_scm]
+# Automatically derive version from Git tags
+# This will use your release tags (v0.1.0, v0.2.0, etc.) as the package version

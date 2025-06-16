@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm", "cython>=0.29.0", "wheel"]
+requires = ["setuptools>=61.0", "cython>=0.29.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanots"
-dynamic = ["version"]
+version = "0.2.0"
 description = "Python bindings for nanots embedded time series database"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "MIT"}
@@ -37,5 +37,3 @@ py-modules = ["nanots"]
 
 [tool.setuptools.package-data]
 "*" = ["*.pyx", "*.pxd"]
-
-[tool.setuptools_scm]

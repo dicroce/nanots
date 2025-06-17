@@ -398,6 +398,10 @@ cdef class Iterator:
     
     def __iter__(self):
         """Make iterator iterable."""
+        return self
+    
+    def iter_all(self):
+        """Iterate from beginning regardless of current position."""
         self.reset()
         return self
     

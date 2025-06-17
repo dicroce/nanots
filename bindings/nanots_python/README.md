@@ -1,11 +1,10 @@
-"""
+```
 
 import os
 import tempfile
 import time
 import json
 import nanots
-
 
 def nanots_basics_example():
     # 1. CREATE DATABASE
@@ -72,16 +71,4 @@ def nanots_basics_example():
 if __name__ == "__main__":
     nanots_basics_example()
 
-"""
-
-
-# nanots Python bindings
-
-# Open x64 Native Console
-
-# You gotta have cython and build installed
-
-pip install cython
-pip install build
-
-# on linux, build with make, on windows, "python -m build"
+```

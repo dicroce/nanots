@@ -2,15 +2,15 @@
 """
 NanoTS Parallel Threading Stress Test
 
-This script demonstrates the TRUE parallel power of NanoTS by utilizing
-Python threading with the GIL-releasing C++ backend. We'll run:
+This script tests NanoTS parallel capabilities by utilizing Python threading
+with the GIL-releasing C++ backend. The test includes:
 
 - Multiple writer threads (one per crypto symbol)
 - Live reader threads analyzing data in real-time  
 - Performance monitoring and throughput measurement
 - Real concurrent database operations
 
-Let's see what NanoTS can REALLY do with parallel threading!
+Uses synthetic cryptocurrency data to focus purely on NanoTS performance.
 """
 
 import threading
@@ -24,13 +24,6 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 import nanots
 
-# Import binance data for real data
-try:
-    from binance_historical_data import BinanceDataDumper
-    BINANCE_AVAILABLE = True
-except ImportError:
-    BINANCE_AVAILABLE = False
-
 
 class ParallelNanoTSStressTest:
     """Comprehensive parallel threading stress test for NanoTS."""
@@ -42,7 +35,6 @@ class ParallelNanoTSStressTest:
         ]
         
         self.db_path = "parallel_stress_test.nanots"
-        self.data_dir = "./parallel_test_data"
         
         # Threading coordination
         self.writer_threads = []
@@ -72,50 +64,69 @@ class ParallelNanoTSStressTest:
             'peak_read_rate': 0
         }
     
-    def create_parallel_database(self):
+    def create_parallel_database(self, block_size_mb):
         """Create optimized database for parallel operations."""
         print("🏗️  Creating parallel-optimized NanoTS database...")
         
-        # Large database for parallel stress testing
-        block_size = 1024 * 1024  # 1MB blocks
-        num_blocks = 20000        # 20GB capacity
+        # Calculate database parameters from pre-configured block size
+        block_size = block_size_mb * 1024 * 1024  # Convert MB to bytes
         
-        print(f"📊 Parallel Database Specs:")
-        print(f"   Block size: {block_size//1024//1024}MB")
+        # Calculate number of blocks based on block size
+        if block_size_mb <= 4:
+            num_blocks = 20000  # Up to 80GB for small blocks
+        elif block_size_mb <= 16:
+            num_blocks = 5000   # Up to 80GB for medium blocks  
+        elif block_size_mb <= 64:
+            num_blocks = 1250   # Up to 80GB for large blocks
+        else:
+            num_blocks = 500    # Up to 500GB for very large blocks
+        
+        total_capacity_gb = (num_blocks * block_size) / (1024**3)
+        
+        print(f"\n📊 Database Allocation:")
+        print(f"   Block size: {block_size_mb}MB")
         print(f"   Total blocks: {num_blocks:,}")
-        print(f"   Total capacity: {num_blocks * block_size // 1024**3}GB")
+        print(f"   Total capacity: {total_capacity_gb:.1f}GB")
         
         nanots.allocate_file(self.db_path, block_size, num_blocks)
-        print(f"✅ Allocated massive parallel database")
+        print(f"✅ Database allocated successfully")
     
-    def generate_synthetic_data(self, symbol, num_records=50000):
-        """Generate realistic synthetic crypto data for stress testing."""
+    def generate_synthetic_crypto_data(self, symbol, num_records=50000):
+        """
+        Generate synthetic cryptocurrency OHLCV data for testing.
+        
+        Creates realistic-looking price movements using random walks
+        with proper volatility characteristics for each symbol.
+        """
+        # Realistic base prices for different cryptocurrencies
         base_price = {
             "BTCUSDT": 100000, "ETHUSDT": 4000, "BNBUSDT": 600, "ADAUSDT": 1.2,
             "SOLUSDT": 200, "XRPUSDT": 2.5, "DOTUSDT": 25, "LINKUSDT": 20
         }.get(symbol, 1000)
         
-        # Each symbol gets its own time range to avoid conflicts
+        # Each symbol gets its own time range to avoid timestamp conflicts
         symbol_index = self.symbols.index(symbol)
         base_timestamp = int(time.time() * 1000) - (num_records * 60000)  # Start in past
         start_time = base_timestamp + (symbol_index * num_records * 60000)  # Separate time windows
         
         current_price = base_price
-        
         data = []
+        
+        print(f"📊 Generating {num_records:,} synthetic records for {symbol}")
+        
         for i in range(num_records):
-            # Realistic price movement
-            price_change = random.gauss(0, base_price * 0.001)  # 0.1% volatility
+            # Simulate realistic price movement (0.1% volatility)
+            price_change = random.gauss(0, base_price * 0.001)
             current_price = max(current_price + price_change, base_price * 0.5)
             
-            # OHLCV data
+            # Generate OHLCV data with realistic spread
             high = current_price * (1 + random.uniform(0, 0.002))
             low = current_price * (1 - random.uniform(0, 0.002))
             volume = random.uniform(10, 1000)
             trades = random.randint(100, 5000)
             
             record = {
-                'timestamp': start_time + (i * 60000),  # Guaranteed monotonic per symbol
+                'timestamp': start_time + (i * 60000),  # 1 minute intervals
                 'open': current_price,
                 'high': high,
                 'low': low,
@@ -133,13 +144,13 @@ class ParallelNanoTSStressTest:
         print(f"🚀 Writer thread {thread_id} starting for {symbol}")
         
         try:
-            # Each thread gets its own writer and context
+            # Each thread gets its own writer and contexts
             writer = nanots.Writer(self.db_path, auto_reclaim=True)
             price_context = writer.create_context(f"{symbol}_price", f"{symbol} OHLCV data")
             volume_context = writer.create_context(f"{symbol}_volume", f"{symbol} volume data") 
             trade_context = writer.create_context(f"{symbol}_trades", f"{symbol} trade data")
             
-            # CRITICAL: Each thread needs unique stream tags
+            # Each thread needs unique stream tags to avoid conflicts
             price_tag = thread_id * 10 + 1      # e.g., 1, 11, 21, 31...
             volume_tag = thread_id * 10 + 2     # e.g., 2, 12, 22, 32...
             trade_tag = thread_id * 10 + 3      # e.g., 3, 13, 23, 33...
@@ -156,18 +167,15 @@ class ParallelNanoTSStressTest:
                     
                     write_start = time.time()
                     
-                    # Pack OHLC data
+                    # Pack binary data for efficient storage
                     price_data = struct.pack('ffff', 
                                            record['open'], record['high'],
                                            record['low'], record['close'])
                     
-                    # Pack volume data  
                     volume_data = struct.pack('f', record['volume'])
-                    
-                    # Pack trade data
                     trade_data = struct.pack('if', record['trades'], record['volume'])
                     
-                    # Write to different contexts with UNIQUE STREAM TAGS
+                    # Write to different contexts with unique stream tags
                     writer.write(price_context, price_data, record['timestamp'], price_tag)
                     writer.write(volume_context, volume_data, record['timestamp'], volume_tag)
                     writer.write(trade_context, trade_data, record['timestamp'], trade_tag)
@@ -197,7 +205,7 @@ class ParallelNanoTSStressTest:
         print(f"🏁 Writer thread {thread_id} ({symbol}) completed")
     
     def parallel_reader_thread(self, reader_id, symbols_to_read):
-        """Live reader thread performing analysis while writing."""
+        """Live reader thread performing queries while writing occurs."""
         print(f"📖 Reader thread {reader_id} starting for {symbols_to_read}")
         
         try:
@@ -209,11 +217,11 @@ class ParallelNanoTSStressTest:
                     try:
                         query_start = time.time()
                         
-                        # Read recent data (last 1000 records)
+                        # Read recent data (last 1000 records worth of time)
                         end_time = int(time.time() * 1000)
                         start_time = end_time - (1000 * 60 * 1000)  # 1000 minutes ago
                         
-                        # Query price data (LIVE READ while writers are active!)
+                        # Query price data (concurrent with active writes!)
                         frames = reader.read(f"{symbol}_price", start_time, end_time)
                         
                         query_time = time.time() - query_start
@@ -225,14 +233,14 @@ class ParallelNanoTSStressTest:
                             stats['query_times'].append(query_time)
                             stats['queries_executed'] += 1
                         
-                        # Brief pause to avoid overwhelming
+                        # Brief pause to avoid overwhelming the system
                         time.sleep(0.01)
                         
                     except Exception as e:
-                        # Ignore read errors during parallel writing
+                        # Ignore read errors during active writing
                         continue
                 
-                time.sleep(0.1)  # Check shutdown every 100ms
+                time.sleep(0.1)  # Check shutdown periodically
                 
         except Exception as e:
             print(f"❌ Reader thread {reader_id} failed: {e}")
@@ -254,7 +262,7 @@ class ParallelNanoTSStressTest:
             with self.stats_lock:
                 current_total = self.global_stats['total_records']
                 
-                # Calculate throughput
+                # Calculate current throughput
                 records_delta = current_total - last_total
                 time_delta = current_time - last_time
                 current_rate = records_delta / time_delta if time_delta > 0 else 0
@@ -263,7 +271,7 @@ class ParallelNanoTSStressTest:
                 if current_rate > self.global_stats['peak_write_rate']:
                     self.global_stats['peak_write_rate'] = current_rate
                 
-                # Print real-time stats
+                # Print live statistics
                 elapsed = current_time - self.global_stats['start_time']
                 avg_rate = current_total / elapsed if elapsed > 0 else 0
                 
@@ -275,46 +283,45 @@ class ParallelNanoTSStressTest:
                 last_total = current_total
                 last_time = current_time
     
-    def feed_data_to_writers(self, records_per_symbol=100000):
-        """Feed synthetic data to writer threads via queues."""
-        print(f"🍽️  Feeding {records_per_symbol:,} records per symbol to writers...")
+    def feed_synthetic_data_to_writers(self, records_per_symbol=100000):
+        """Generate and feed synthetic data to writer threads via queues."""
+        print(f"🍽️  Generating and feeding {records_per_symbol:,} records per symbol...")
         
         for symbol in self.symbols:
-            print(f"📊 Generating data for {symbol}...")
-            data = self.generate_synthetic_data(symbol, records_per_symbol)
+            data = self.generate_synthetic_crypto_data(symbol, records_per_symbol)
             
-            # DO NOT SHUFFLE - keep timestamps monotonic for nanots!
-            # random.shuffle(data)  # ❌ This breaks monotonic requirement
-            
-            # Feed to queue in chronological order
+            # Feed to queue in chronological order (NanoTS requires monotonic timestamps)
             for record in data:
                 self.data_queues[symbol].put(record)
     
-    def run_parallel_stress_test(self, records_per_symbol=100000, num_readers=4):
-        """Execute the full parallel stress test."""
+    def run_parallel_stress_test(self, records_per_symbol=100000, num_readers=4, block_size_mb=None):
+        """Execute the complete parallel stress test."""
         print("🔥 NANOTS PARALLEL THREADING STRESS TEST")
         print("=" * 80)
-        print(f"🎯 Target: {len(self.symbols)} symbols × {records_per_symbol:,} records = {len(self.symbols) * records_per_symbol:,} total")
-        print(f"🧵 Writers: {len(self.symbols)} threads (one per symbol)")
-        print(f"📖 Readers: {num_readers} threads (live analysis)")
-        print(f"📊 Expected: TRUE PARALLEL execution via C++ backend")
+        print(f"📊 Test Configuration:")
+        print(f"   Symbols: {len(self.symbols)} cryptocurrencies")
+        print(f"   Records per symbol: {records_per_symbol:,}")
+        print(f"   Total records: {len(self.symbols) * records_per_symbol * 3:,} (3 streams per symbol)")
+        print(f"   Writer threads: {len(self.symbols)} (one per symbol)")
+        print(f"   Reader threads: {num_readers} (live analysis)")
+        print(f"   Data: Synthetic cryptocurrency OHLCV")
         print()
         
         try:
-            # Step 1: Create database
-            self.create_parallel_database()
+            # Step 1: Create database with user-specified block size
+            self.create_parallel_database(block_size_mb)
             
             # Step 2: Initialize queues
-            print("🔧 Setting up threading infrastructure...")
+            print("\n🔧 Setting up threading infrastructure...")
             for symbol in self.symbols:
                 self.data_queues[symbol] = queue.Queue(maxsize=10000)
             
-            # Step 3: Start monitoring
+            # Step 3: Start performance monitoring
             self.global_stats['start_time'] = time.time()
             stats_thread = threading.Thread(target=self.stats_monitor_thread, daemon=True)
             stats_thread.start()
             
-            # Step 4: Launch writer threads (TRUE PARALLEL!)
+            # Step 4: Launch writer threads
             print("🚀 Launching parallel writer threads...")
             for i, symbol in enumerate(self.symbols):
                 writer_thread = threading.Thread(
@@ -325,7 +332,7 @@ class ParallelNanoTSStressTest:
                 writer_thread.start()
                 self.writer_threads.append(writer_thread)
             
-            # Step 5: Launch reader threads (LIVE ANALYSIS!)
+            # Step 5: Launch reader threads for live analysis
             print("📖 Launching parallel reader threads...")
             symbols_per_reader = len(self.symbols) // num_readers
             for i in range(num_readers):
@@ -341,33 +348,33 @@ class ParallelNanoTSStressTest:
                 reader_thread.start()
                 self.reader_threads.append(reader_thread)
             
-            print(f"✅ All {len(self.writer_threads)} writers + {len(self.reader_threads)} readers launched!")
+            print(f"✅ Launched {len(self.writer_threads)} writers + {len(self.reader_threads)} readers")
             
-            # Step 6: Feed data to writers
+            # Step 6: Generate and feed synthetic data to writers
             time.sleep(1)  # Let threads initialize
-            self.feed_data_to_writers(records_per_symbol)
+            self.feed_synthetic_data_to_writers(records_per_symbol)
             
             # Step 7: Wait for completion
             print("⏳ Waiting for all writers to complete...")
             
-            # Signal shutdown when all queues are empty
+            # Wait until all queues are empty
             all_empty = False
             while not all_empty:
                 time.sleep(1)
                 all_empty = all(q.empty() for q in self.data_queues.values())
             
-            # Shutdown signal
+            # Send shutdown signal to writers
             for symbol in self.symbols:
                 self.data_queues[symbol].put(None)  # Poison pill
             
-            # Wait for writers
+            # Wait for writers to finish
             for thread in self.writer_threads:
                 thread.join(timeout=30)
             
             print("✅ All writers completed!")
             
-            # Let readers run a bit more to show live capability
-            print("📖 Letting readers continue for live analysis demo...")
+            # Let readers continue briefly to demonstrate live capability
+            print("📖 Letting readers continue for live analysis demonstration...")
             time.sleep(5)
             
             # Shutdown everything
@@ -378,39 +385,39 @@ class ParallelNanoTSStressTest:
             
             stats_thread.join(timeout=5)
             
-            # Final analysis
-            self.analyze_parallel_results()
+            # Analyze results
+            self.analyze_results()
             
         except KeyboardInterrupt:
-            print("\n⚠️  Parallel stress test interrupted!")
+            print("\n⚠️  Stress test interrupted!")
             self.shutdown_event.set()
         except Exception as e:
-            print(f"\n❌ Parallel stress test failed: {e}")
+            print(f"\n❌ Stress test failed: {e}")
             raise
     
-    def analyze_parallel_results(self):
-        """Comprehensive analysis of parallel performance."""
+    def analyze_results(self):
+        """Analyze and report comprehensive performance results."""
         print("\n🎊 PARALLEL STRESS TEST RESULTS")
         print("=" * 80)
         
         total_time = time.time() - self.global_stats['start_time']
         
-        # Database size
+        # Database size analysis
         db_size_mb = Path(self.db_path).stat().st_size / 1024 / 1024
         
-        print(f"📊 PARALLEL EXECUTION RESULTS:")
+        print(f"📊 EXECUTION SUMMARY:")
         print(f"   ⏱️  Total runtime: {total_time:.1f} seconds")
-        print(f"   📈 Total records: {self.global_stats['total_records']:,}")
+        print(f"   📈 Total records written: {self.global_stats['total_records']:,}")
         print(f"   💾 Database size: {db_size_mb:.1f} MB")
-        print(f"   📊 Data density: {self.global_stats['total_records']/db_size_mb:.1f} records/MB")
+        print(f"   📊 Storage efficiency: {self.global_stats['total_records']/db_size_mb:.1f} records/MB")
         
         print(f"\n⚡ THREADING PERFORMANCE:")
         avg_throughput = self.global_stats['total_records'] / total_time
         print(f"   🚀 Average throughput: {avg_throughput:.0f} records/sec")
         print(f"   🔥 Peak throughput: {self.global_stats['peak_write_rate']:.0f} records/sec")
-        print(f"   🧵 Parallel efficiency: {len(self.symbols)} concurrent writers")
+        print(f"   🧵 Parallel writers: {len(self.symbols)} concurrent")
         
-        # Per-symbol breakdown
+        # Per-symbol performance breakdown
         print(f"\n📋 PER-SYMBOL WRITER PERFORMANCE:")
         total_written = 0
         total_errors = 0
@@ -426,8 +433,8 @@ class ParallelNanoTSStressTest:
                 print(f"   {symbol:8s}: {stats['records_written']:,} records "
                       f"({symbol_rate:.0f}/sec, {avg_write_time:.2f}ms avg)")
         
-        # Reader performance
-        print(f"\n📖 LIVE READER PERFORMANCE:")
+        # Reader performance analysis
+        print(f"\n📖 CONCURRENT READER PERFORMANCE:")
         total_read = 0
         total_queries = 0
         
@@ -442,31 +449,34 @@ class ParallelNanoTSStressTest:
                 print(f"   Reader {reader_id}: {stats['records_read']:,} records read "
                       f"({read_rate:.0f}/sec, {avg_query_time:.2f}ms avg query)")
         
-        print(f"\n🏆 NANOTS PARALLEL VERDICT:")
+        print(f"\n🏆 NANOTS PARALLEL ASSESSMENT:")
         if avg_throughput > 50000:
-            print(f"   🔥 INCREDIBLE: {avg_throughput:.0f} records/sec with {len(self.symbols)} parallel writers!")
+            print(f"   🔥 EXCELLENT: {avg_throughput:.0f} records/sec with {len(self.symbols)} parallel writers!")
         elif avg_throughput > 25000:
-            print(f"   🚀 EXCELLENT: {avg_throughput:.0f} records/sec parallel performance!")
+            print(f"   🚀 VERY GOOD: {avg_throughput:.0f} records/sec parallel performance!")
         elif avg_throughput > 10000:
-            print(f"   ✅ VERY GOOD: {avg_throughput:.0f} records/sec with threading!")
+            print(f"   ✅ GOOD: {avg_throughput:.0f} records/sec with threading!")
         else:
-            print(f"   ⚠️  BASELINE: {avg_throughput:.0f} records/sec")
+            print(f"   📊 BASELINE: {avg_throughput:.0f} records/sec")
         
-        print(f"\n🎯 THEORETICAL SCALING:")
-        single_thread_estimate = avg_throughput / len(self.symbols)
-        print(f"   📊 Estimated single-thread: {single_thread_estimate:.0f} records/sec")
-        parallel_efficiency = (avg_throughput / (single_thread_estimate * len(self.symbols))) * 100
+        print(f"\n🎯 PARALLEL SCALING ANALYSIS:")
+        estimated_single_thread = avg_throughput / len(self.symbols)
+        print(f"   📊 Estimated single-thread rate: {estimated_single_thread:.0f} records/sec")
+        parallel_efficiency = (avg_throughput / (estimated_single_thread * len(self.symbols))) * 100
         print(f"   🧵 Parallel efficiency: {parallel_efficiency:.1f}%")
         
-        # Concurrent read/write demonstration
+        # Concurrent operations summary
         if total_read > 0:
-            print(f"   📖 Live reads during writes: {total_read:,} records ({total_queries} queries)")
-            print(f"   🔄 Read/Write concurrency: DEMONSTRATED ✅")
+            print(f"   📖 Concurrent reads during writes: {total_read:,} records ({total_queries} queries)")
+            print(f"   🔄 Read/Write concurrency: ✅ DEMONSTRATED")
+        
+        if total_errors > 0:
+            print(f"   ⚠️  Total errors: {total_errors}")
         
         print(f"\n📂 Database file: {self.db_path} ({db_size_mb:.1f}MB)")
         
         # Cleanup option
-        keep = input(f"\n🗑️  Keep parallel test database ({db_size_mb:.1f}MB)? (y/n): ").lower().strip()
+        keep = input(f"\n🗑️  Keep test database ({db_size_mb:.1f}MB)? (y/n): ").lower().strip()
         if keep != 'y':
             if Path(self.db_path).exists():
                 Path(self.db_path).unlink()
@@ -474,52 +484,103 @@ class ParallelNanoTSStressTest:
 
 
 def main():
-    """Main parallel stress test execution."""
-    print("🚀 Welcome to the NanoTS PARALLEL Threading Stress Test!")
-    print("This will test TRUE parallel execution via C++ backend with GIL release.")
+    """Main stress test execution with configuration options."""
+    print("🚀 NanoTS Parallel Threading Stress Test")
+    print("Tests parallel execution capabilities using synthetic cryptocurrency data")
     print()
     
-    print("🧵 Parallel test configurations:")
-    print("  1. 🔥 PARALLEL DEMO: 8 writers × 50K records (~400K total)")
-    print("  2. 🚀 PARALLEL STRESS: 8 writers × 100K records (~800K total)")
-    print("  3. 💀 PARALLEL EXTREME: 8 writers × 200K records (~1.6M total)")
-    print("  4. 🎯 Custom parallel configuration")
+    print("🧵 Available test configurations:")
+    print("  1. 🔥 DEMO: 8 symbols × 25K records each (~600K total)")
+    print("  2. 🚀 STANDARD: 8 symbols × 50K records each (~1.2M total)")
+    print("  3. 💪 HEAVY: 8 symbols × 100K records each (~2.4M total)")
+    print("  4. 💀 EXTREME: 8 symbols × 200K records each (~4.8M total)")
+    print("  5. 🎯 Custom configuration")
     
-    choice = input("\nSelect parallel test (1-4): ").strip()
+    choice = input("\nSelect test configuration (1-5): ").strip()
     
     if choice == "1":
-        records = 50000
+        records = 25000
         readers = 2
-        print("🔥 PARALLEL DEMO selected!")
+        print("🔥 DEMO configuration selected")
     elif choice == "2":
+        records = 50000
+        readers = 3
+        print("🚀 STANDARD configuration selected")
+    elif choice == "3":
         records = 100000
         readers = 4
-        print("🚀 PARALLEL STRESS selected!")
-    elif choice == "3":
+        print("💪 HEAVY configuration selected")
+    elif choice == "4":
         records = 200000
         readers = 6
-        print("💀 PARALLEL EXTREME selected!")
-    elif choice == "4":
+        print("💀 EXTREME configuration selected")
+    elif choice == "5":
         records = int(input("Records per symbol: "))
         readers = int(input("Number of reader threads: "))
-        print(f"🎯 Custom: {records} records, {readers} readers")
+        print(f"🎯 Custom: {records:,} records per symbol, {readers} readers")
     else:
-        records = 50000
+        records = 25000
         readers = 2
-        print("🔥 Default PARALLEL DEMO")
+        print("🔥 Default DEMO configuration")
     
+    # Configure block size right after test selection
+    print("\n📏 Block Size Configuration:")
+    print("   Larger blocks = better sequential performance, more memory usage")
+    print("   Smaller blocks = lower memory usage, more granular allocation")
+    print("   Typical options: 1MB (default), 4MB, 16MB, 64MB")
+    
+    while True:
+        try:
+            block_size_input = input("\nBlock size in MB (default 1): ").strip()
+            if not block_size_input:
+                block_size_mb = 1
+                break
+            block_size_mb = int(block_size_input)
+            if block_size_mb <= 0 or block_size_mb > 1024:
+                print("❌ Block size must be between 1 and 1024 MB")
+                continue
+            break
+        except ValueError:
+            print("❌ Please enter a valid number")
+            continue
+    
+    # Calculate database capacity based on block size
+    if block_size_mb <= 4:
+        num_blocks = 20000  # Up to 80GB for small blocks
+    elif block_size_mb <= 16:
+        num_blocks = 5000   # Up to 80GB for medium blocks  
+    elif block_size_mb <= 64:
+        num_blocks = 1250   # Up to 80GB for large blocks
+    else:
+        num_blocks = 500    # Up to 500GB for very large blocks
+    
+    total_capacity_gb = (num_blocks * block_size_mb) / 1024
     total_records = records * 8 * 3  # 8 symbols × 3 streams each
-    print(f"\n⚠️  This will create ~{total_records:,} database records")
-    print(f"💾 Estimated database size: ~{total_records * 20 / 1024 / 1024:.0f}MB")
-    print(f"🧵 Threading: 8 parallel writers + {readers} live readers")
+    estimated_size_mb = total_records * 20 / 1024 / 1024  # Rough estimate
     
-    if input("\nReady to test TRUE parallel power? (y/n): ").lower().strip() != 'y':
-        print("👋 Parallel stress test cancelled")
+    print(f"\n📊 Complete Test Configuration:")
+    print(f"   📈 Total database records: ~{total_records:,}")
+    print(f"   💾 Estimated data size: ~{estimated_size_mb:.0f}MB")
+    print(f"   🗄️  Block size: {block_size_mb}MB")
+    print(f"   📦 Total blocks: {num_blocks:,}")
+    print(f"   💿 Database capacity: {total_capacity_gb:.1f}GB")
+    print(f"   🧵 Writer threads: 8 (one per symbol)")
+    print(f"   📖 Reader threads: {readers}")
+    print(f"   📊 Data type: Synthetic cryptocurrency OHLCV")
+    
+    # Warn about large configurations
+    if block_size_mb >= 64:
+        print(f"   ⚠️  Large blocks: {block_size_mb}MB memory per block")
+    if total_capacity_gb > 100:
+        print(f"   ⚠️  Large capacity: {total_capacity_gb:.1f}GB total")
+    
+    if input("\nProceed with stress test? (y/n): ").lower().strip() != 'y':
+        print("👋 Stress test cancelled")
         return
     
-    # Execute the parallel stress test
+    # Execute the stress test with pre-configured block size
     tester = ParallelNanoTSStressTest()
-    tester.run_parallel_stress_test(records_per_symbol=records, num_readers=readers)
+    tester.run_parallel_stress_test(records_per_symbol=records, num_readers=readers, block_size_mb=block_size_mb)
 
 
 if __name__ == "__main__":

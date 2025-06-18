@@ -11,7 +11,7 @@ A lightweight, high-performance, embedded (like sqlite) time-series database opt
 - **Preallocated storage**: Preallocated storage files avoid filesystem fragmentation and administration hassles. In auto-recyle mode you always have the latest data.
 - **Multiple streams**: Store different data streams in the same database file
 - **Iterator interface**: Efficient navigation with bidirectional iteration and timestamp-based seeking
-- **Cross Platform**: Currently works on Linux & Windows.
+- **Cross Platform**: Currently works on Linux, Windows and MacOS.
 
 ## Performance
 

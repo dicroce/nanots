@@ -1,3 +1,14 @@
+# NanoTS
+NanoTS is a super fast, embedded time series database (so, no server). It supports 1 writer per stream + an unlimited number of readers.
+
+NanoTS chooses to pre-allocate its entire storage file, this has a number of advantages:
+- You cannot fill up your servers disk with data. Set it up and forget about it
+- We don't waste time & cpu creating and deleting files forever
+- If you configure your writer with auto_reclaim=true (the default) you will always have the newest data
+
+## Check out: https://github.com/dicroce/nanots
+
+# Basics Example
 ```
 
 import os
@@ -7,17 +18,13 @@ import json
 import nanots
 
 def nanots_basics_example():
-    # 1. CREATE DATABASE
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.nanots') as tmp:
-        db_file = tmp.name
-    
     try:
-        # Allocate database: 64KB blocks, 100 blocks = ~6MB
-        nanots.allocate_file(db_file, 64*1024, 100)
+        # 1. CREATE DATABASE - 64KB blocks, 100 blocks = ~6MB
+        nanots.allocate_file("test.nts", 64*1024, 100)
         
         # 2. WRITE DATA
         writer = nanots.Writer(db_file)
-        context = writer.create_context("sensors", "Temperature readings")
+        write_context = writer.create_context("sensors", "Temperature readings")
         
         # Write 10 temperature readings
         base_time = int(time.time() * 1000)
@@ -31,10 +38,10 @@ def nanots_basics_example():
             }).encode('utf-8')
             
             print("Writing data:", data.decode('utf-8'), "at", timestamp)
-            writer.write(context, data, timestamp, 0)
+            writer.write(write_context, data, timestamp, 0)
         
         # 3. READ DATA
-        reader = nanots.Reader(db_file)
+        reader = nanots.Reader("test.nts")
         
         # Read all data
         frames = reader.read("sensors", base_time, base_time + 50000)
@@ -45,8 +52,9 @@ def nanots_basics_example():
             print(f"      {i+1}. {data['temp_c']}°C from {data['sensor']}")
         
         # 4. ITERATE THROUGH DATA
-        iterator = nanots.Iterator(db_file, "sensors")
+        iterator = nanots.Iterator("test.nts", "sensors")
 
+        # position the iterator...
         iterator.find(base_time + 10000)
 
         print("Iterating through data:")

@@ -1222,17 +1222,21 @@ struct nanots_iterator_handle {
 };
 
 nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks) {
+  nanots_ec_t ec = nanots_ec_t::NANOTS_EC_OK;
   try {
     nanots_writer::allocate(std::string(file_name), block_size, n_blocks);
-    return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
-    return e.get_ec();
+    ec = e.get_ec();
   } catch (const std::exception& e) {
     fprintf(stderr,"Exception in nanots_writer_allocate_file: %s\n", e.what());
-    return NANOTS_EC_UNKNOWN;
+    ec = NANOTS_EC_UNKNOWN;
   } catch (...) {
-    return NANOTS_EC_UNKNOWN;
+    ec = NANOTS_EC_UNKNOWN;
   }
+  if(ec != NANOTS_EC_OK) {
+    fprintf(stderr,"Error in nanots_writer_allocate_file: %d\n", ec);
+  }
+  return ec;
 }
 
 nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim) {
@@ -1299,6 +1303,7 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
     fprintf(stderr,"Exception in nanots_writer_write: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_writer_write\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1320,6 +1325,7 @@ nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
     fprintf(stderr,"Exception in nanots_writer_free_blocks: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_writer_free_blocks\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1376,6 +1382,7 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
     fprintf(stderr,"Exception in nanots_reader_read: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_reader_read\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1423,6 +1430,7 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     fprintf(stderr,"Exception in nanots_reader_query_contiguous_segments: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_reader_query_contiguous_segments\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1448,6 +1456,7 @@ nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
     fprintf(stderr,"Exception in nanots_reader_query_stream_tags_start: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_reader_query_stream_tags_start\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1479,6 +1488,7 @@ nanots_iterator_t nanots_iterator_create(const char* file_name,
     fprintf(stderr,"Exception in nanots_iterator_create: %s\n", e.what());
     return nullptr;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_create\n");
     return nullptr;
   }
 }
@@ -1521,6 +1531,7 @@ nanots_ec_t nanots_iterator_get_current_frame(
     fprintf(stderr,"Exception in nanots_iterator_get_current_frame: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_get_current_frame\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1539,6 +1550,7 @@ nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator) {
     fprintf(stderr,"Exception in nanots_iterator_next: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_next\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1557,6 +1569,7 @@ nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator) {
     fprintf(stderr,"Exception in nanots_iterator_prev: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_prev\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1576,6 +1589,7 @@ nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
     fprintf(stderr,"Exception in nanots_iterator_find: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_find\n");
     return NANOTS_EC_UNKNOWN;
   }
 }
@@ -1594,6 +1608,7 @@ nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator) {
     fprintf(stderr,"Exception in nanots_iterator_reset: %s\n", e.what());
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_reset\n");
     return NANOTS_EC_UNKNOWN;
   }
 }

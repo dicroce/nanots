@@ -1,2 +1,4 @@
 venv/
-
+nanots.cpp
+dist/
+nanots.egg-info/

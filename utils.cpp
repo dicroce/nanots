@@ -592,11 +592,14 @@ int fallocate(FILE* file, uint64_t size) {
 #ifdef _WIN32
   LARGE_INTEGER li;
   li.QuadPart = size;
-  auto moved = SetFilePointerEx((HANDLE)_get_osfhandle(filenum(file)), li,
+  BOOL ok = SetFilePointerEx((HANDLE)_get_osfhandle(filenum(file)), li,
                                 nullptr, FILE_BEGIN);
-  if (moved == INVALID_SET_FILE_POINTER)
+  if (!ok)
     return -1;
-  SetEndOfFile((HANDLE)_get_osfhandle(filenum(file)));
+
+  if (!SetEndOfFile((HANDLE)_get_osfhandle(filenum(file))))
+    return -1;
+
   return 0;
 #elif defined(__APPLE__)
   // macOS: Use fcntl with F_PREALLOCATE for actual space allocation

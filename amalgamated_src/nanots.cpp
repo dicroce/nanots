@@ -596,11 +596,14 @@ int fallocate(FILE* file, uint64_t size) {
 #ifdef _WIN32
   LARGE_INTEGER li;
   li.QuadPart = size;
-  auto moved = SetFilePointerEx((HANDLE)_get_osfhandle(filenum(file)), li,
+  BOOL ok = SetFilePointerEx((HANDLE)_get_osfhandle(filenum(file)), li,
                                 nullptr, FILE_BEGIN);
-  if (moved == INVALID_SET_FILE_POINTER)
+  if (!ok)
     return -1;
-  SetEndOfFile((HANDLE)_get_osfhandle(filenum(file)));
+
+  if (!SetEndOfFile((HANDLE)_get_osfhandle(filenum(file))))
+    return -1;
+
   return 0;
 #elif defined(__APPLE__)
   // macOS: Use fcntl with F_PREALLOCATE for actual space allocation
@@ -1454,7 +1457,7 @@ void nanots_writer::allocate(const std::string& file_name,
   // multiple of 65536 then block start and end on 64k boundaries.
   block_size = _round_to_64k_boundary(block_size);
 
-  auto file_size = FILE_HEADER_BLOCK_SIZE + (n_blocks * block_size);
+  uint64_t file_size = FILE_HEADER_BLOCK_SIZE + static_cast<uint64_t>(n_blocks) * block_size;
 
   {
     auto f = nts_file::open(file_name, "w+");

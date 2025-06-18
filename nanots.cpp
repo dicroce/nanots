@@ -544,7 +544,7 @@ void nanots_writer::allocate(const std::string& file_name,
   // multiple of 65536 then block start and end on 64k boundaries.
   block_size = _round_to_64k_boundary(block_size);
 
-  auto file_size = FILE_HEADER_BLOCK_SIZE + (n_blocks * block_size);
+  uint64_t file_size = FILE_HEADER_BLOCK_SIZE + static_cast<uint64_t>(n_blocks) * block_size;
 
   {
     auto f = nts_file::open(file_name, "w+");

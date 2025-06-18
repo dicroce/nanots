@@ -8,6 +8,9 @@ NanoTS chooses to pre-allocate its entire storage file, this has a number of adv
 
 ## Check out: https://github.com/dicroce/nanots
 
+## Building
+python -m build --wheel
+
 # Basics Example
 ```
 

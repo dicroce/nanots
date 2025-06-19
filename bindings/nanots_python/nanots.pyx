@@ -74,6 +74,7 @@ cdef extern from "nanots.h":
                                            uint8_t flags,
                                            int64_t timestamp,
                                            int64_t block_sequence,
+                                           const char* metadata,
                                            void* user_data)
     
     nanots_ec_t nanots_reader_read(nanots_reader_t reader,
@@ -110,6 +111,7 @@ cdef extern from "nanots.h":
                                      int64_t timestamp)
     nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator)
     int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator)
+    const char* nanots_iterator_current_metadata(nanots_iterator_t iterator)
 
 # Python exceptions
 class NanoTSError(Exception):
@@ -260,14 +262,15 @@ cdef class Reader:
         """Read data from the database, returning a list of frames."""
         frames = []
         
-        def callback(data, size, flags, timestamp, block_sequence):
+        def callback(data, size, flags, timestamp, block_sequence, metadata):
             # Copy data to Python bytes object
             frame_data = data[:size]  # This creates a copy
             frames.append({
                 'data': frame_data,
                 'timestamp': timestamp,
                 'flags': flags,
-                'block_sequence': block_sequence
+                'block_sequence': block_sequence,
+                'metadata': metadata
             })
         
         # Store callback in a place where the C code can find it
@@ -369,7 +372,8 @@ cdef class Iterator:
             'data': data,
             'timestamp': frame_info.timestamp,
             'flags': frame_info.flags,
-            'block_sequence': frame_info.block_sequence
+            'block_sequence': frame_info.block_sequence,
+            'metadata': self.current_metadata()
         }
     
     def next(self):
@@ -395,6 +399,13 @@ cdef class Iterator:
     def current_block_sequence(self):
         """Get current block sequence number."""
         return nanots_iterator_current_block_sequence(self._iterator)
+    
+    def current_metadata(self):
+        """Get current block metadata."""
+        cdef const char* metadata_ptr = nanots_iterator_current_metadata(self._iterator)
+        if metadata_ptr == NULL:
+            return ""
+        return metadata_ptr.decode('utf-8')
     
     def __iter__(self):
         """Make iterator iterable."""

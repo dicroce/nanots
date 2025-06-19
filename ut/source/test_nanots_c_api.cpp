@@ -68,17 +68,19 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
     vector<uint8_t> flags;
     vector<int64_t> timestamps;
     vector<int64_t> block_sequences;
+    vector<string> metadata_list;
   } cb_data;
 
   // Define callback function
   auto callback = [](const uint8_t* data, size_t size, uint8_t flags,
-                     int64_t timestamp, int64_t block_sequence,
+                     int64_t timestamp, int64_t block_sequence, const char* metadata,
                      void* user_data) {
     callback_data* cb = static_cast<callback_data*>(user_data);
     cb->frames.emplace_back(reinterpret_cast<const char*>(data), size);
     cb->flags.push_back(flags);
     cb->timestamps.push_back(timestamp);
     cb->block_sequences.push_back(block_sequence);
+    cb->metadata_list.emplace_back(metadata ? metadata : "");
   };
 
   // Read data back - use a smaller end timestamp to avoid potential UINT64_MAX
@@ -98,6 +100,10 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
   RTF_ASSERT(cb_data.timestamps[0] == 1000);
   RTF_ASSERT(cb_data.timestamps[1] == 2000);
   RTF_ASSERT(cb_data.timestamps[2] == 3000);
+  RTF_ASSERT(cb_data.metadata_list.size() == 3);
+  RTF_ASSERT(cb_data.metadata_list[0] == "test metadata");
+  RTF_ASSERT(cb_data.metadata_list[1] == "test metadata");
+  RTF_ASSERT(cb_data.metadata_list[2] == "test metadata");
 
   nanots_reader_destroy(reader);
 }
@@ -130,6 +136,11 @@ void test_nanots_c_api::test_c_api_iterator_functionality() {
 
   // Test validity
   RTF_ASSERT(nanots_iterator_valid(iterator) == 1);
+  
+  // Test metadata access
+  const char* metadata = nanots_iterator_current_metadata(iterator);
+  RTF_ASSERT(metadata != nullptr);
+  RTF_ASSERT(strcmp(metadata, "iterator test") == 0);
 
   // Test forward iteration
   int frame_count = 0;
@@ -246,6 +257,7 @@ void test_nanots_c_api::test_c_api_error_handling() {
   // Test invalid handles
   RTF_ASSERT(nanots_iterator_valid(nullptr) == 0);
   RTF_ASSERT(nanots_iterator_current_block_sequence(nullptr) == 0);
+  RTF_ASSERT(nanots_iterator_current_metadata(nullptr) == nullptr);
 
   nanots_frame_info_t frame_info;
   RTF_ASSERT(nanots_iterator_get_current_frame(nullptr, &frame_info) ==
@@ -321,7 +333,7 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
   // Test stream1
   vector<string> stream1_data;
   auto callback1 = [](const uint8_t* data, size_t size, uint8_t flags,
-                      int64_t timestamp, int64_t block_sequence,
+                      int64_t timestamp, int64_t block_sequence, const char* metadata,
                       void* user_data) {
     vector<string>* frames = static_cast<vector<string>*>(user_data);
     frames->emplace_back(reinterpret_cast<const char*>(data), size);

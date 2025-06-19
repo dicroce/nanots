@@ -19,6 +19,8 @@ class MixedBuildExt(build_ext):
             ext.sources = [src for src in ext.sources if not src.endswith('sqlite3.c')]
             
             # Compile the C file separately
+            # Ensure the output directory exists
+            os.makedirs(self.build_temp, exist_ok=True)
             sqlite_objects = self.compiler.compile(
                 [sqlite_source],
                 output_dir=self.build_temp,

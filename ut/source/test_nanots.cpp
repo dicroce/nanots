@@ -196,6 +196,10 @@ void test_nanots::test_nanots_multiple_streams() {
     std::string expected = "sensor_" + std::to_string(meta_count);
     RTF_ASSERT(meta_iter->size == expected.size());
     RTF_ASSERT(memcmp(meta_iter->data, expected.c_str(), meta_iter->size) == 0);
+    
+    // Test metadata access through iterator
+    RTF_ASSERT(meta_iter.current_metadata() == "sensor data");
+    
     ++meta_iter;
     meta_count++;
   }
@@ -225,7 +229,7 @@ void test_nanots::test_nanots_reader_time_range() {
   // Read middle portion (1500 to 2200)
   reader.read("test_stream", 1500, 2200,
               [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence) {
+                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
                 std::string frame_data((char*)data, size);
                 frames_read.push_back({timestamp, frame_data});
               });
@@ -241,7 +245,7 @@ void test_nanots::test_nanots_reader_time_range() {
   frames_read.clear();
   reader.read("test_stream", 0, 1200,
               [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence) {
+                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
                 std::string frame_data((char*)data, size);
                 frames_read.push_back({timestamp, frame_data});
               });
@@ -550,16 +554,21 @@ void test_nanots::test_nanots_metadata_integrity() {
 
   reader.read("video", 0, 2000,
               [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence) {
-                // In a real implementation, you might have access to metadata
-                // here This is a placeholder for metadata verification
-                video_metadata_correct = true;
+                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+                // Now we can actually verify the metadata
+                if (metadata == "codec=h264,resolution=1920x1080,fps=30") {
+                  video_metadata_correct = true;
+                }
               });
 
   reader.read(
       "audio", 0, 2000,
       [&](const uint8_t* data, size_t size, uint8_t flags, uint64_t timestamp,
-          uint64_t block_sequence) { audio_metadata_correct = true; });
+          uint64_t block_sequence, const std::string& metadata) { 
+            if (metadata == "codec=aac,samplerate=44100,channels=2") {
+              audio_metadata_correct = true;
+            }
+          });
 
   RTF_ASSERT(video_metadata_correct);
   RTF_ASSERT(audio_metadata_correct);
@@ -1070,7 +1079,7 @@ void test_nanots::test_nanots_reader_callback_exceptions() {
   try {
     reader.read("exception_stream", 0, 20000,
                 [&](const uint8_t* data, size_t size, uint8_t flags,
-                    uint64_t timestamp, uint64_t block_sequence) {
+                    uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
                   frames_processed++;
 
                   if (frames_processed == 5) {
@@ -1301,7 +1310,7 @@ void test_nanots::test_nanots_free_blocks() {
 
   reader.read("delete_stream", 1, 1024,
               [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence) {
+                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
                 remaining_timestamps.push_back(timestamp);
               });
 

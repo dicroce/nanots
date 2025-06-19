@@ -1596,7 +1596,7 @@ void nanots_reader::read(
     int64_t start_timestamp,
     int64_t end_timestamp,
     const std::function<
-        void(const uint8_t*, size_t, uint8_t, int64_t, int64_t)>& callback) {
+        void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   auto stmt = db.prepare(
@@ -1678,7 +1678,7 @@ void nanots_reader::read(
 
       // Callback with frame data
       callback(block_p + offset + FRAME_HEADER_SIZE, (size_t)frame_size, flags,
-               timestamp, block_sequence);
+               timestamp, block_sequence, metadata);
     }
   }
 }
@@ -2107,6 +2107,16 @@ void nanots_iterator::reset() {
   _load_current_frame();
 }
 
+const std::string& nanots_iterator::current_metadata() const {
+  auto it = _block_cache.find(_current_block_sequence);
+  if (it != _block_cache.end()) {
+    return it->second.metadata;
+  }
+  
+  static std::string empty_string;
+  return empty_string;
+}
+
 extern "C" {
 
 struct nanots_writer_handle {
@@ -2284,9 +2294,9 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
     nanots_callback_context ctx{callback, user_data};
     reader->reader->read(std::string(stream_tag), start_timestamp, end_timestamp,
                          [&ctx](const uint8_t* data, size_t size, uint8_t flags,
-                                int64_t timestamp, int64_t block_sequence) {
+                                int64_t timestamp, int64_t block_sequence, const std::string& metadata) {
                            ctx.callback(data, size, flags, timestamp,
-                                        block_sequence, ctx.user_data);
+                                        block_sequence, metadata.c_str(), ctx.user_data);
                          });
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
@@ -2542,6 +2552,25 @@ int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator) {
   }
   
   return 0;
+}
+
+const char* nanots_iterator_current_metadata(nanots_iterator_t iterator) {
+  if (!iterator || !iterator->iterator) {
+    return nullptr;
+  }
+
+  try {
+    const std::string& metadata = iterator->iterator->current_metadata();
+    return metadata.c_str();
+  } catch (const nanots_exception& e) {
+    fprintf(stderr,"nanots_exception in nanots_iterator_current_metadata: %d\n", e.get_ec());
+  } catch (const std::exception& e) {
+    fprintf(stderr,"Exception in nanots_iterator_current_metadata: %s\n", e.what());
+  } catch (...) {
+    fprintf(stderr,"Unknown exception in nanots_iterator_current_metadata\n");
+  }
+  
+  return nullptr;
 }
 
 }

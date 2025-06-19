@@ -511,7 +511,7 @@ class nanots_reader {
       int64_t start_timestamp,
       int64_t end_timestamp,
       const std::function<
-          void(const uint8_t*, size_t, uint8_t, int64_t, int64_t)>& callback);
+          void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback);
   
   std::vector<std::string> query_stream_tags(int64_t start_timestamp, int64_t end_timestamp);
 
@@ -573,6 +573,7 @@ class nanots_iterator {
 
   // Utility
   int64_t current_block_sequence() const { return _current_block_sequence; }
+  const std::string& current_metadata() const;
 
  private:
   block_info* _get_block_by_sequence(int64_t sequence);
@@ -630,6 +631,7 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        uint8_t flags,
                                        int64_t timestamp,
                                        int64_t block_sequence,
+                                       const char* metadata,
                                        void* user_data);
 
 nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
@@ -706,6 +708,8 @@ nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
 nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 
 int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
+
+const char* nanots_iterator_current_metadata(nanots_iterator_t iterator);
 
 #ifdef __cplusplus
 }

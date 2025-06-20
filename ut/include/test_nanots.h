@@ -30,6 +30,8 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_free_blocks);
   TEST(test_nanots::test_nanots_query_contiguous_segments);
   TEST(test_nanots::test_nanots_query_stream_tags);
+  TEST(test_nanots::test_nanots_progressive_block_deletion);
+  TEST(test_nanots::test_nanots_iterator_block_transition_flag_search);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -64,4 +66,6 @@ class test_nanots : public test_fixture {
   void test_nanots_free_blocks();
   void test_nanots_query_contiguous_segments();
   void test_nanots_query_stream_tags();
+  void test_nanots_progressive_block_deletion();
+  void test_nanots_iterator_block_transition_flag_search();
 };

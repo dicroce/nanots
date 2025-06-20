@@ -1,6 +1,7 @@
 #include "test_nanots.h"
 #include <chrono>
 #include <set>
+#include <inttypes.h>
 #include "nanots.h"
 
 // Forward declaration from nanots.cpp
@@ -1429,4 +1430,291 @@ void test_nanots::test_nanots_query_stream_tags() {
   RTF_ASSERT(video_only_set.count("video") == 1);
   RTF_ASSERT(video_only_set.count("audio") == 0);
   RTF_ASSERT(video_only_set.count("metadata") == 0);
+}
+
+void test_nanots::test_nanots_progressive_block_deletion() {
+  // Create a file with small blocks to make it easier to have many blocks
+  const size_t block_size = 8 * 1024;  // 8KB blocks
+  const size_t num_blocks = 1024;  // Plenty of blocks
+  
+  nanots_writer::allocate("nanots_test_progressive_deletion.nts", block_size, num_blocks);
+  nanots_writer db("nanots_test_progressive_deletion.nts", false);
+  
+  // Write data with small frames to fill many blocks
+  const size_t frame_size = 512;  // 512 byte frames
+  const int total_frames = 2000;  // Write 2000 frames
+  const uint64_t start_timestamp = 10000;
+  const uint64_t end_timestamp = start_timestamp + (total_frames - 1) * 10;
+  
+  printf("Writing %d frames of %zu bytes each (timestamps %" PRIu64 " to %" PRIu64 ")\n", 
+         total_frames, frame_size, start_timestamp, end_timestamp);
+  
+  {
+    auto wctx = db.create_write_context("test_stream", "progressive deletion test");
+    std::vector<uint8_t> frame_data(frame_size, 0xAB);
+    
+    // Write frames with sequential timestamps starting at 10000
+    for (int i = 0; i < total_frames; i++) {
+      uint64_t timestamp = start_timestamp + i * 10;  // Space timestamps by 10
+      db.write(wctx, frame_data.data(), frame_size, timestamp, (uint8_t)(i % 256));
+    }
+  }
+  
+  // Verify initial state - should have 1 contiguous segment
+  {
+    nanots_reader reader("nanots_test_progressive_deletion.nts");
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    
+    RTF_ASSERT(segments.size() == 1);
+    RTF_ASSERT(segments[0].start_timestamp == start_timestamp);
+    RTF_ASSERT(segments[0].end_timestamp == end_timestamp);
+    
+    printf("\nInitial state: %zu contiguous segment(s)\n", segments.size());
+    printf("  Segment 0: [%" PRId64 ", %" PRId64 "]\n", 
+           segments[0].start_timestamp, segments[0].end_timestamp);
+  }
+  
+  // Free a large window in the middle - guaranteed to delete at least one complete block
+  uint64_t first_delete_start = 15000;  // Somewhere in the middle
+  uint64_t first_delete_end = 18000;    // Large enough window to encompass multiple blocks
+  
+  printf("\nFreeing large window: [%" PRIu64 ", %" PRIu64 "]\n", 
+         first_delete_start, first_delete_end);
+  db.free_blocks("test_stream", first_delete_start, first_delete_end);
+  
+  // Should now have 2 contiguous segments
+  {
+    nanots_reader reader("nanots_test_progressive_deletion.nts");
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    
+    RTF_ASSERT(segments.size() == 2);
+    RTF_ASSERT(segments[0].start_timestamp == start_timestamp);
+    RTF_ASSERT(segments[1].end_timestamp == end_timestamp);
+    
+    printf("After first deletion: %zu contiguous segment(s)\n", segments.size());
+    for (size_t i = 0; i < segments.size(); i++) {
+      printf("  Segment %zu: [%" PRId64 ", %" PRId64 "]\n", i,
+             segments[i].start_timestamp, segments[i].end_timestamp);
+    }
+  }
+  
+  // Free another large window earlier in the timeline
+  uint64_t second_delete_start = 11000;
+  uint64_t second_delete_end = 13000;
+  
+  printf("\nFreeing second window: [%" PRIu64 ", %" PRIu64 "]\n", 
+         second_delete_start, second_delete_end);
+  db.free_blocks("test_stream", second_delete_start, second_delete_end);
+  
+  {
+    nanots_reader reader("nanots_test_progressive_deletion.nts");
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    
+    // Should have at least 2 segments, possibly 3 if the windows don't overlap
+    RTF_ASSERT(segments.size() >= 2);
+    
+    printf("After second deletion: %zu contiguous segment(s)\n", segments.size());
+    for (size_t i = 0; i < segments.size(); i++) {
+      printf("  Segment %zu: [%" PRId64 ", %" PRId64 "]\n", i,
+             segments[i].start_timestamp, segments[i].end_timestamp);
+    }
+  }
+  
+  // Free another large window later in the timeline
+  uint64_t third_delete_start = 22000;
+  uint64_t third_delete_end = 25000;
+  
+  printf("\nFreeing third window: [%" PRIu64 ", %" PRIu64 "]\n", 
+         third_delete_start, third_delete_end);
+  db.free_blocks("test_stream", third_delete_start, third_delete_end);
+  
+  {
+    nanots_reader reader("nanots_test_progressive_deletion.nts");
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    
+    // Should have multiple segments now
+    RTF_ASSERT(segments.size() >= 2);
+    
+    printf("After third deletion: %zu contiguous segment(s)\n", segments.size());
+    for (size_t i = 0; i < segments.size(); i++) {
+      printf("  Segment %zu: [%" PRId64 ", %" PRId64 "]\n", i,
+             segments[i].start_timestamp, segments[i].end_timestamp);
+    }
+  }
+  
+  // Test edge case: try to free a very small range that won't encompass any complete blocks
+  printf("\nTrying to free tiny range (should not free anything)\n");
+  uint64_t tiny_start = 10050;
+  uint64_t tiny_end = 10060;   // Only 10 timestamp units - won't encompass a full block
+  
+  printf("Attempting to free tiny range [%" PRIu64 ", %" PRIu64 "]\n", 
+         tiny_start, tiny_end);
+  
+  // Get current segment count
+  nanots_reader reader_before("nanots_test_progressive_deletion.nts");
+  auto segments_before = reader_before.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+  size_t count_before = segments_before.size();
+  
+  db.free_blocks("test_stream", tiny_start, tiny_end);
+  
+  // Check that segment count hasn't changed
+  nanots_reader reader_after("nanots_test_progressive_deletion.nts");
+  auto segments_after = reader_after.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+  
+  RTF_ASSERT(segments_after.size() == count_before);
+  printf("After tiny range free attempt: still %zu contiguous segment(s) (unchanged)\n", segments_after.size());
+  
+  // Test querying a deleted range
+  {
+    nanots_reader reader("nanots_test_progressive_deletion.nts");
+    auto segments = reader.query_contiguous_segments("test_stream", first_delete_start, first_delete_end);
+    
+    // Should return empty or very few segments since most of this range was deleted
+    printf("\nQuery in first deleted range [%" PRIu64 ", %" PRIu64 "]: %zu segment(s)\n", 
+           first_delete_start, first_delete_end, segments.size());
+    
+    // The range might have some remaining data at the edges, so we don't assert == 0
+    // but we can assert it's fewer segments than we started with
+    RTF_ASSERT(segments.size() <= 2);
+  }
+}
+
+void test_nanots::test_nanots_iterator_block_transition_flag_search() {
+  // Use smaller block database to ensure block transitions happen sooner
+  nanots_writer db("nanots_test_2048_4k_blocks.nts", false);
+  
+  const size_t frame_size = 500;  // 500 byte frames to fill blocks faster
+  const int total_frames = 200;   // Write enough frames to guarantee block transitions
+  
+  printf("Writing %d frames of %zu bytes each to force block transitions\n", 
+         total_frames, frame_size);
+  
+  {
+    auto wctx = db.create_write_context("block_transition_stream", "block transition flag test");
+    std::vector<uint8_t> frame_data(frame_size, 0xCD);
+    
+    for (int i = 0; i < total_frames; i++) {
+      uint64_t timestamp = 10000 + (i * 100);  // Timestamps: 10000, 10100, 10200, ...
+      
+      // Every 20th row has flags = 1, others have flags = 0
+      // But skip the flagged frame at the block boundary to force cross-block search
+      uint8_t flags = (i % 20 == 0 && i != 120) ? 1 : 0;
+      
+      // Fill frame with unique pattern to verify integrity
+      for (size_t j = 0; j < frame_size; j++) {
+        frame_data[j] = (uint8_t)((i + j) % 256);
+      }
+      
+      db.write(wctx, frame_data.data(), frame_size, timestamp, flags);
+      
+      if (flags == 1) {
+        printf("  Wrote flagged frame %d at timestamp %" PRIu64 "\n", i, timestamp);
+      }
+    }
+  }
+  
+  printf("Finished writing frames\n");
+  
+  // Verify we have multiple blocks by checking block sequences
+  nanots_iterator iter("nanots_test_2048_4k_blocks.nts", "block_transition_stream");
+  
+  std::set<int64_t> block_sequences;
+  int frame_count = 0;
+  
+  while (iter.valid()) {
+    block_sequences.insert(iter->block_sequence);
+    frame_count++;
+    ++iter;
+  }
+  
+  printf("Found %d frames across %zu different blocks\n", 
+         frame_count, block_sequences.size());
+  RTF_ASSERT(block_sequences.size() > 1);  // Must have multiple blocks
+  RTF_ASSERT(frame_count == total_frames);
+  
+  // Find the exact block transition point by scanning through frames
+  iter.reset();
+  int64_t first_block_sequence = -1;
+  uint64_t block_transition_timestamp = 0;
+  int frames_in_first_block = 0;
+  
+  while (iter.valid()) {
+    if (first_block_sequence == -1) {
+      first_block_sequence = iter->block_sequence;
+    }
+    
+    if (iter->block_sequence != first_block_sequence) {
+      // Found the transition point
+      block_transition_timestamp = iter->timestamp;
+      printf("Block transition found at timestamp %" PRIu64 " (frame %d), from block %" PRId64 " to %" PRId64 "\n", 
+             iter->timestamp, frames_in_first_block, first_block_sequence, iter->block_sequence);
+      break;
+    }
+    
+    frames_in_first_block++;
+    ++iter;
+  }
+  
+  RTF_ASSERT(block_transition_timestamp > 0);  // Must have found a transition
+  
+  // Position iterator just into the second block, past the boundary frame
+  // Since we removed the flag from frame 120, backing up should go to frame 100 in block 0
+  uint64_t search_timestamp = block_transition_timestamp + (5 * 100);  // 5 frames past transition
+  
+  printf("\nSearching for timestamp %" PRIu64 " (5 frames past block transition)\n", search_timestamp);
+  
+  iter.reset();
+  bool found = iter.find(search_timestamp);
+  RTF_ASSERT(found);
+  RTF_ASSERT(iter.valid());
+  
+  printf("Found frame at timestamp %" PRId64 " in block sequence %" PRId64 "\n", 
+         iter->timestamp, iter->block_sequence);
+  
+  // Now walk backward using -- until we find a frame with flags == 1
+  int steps_backward = 0;
+  bool found_flagged = false;
+  
+  printf("Walking backward from timestamp %" PRId64 " looking for flags=1\n", 
+         iter->timestamp);
+  
+  while (iter.valid()) {
+    printf("  Step %d: timestamp=%" PRId64 ", flags=%d, block_sequence=%" PRId64 "\n", 
+           steps_backward, iter->timestamp, iter->flags, iter->block_sequence);
+    
+    if (iter->flags == 1) {
+      found_flagged = true;
+      printf("  Found flagged frame at timestamp %" PRId64 " after %d backward steps!\n", 
+             iter->timestamp, steps_backward);
+      break;
+    }
+    
+    --iter;
+    steps_backward++;
+    
+    // Safety check to prevent infinite loop
+    if (steps_backward > 100) {
+      printf("  Stopped after 100 steps to prevent infinite loop\n");
+      break;
+    }
+  }
+  
+  RTF_ASSERT(found_flagged);  // Must find a flagged frame
+  RTF_ASSERT(iter->flags == 1);  // Verify we're on the correct frame
+  
+  // Verify this is indeed one of our expected flagged frames (every 20th)
+  // Calculate which frame index this should be based on timestamp
+  int64_t frame_index = (iter->timestamp - 10000) / 100;
+  RTF_ASSERT(frame_index % 20 == 0);  // Should be a multiple of 20
+  
+  printf("Successfully found flagged frame at index %" PRId64 " (timestamp %" PRId64 ")\n", 
+         frame_index, iter->timestamp);
+  
+  // Verify frame data integrity
+  for (size_t j = 0; j < min(frame_size, (size_t)100); j++) {
+    uint8_t expected_byte = (uint8_t)((frame_index + j) % 256);
+    RTF_ASSERT(iter->data[j] == expected_byte);
+  }
+  
+  printf("Frame data integrity verified\n");
 }

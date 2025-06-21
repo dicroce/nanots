@@ -19,7 +19,8 @@ enum nanots_ec_t {
   NANOTS_EC_ROW_SIZE_TOO_BIG = 9,
   NANOTS_EC_UNABLE_TO_ALLOCATE_FILE = 10,
   NANOTS_EC_INVALID_ARGUMENT = 11,
-  NANOTS_EC_UNKNOWN = 12
+  NANOTS_EC_UNKNOWN = 12,
+  NANOTS_EC_NOT_FOUND = 13
 };
 
 }
@@ -193,6 +194,7 @@ struct frame_info {
 struct block_info {
   int64_t block_idx{0};
   int64_t block_sequence{0};
+  int64_t segment_id{0};
   std::string metadata;
   std::string uuid_hex;
   int64_t start_timestamp{0};
@@ -231,10 +233,10 @@ class nanots_iterator {
   const std::string& current_metadata() const;
 
  private:
-  block_info* _get_block_by_sequence(int64_t sequence);
+  block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
   block_info* _get_first_block();
-  block_info* _get_next_block(int64_t current_sequence);
-  block_info* _get_prev_block(int64_t current_sequence);
+  block_info* _get_next_block();
+  block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
 
   bool _load_block_data(block_info& block);
@@ -247,10 +249,12 @@ class nanots_iterator {
 
   // Current position
   int64_t _current_block_sequence;
+  int64_t _current_segment_id;
   size_t _current_frame_idx;
 
-  // Cache of visited blocks (sequence -> block_info)
-  std::unordered_map<int64_t, block_info> _block_cache;
+  // Cache of visited blocks (segment_id:sequence -> block_info)
+  // Using string key for simplicity: "segment_id:sequence"
+  std::unordered_map<std::string, block_info> _block_cache;
 
   // Cached current frame
   frame_info _current_frame;

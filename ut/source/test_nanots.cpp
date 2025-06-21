@@ -380,6 +380,141 @@ void test_nanots::test_nanots_edge_cases() {
   }
 }
 
+void test_nanots::test_nanots_cross_segment_iteration() {
+  // Create multiple segments by writing data in separate contexts
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Write first segment
+  {
+    auto wctx = db.create_write_context("cross_segment_stream", "segment 1");
+    for (int i = 0; i < 5; i++) {
+      std::string data = "seg1_frame_" + std::to_string(i);
+      uint64_t timestamp = 1000 + (i * 100);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x01);
+    }
+  }
+
+  // Write second segment (simulating restart)
+  {
+    auto wctx = db.create_write_context("cross_segment_stream", "segment 2");
+    for (int i = 0; i < 5; i++) {
+      std::string data = "seg2_frame_" + std::to_string(i);
+      uint64_t timestamp = 2000 + (i * 100);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x02);
+    }
+  }
+
+  // Write third segment
+  {
+    auto wctx = db.create_write_context("cross_segment_stream", "segment 3");
+    for (int i = 0; i < 5; i++) {
+      std::string data = "seg3_frame_" + std::to_string(i);
+      uint64_t timestamp = 3000 + (i * 100);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x03);
+    }
+  }
+
+  // Test forward iteration across segments
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "cross_segment_stream");
+    RTF_ASSERT(iter.valid());
+
+    // Verify we can iterate through all frames across segments
+    std::vector<std::string> frames_read;
+    std::vector<int64_t> timestamps_read;
+    while (iter.valid()) {
+      std::string frame_data((char*)iter->data, iter->size);
+      frames_read.push_back(frame_data);
+      timestamps_read.push_back(iter->timestamp);
+      ++iter;
+    }
+
+    RTF_ASSERT(frames_read.size() == 15); // 5 frames per segment * 3 segments
+    
+    // Verify first segment frames
+    for (int i = 0; i < 5; i++) {
+      RTF_ASSERT(frames_read[i] == "seg1_frame_" + std::to_string(i));
+      RTF_ASSERT(timestamps_read[i] == 1000 + (i * 100));
+    }
+    
+    // Verify second segment frames  
+    for (int i = 0; i < 5; i++) {
+      RTF_ASSERT(frames_read[5 + i] == "seg2_frame_" + std::to_string(i));
+      RTF_ASSERT(timestamps_read[5 + i] == 2000 + (i * 100));
+    }
+    
+    // Verify third segment frames
+    for (int i = 0; i < 5; i++) {
+      RTF_ASSERT(frames_read[10 + i] == "seg3_frame_" + std::to_string(i));
+      RTF_ASSERT(timestamps_read[10 + i] == 3000 + (i * 100));
+    }
+  }
+
+  // Test backward iteration across segments
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "cross_segment_stream");
+    
+    // Find a timestamp in the middle segment
+    RTF_ASSERT(iter.find(2200));
+    RTF_ASSERT(iter->timestamp == 2200);
+    
+    // Move backward to previous segment
+    for (int i = 0; i < 3; i++) {
+      --iter;
+      RTF_ASSERT(iter.valid());
+    }
+    
+    // Should now be at last frame of first segment
+    RTF_ASSERT(iter->timestamp == 1400);
+    std::string frame_data((char*)iter->data, iter->size);
+    RTF_ASSERT(frame_data == "seg1_frame_4");
+    
+    // Continue moving backward within first segment
+    --iter;
+    RTF_ASSERT(iter->timestamp == 1300);
+  }
+
+  // Test find across segments
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "cross_segment_stream");
+    
+    // Find in first segment
+    RTF_ASSERT(iter.find(1200));
+    RTF_ASSERT(iter->timestamp == 1200);
+    
+    // Find in second segment
+    RTF_ASSERT(iter.find(2100));
+    RTF_ASSERT(iter->timestamp == 2100);
+    
+    // Find in third segment
+    RTF_ASSERT(iter.find(3300));
+    RTF_ASSERT(iter->timestamp == 3300);
+    
+    // Find with timestamp between segments
+    RTF_ASSERT(iter.find(1500)); // After first segment, should find first frame of second segment
+    RTF_ASSERT(iter->timestamp == 2000);
+  }
+
+  // Test metadata changes across segments
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "cross_segment_stream");
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter.current_metadata() == "segment 1");
+    
+    // Move to second segment
+    for (int i = 0; i < 5; i++) {
+      ++iter;
+    }
+    RTF_ASSERT(iter.current_metadata() == "segment 2");
+    
+    // Move to third segment
+    for (int i = 0; i < 5; i++) {
+      ++iter;
+    }
+    RTF_ASSERT(iter.current_metadata() == "segment 3");
+  }
+}
+
 void test_nanots::test_nanots_monotonic_timestamp_validation() {
   nanots_writer db("nanots_test_4mb.nts", false);
 

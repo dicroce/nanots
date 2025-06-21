@@ -33,6 +33,7 @@ cdef extern from "nanots.h":
         NANOTS_EC_UNABLE_TO_ALLOCATE_FILE = 10
         NANOTS_EC_INVALID_ARGUMENT = 11
         NANOTS_EC_UNKNOWN = 12
+        NANOTS_EC_NOT_FOUND = 13
     
     ctypedef struct nanots_contiguous_segment_t:
         int segment_id
@@ -150,6 +151,9 @@ class UnableToAllocateFileError(NanoTSError):
 class InvalidArgumentError(NanoTSError):
     pass
 
+class NotFoundError(NanoTSError):
+    pass
+
 # Helper function to check results and raise appropriate exceptions
 cdef void _check_result(nanots_ec_t result):
     if result == NANOTS_EC_OK:
@@ -176,6 +180,8 @@ cdef void _check_result(nanots_ec_t result):
         raise UnableToAllocateFileError("Unable to allocate file")
     elif result == NANOTS_EC_INVALID_ARGUMENT:
         raise InvalidArgumentError("Invalid argument")
+    elif result == NANOTS_EC_NOT_FOUND:
+        raise NotFoundError("Not found")
     else:
         raise NanoTSError(f"Unknown error: {result}")
 

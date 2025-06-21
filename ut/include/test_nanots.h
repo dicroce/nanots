@@ -11,6 +11,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_iterator_bidirectional);
   TEST(test_nanots::test_nanots_large_frames);
   TEST(test_nanots::test_nanots_edge_cases);
+  TEST(test_nanots::test_nanots_cross_segment_iteration);
   TEST(test_nanots::test_nanots_monotonic_timestamp_validation);
   TEST(test_nanots::test_nanots_performance_baseline);
   TEST(test_nanots::test_nanots_concurrent_readers);
@@ -47,6 +48,7 @@ class test_nanots : public test_fixture {
   void test_nanots_iterator_bidirectional();
   void test_nanots_large_frames();
   void test_nanots_edge_cases();
+  void test_nanots_cross_segment_iteration();
   void test_nanots_monotonic_timestamp_validation();
   void test_nanots_performance_baseline();
   void test_nanots_concurrent_readers();

@@ -1034,8 +1034,28 @@ block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
   auto results =
       stmt.bind(1, _stream_tag).bind(2, timestamp).bind(3, timestamp).exec();
 
-  if(results.empty())
-    return nullptr;
+  if(!results.empty())
+  {
+    int64_t segment_id = std::stoll(results[0]["segment_id"].value());
+    int64_t sequence = std::stoll(results[0]["sequence"].value());
+    return _get_block_by_segment_and_sequence(segment_id, sequence);
+  }
+
+  // If no block contains the timestamp, find the first block with start_timestamp >=
+  // timestamp. This explicitly allows a find() before the first timsestamp to still find the first block.
+  stmt = db.prepare(
+      "SELECT sb.segment_id, sb.sequence "
+      "FROM segments s "
+      "JOIN segment_blocks sb ON sb.segment_id = s.id "
+      "WHERE s.stream_tag = ? "
+      "AND sb.start_timestamp >= ? "
+      "ORDER BY s.id ASC, sb.sequence ASC "
+      "LIMIT 1");
+
+  results = stmt.bind(1, _stream_tag).bind(2, timestamp).exec();
+
+  if (results.empty())
+    return nullptr;  // No blocks at all, or timestamp is after everything
 
   int64_t segment_id = std::stoll(results[0]["segment_id"].value());
   int64_t sequence = std::stoll(results[0]["sequence"].value());
@@ -1232,7 +1252,6 @@ bool nanots_iterator::find(int64_t timestamp) {
   _current_frame.block_sequence = block->block_sequence;
 
   _valid = true;
-
   return true;
 }
 

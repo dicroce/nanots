@@ -111,7 +111,8 @@ class test_fixture {
 
   virtual ~test_fixture() throw() {}
 
-  void run_tests(const std::string& test_filter = "") {
+  int run_tests(const std::string& test_filter = "") {
+    int tests_run = 0;
     std::vector<struct test_host>::iterator i = _tests.begin();
     for (; i != _tests.end(); i++) {
       // Skip test if filter is specified and doesn't match
@@ -137,7 +138,9 @@ class test_fixture {
              (*i).test_name.c_str());
 
       teardown();
+      tests_run++;
     }
+    return tests_run;
   }
 
   bool something_failed() { return _something_failed; }

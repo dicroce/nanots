@@ -1853,3 +1853,98 @@ void test_nanots::test_nanots_iterator_block_transition_flag_search() {
   
   printf("Frame data integrity verified\n");
 }
+
+void test_nanots::test_nanots_iterator_performance_benchmark() {
+  nanots_writer db("nanots_test_16mb.nts", false);
+  
+  const int num_rows = 2000;
+  const size_t row_size = 1024;  // 1KB rows
+  const uint64_t start_timestamp = 1000000;
+  
+  printf("Writing %d rows of %zu bytes each for performance test\n", num_rows, row_size);
+  
+  // Step 1: Write rows with every 30th row having flags=1
+  {
+    auto wctx = db.create_write_context("perf_test_stream", "iterator performance test");
+    std::vector<uint8_t> row_data(row_size);
+    
+    for (int i = 0; i < num_rows; i++) {
+      uint64_t timestamp = start_timestamp + i;
+      uint8_t flags = (i % 30 == 0) ? 1 : 0;
+      
+      // Fill row with pattern for verification
+      for (size_t j = 0; j < row_size; j++) {
+        row_data[j] = (uint8_t)((i + j) % 256);
+      }
+      
+      db.write(wctx, row_data.data(), row_size, timestamp, flags);
+    }
+  }
+  
+  printf("Finished writing %d rows\n", num_rows);
+  
+  // Step 2: Get current time in microseconds
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  // Static buffer for memcpy (step 7)
+  static uint8_t static_buffer[1024];
+  
+  // Step 3: Loop 100 times
+  const int num_iterations = 100;
+  int successful_finds = 0;
+  
+  for (int iteration = 0; iteration < num_iterations; iteration++) {
+    // Step 4: Compute random timestamp in inserted range
+    uint64_t random_timestamp = start_timestamp + (rand() % num_rows);
+    
+    // Step 5: Declare iterator and do find
+    nanots_iterator iter("nanots_test_16mb.nts", "perf_test_stream");
+    bool found = iter.find(random_timestamp);
+    
+    if (!found || !iter.valid()) {
+      printf("Warning: Failed to find timestamp %" PRIu64 " in iteration %d\n", 
+             random_timestamp, iteration);
+      continue;
+    }
+    
+    // Step 6: Backup iterator until we see flags=1
+    int backup_steps = 0;
+    while (iter.valid() && iter->flags != 1) {
+      --iter;
+      backup_steps++;
+      
+      // Safety check to prevent going too far back
+      if (backup_steps > 100) {
+        printf("Warning: Too many backup steps in iteration %d\n", iteration);
+        break;
+      }
+    }
+    
+    if (iter.valid() && iter->flags == 1) {
+      // Step 7: memcpy the row data out to static buffer
+      size_t copy_size = min(iter->size, sizeof(static_buffer));
+      memcpy(static_buffer, iter->data, copy_size);
+      successful_finds++;
+    }
+  }
+  // Step 7 (end loop)
+  
+  // Get current time (step 8)
+  auto end_time = std::chrono::high_resolution_clock::now();
+  
+  // Step 8: Print timing summary
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+  
+  printf("\n=== Iterator Performance Benchmark Results ===\n");
+  printf("Total time: %lld microseconds\n", static_cast<long long>(duration.count()));
+  printf("Number of iterations: %d\n", num_iterations);
+  printf("Successful finds: %d\n", successful_finds);
+  printf("Average time per iteration: %.2f microseconds\n", 
+         (double)duration.count() / num_iterations);
+  printf("Average time per successful find: %.2f microseconds\n",
+         successful_finds > 0 ? (double)duration.count() / successful_finds : 0.0);
+  printf("==============================================\n");
+  
+  // Verify at least most finds were successful
+  RTF_ASSERT(successful_finds >= num_iterations * 0.9);  // At least 90% success rate
+}

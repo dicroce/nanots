@@ -191,6 +191,7 @@ int main(int argc, char* argv[]) {
 
   std::string fixture_name = "";
   std::string test_name = "";
+  std::string full_test_name = "";
 
   // Parse command line arguments
   if (argc > 1) {
@@ -201,11 +202,14 @@ int main(int argc, char* argv[]) {
     if (pos != std::string::npos) {
       fixture_name = arg1.substr(0, pos);
       test_name = arg1.substr(pos + 2);
+      // The test names in the framework are stored as "fixture::method"
+      full_test_name = arg1;
     } else {
       fixture_name = arg1;
       // Check for separate test name argument
       if (argc > 2) {
         test_name = argv[2];
+        full_test_name = fixture_name + "::" + test_name;
       }
     }
   }
@@ -226,13 +230,16 @@ int main(int argc, char* argv[]) {
 #endif
 
   bool something_failed = false;
+  int total_tests_run = 0;
 
   for (auto& tf : _test_fixtures) {
     if (!fixture_name.empty())
       if (tf->get_name() != fixture_name)
         continue;
 
-    tf->run_tests(test_name);
+    // Pass the full test name for specific test execution
+    int tests_run = tf->run_tests(full_test_name);
+    total_tests_run += tests_run;
 
     if (tf->something_failed()) {
       something_failed = true;
@@ -240,10 +247,20 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (!something_failed)
-    printf("\nSuccess.\n");
-  else
-    printf("\nFailure.\n");
+  // Only print Success/Failure if at least one test was run
+  if (total_tests_run > 0) {
+    if (!something_failed)
+      printf("\nSuccess.\n");
+    else
+      printf("\nFailure.\n");
+  } else {
+    printf("\nNo tests were run.\n");
+    // Exit with error code if a specific test was requested but not found
+    if (!fixture_name.empty() || !test_name.empty()) {
+      printf("Error: Requested test not found.\n");
+      return 1;
+    }
+  }
 
   if (something_failed)
     if (system("/bin/bash -c 'read -p \"Press Any Key\"'") < 0) {

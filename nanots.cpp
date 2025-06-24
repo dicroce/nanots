@@ -36,6 +36,47 @@ static std::string _database_name(const std::string& file_name) {
   return file_name.substr(0, file_name.find(".nts")) + ".db";
 }
 
+static void _free_block(nts_sqlite_conn& conn, int sb_id, int block_id) {
+  nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+    auto stmt = conn.prepare("DELETE FROM segment_blocks WHERE id = ?");
+    stmt.bind(1, sb_id).exec_no_result();
+    stmt = conn.prepare("UPDATE blocks SET status = 'free' WHERE id = ?");
+    stmt.bind(1, block_id).exec_no_result();
+  });
+}
+
+static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size, 
+                                     int index, uint32_t n_valid_indexes, 
+                                     const uint8_t* uuid) {
+  uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (index * INDEX_ENTRY_SIZE);
+  int64_t timestamp = *(int64_t*)index_p;
+  uint64_t offset = *(uint64_t*)(index_p + 8);
+
+  // Skip zeroed entries
+  if (timestamp == 0 || offset == 0) {
+    return false;
+  }
+  
+  // Check frame offset bounds
+  uint32_t index_region_end = BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
+  if (offset < index_region_end || offset > block_size - FRAME_HEADER_SIZE) {
+    return false;
+  }
+  
+  // Validate frame header
+  uint32_t frame_size = 0;
+  if (!_validate_frame_header(block_p + offset, uuid, nullptr, &frame_size)) {
+    return false;
+  }
+  
+  // Check if frame size fits within block
+  if (frame_size > block_size - offset - FRAME_HEADER_SIZE) {
+    return false;
+  }
+  
+  return true;
+}
+
 static void _validate_blocks(const std::string& file_name) {
   auto f = nts_file::open(file_name, "r+");
 
@@ -55,87 +96,88 @@ static void _validate_blocks(const std::string& file_name) {
 
   auto db_name = _database_name(file_name);
   nts_sqlite_conn conn(db_name, true, true);
-
-  auto result = conn.exec(
-      "SELECT sb.id, sb.block_idx, sb.uuid, s.stream_tag "
-      "FROM segment_blocks sb "
-      "JOIN segments s ON sb.segment_id = s.id "
-      "WHERE sb.end_timestamp = 0");
-
-  for (auto& row : result) {
-    int block_idx = std::stoi(row["block_idx"].value());
-    std::string uuid_hex = row["uuid"].value();
-
-    uint8_t uuid[16];
-    s_to_entropy_id(uuid_hex, uuid);
-
-    nts_memory_map mm(
-        filenum(f), FILE_HEADER_BLOCK_SIZE + (block_idx * block_size),
-        block_size,
-        nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
-        nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
-
-    uint8_t* block_p = (uint8_t*)mm.map();
-
-    auto valid_counter = (uint32_t*)(block_p + 8);
-
-    #ifdef _WIN32
-        uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
-        _ReadWriteBarrier(); // compiler barrier (not mem)
-    #else
-        uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
-    #endif
-    
-    // Scan backwards to find last valid frame
-
-    int last_valid = -1;
-    for (int i = n_valid_indexes - 1; i >= 0; i--) {
-      uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
-      int64_t timestamp = *(int64_t*)index_p;
-      uint64_t offset = *(uint64_t*)(index_p + 8);
-
-      if (timestamp == 0 || offset == 0)
-        continue;  // Skip zeroed entries
-
-      uint32_t index_region_end =
-          BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
-
-      // Frame must be after all possible index entries and have room for header
-      if (offset < index_region_end || offset > block_size - FRAME_HEADER_SIZE)
+  
+  std::vector<std::map<std::string, std::optional<std::string>>> rowsToProcess;
+  
+  bool doneValidating = false;
+  while(!doneValidating) {
+    if(rowsToProcess.empty()) {
+      rowsToProcess = conn.exec(
+          "SELECT sb.id, sb.block_idx, sb.block_id, sb.uuid, s.stream_tag "
+          "FROM segment_blocks sb "
+          "JOIN segments s ON sb.segment_id = s.id "
+          "WHERE sb.end_timestamp = 0");
+      
+      if(rowsToProcess.empty()) {
+        doneValidating = true;
         continue;
-
-      uint32_t frame_size = 0;
-      if (_validate_frame_header(block_p + offset, uuid, nullptr,
-                                 &frame_size)) {
-        // Basic sanity check on size
-        if (frame_size > block_size - offset - FRAME_HEADER_SIZE)
-          continue;
-
-        last_valid = i;
-        break;
       }
-    }
+    } else {
+      auto row = rowsToProcess.back();
+      rowsToProcess.pop_back();
 
-    if (last_valid >= 0) {
-      nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
-        uint8_t* last_index_p =
-            block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
-        int64_t actual_last_timestamp = *(int64_t*)last_index_p;
-        auto stmt = conn.prepare(
-            "UPDATE segment_blocks SET end_timestamp = ? WHERE block_idx = ? AND uuid "
-            "= ?");
-        stmt.bind(1, actual_last_timestamp)
-            .bind(2, block_idx)
-            .bind(3, uuid_hex)
-            .exec_no_result();
-      });
-    }
+      int sb_id = std::stoi(row["id"].value());
+      int block_id = std::stoi(row["block_id"].value());
+      int block_idx = std::stoi(row["block_idx"].value());
+      std::string uuid_hex = row["uuid"].value();
 
-    // Fix n_valid_indexes if needed
-    if (last_valid + 1 != (int)n_valid_indexes) {
-      // Truncating corrupt block
-      *(uint32_t*)(block_p + 8) = last_valid + 1;
-      mm.flush(mm.map(), block_size, true);
+      uint8_t uuid[16];
+      s_to_entropy_id(uuid_hex, uuid);
+
+      nts_memory_map mm(
+          filenum(f), FILE_HEADER_BLOCK_SIZE + (block_idx * block_size),
+          block_size,
+          nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
+          nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
+
+      uint8_t* block_p = (uint8_t*)mm.map();
+
+      auto valid_counter = (uint32_t*)(block_p + 8);
+
+      #ifdef _WIN32
+          uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
+          _ReadWriteBarrier(); // compiler barrier (not mem)
+      #else
+          uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
+      #endif
+
+      if((n_valid_indexes * INDEX_ENTRY_SIZE) >= (block_size / 2) || n_valid_indexes == 0) {
+        _free_block(conn, sb_id, block_id);
+        rowsToProcess.clear();
+        continue;
+      }
+
+      // Find the last valid frame by searching backwards from the end
+      int last_valid = -1;
+      for (int i = n_valid_indexes - 1; i >= 0; i--) {
+        if (_is_valid_frame_at_index(block_p, block_size, i, n_valid_indexes, uuid)) {
+          last_valid = i;
+          break;
+        }
+      }
+
+      if(last_valid < 0) {
+        _free_block(conn, sb_id, block_id);
+        rowsToProcess.clear();
+        continue;
+      } else {
+        nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+          uint8_t* last_index_p =
+              block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
+          int64_t actual_last_timestamp = *(int64_t*)last_index_p;
+          auto stmt = conn.prepare(
+              "UPDATE segment_blocks SET end_timestamp = ? WHERE block_idx = ? AND uuid "
+              "= ?");
+          stmt.bind(1, actual_last_timestamp)
+              .bind(2, block_idx)
+              .bind(3, uuid_hex)
+              .exec_no_result();
+        });
+
+        // Truncating corrupt block
+        *(uint32_t*)(block_p + 8) = last_valid + 1;
+        mm.flush(mm.map(), block_size, true);
+      }
     }
   }
 }

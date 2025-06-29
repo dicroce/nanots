@@ -369,7 +369,8 @@ static void _recycle_block(write_context& wctx, int64_t timestamp) {
 
 write_context::~write_context() {
   std::lock_guard<std::mutex> g(current_stream_tags_lok);
-  current_stream_tags.erase(stream_tag);
+  std::string key = file_name + ":" + stream_tag;
+  current_stream_tags.erase(key);
 
   if (last_timestamp && current_block) {
     auto db_name = _database_name(file_name);
@@ -396,8 +397,7 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       _file_header_p((uint8_t*)_file_header_mm.map()),
       _block_size(*(uint32_t*)_file_header_p),
       _n_blocks(*(uint32_t*)(_file_header_p + sizeof(uint32_t))),
-      _auto_reclaim(auto_reclaim),
-      _active_stream_tags() {
+      _auto_reclaim(auto_reclaim) {
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
@@ -410,8 +410,10 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
 write_context nanots_writer::create_write_context(const std::string& stream_tag,
                                                   const std::string& metadata) {
 
+  std::string key = _file_name + ":" + stream_tag;
+  
   std::lock_guard<std::mutex> g(current_stream_tags_lok);
-  if(current_stream_tags.find(stream_tag) != current_stream_tags.end())
+  if(current_stream_tags.find(key) != current_stream_tags.end())
     throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Only one current writer per active stream tag.", __FILE__, __LINE__);
 
   write_context wctx;
@@ -423,16 +425,13 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
 
   nts_sqlite_conn conn(db_name.c_str(), true, true);
 
-  if(_active_stream_tags.find(stream_tag) != _active_stream_tags.end())
-    throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Stream tag already exists.", __FILE__, __LINE__);
-
   nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
     wctx.current_segment = _db_create_segment(conn, stream_tag, metadata);
     if (!wctx.current_segment)
       throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
   });
 
-  current_stream_tags.insert(stream_tag);
+  current_stream_tags.insert(key);
 
   return wctx;
 }

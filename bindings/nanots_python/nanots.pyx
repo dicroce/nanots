@@ -60,7 +60,7 @@ cdef extern from "nanots.h":
                                     size_t size,
                                     int64_t timestamp,
                                     uint8_t flags)
-    nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
+    nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
                                           int64_t end_timestamp)
@@ -241,11 +241,13 @@ cdef class Writer:
             self._writer, context._context, data, len(data), timestamp, flags)
         _check_result(result)
     
-    def free_blocks(self, str stream_tag, int64_t start_timestamp, int64_t end_timestamp):
+    @staticmethod
+    def free_blocks(str filename, str stream_tag, int64_t start_timestamp, int64_t end_timestamp):
         """Free blocks for a time range in a stream."""
+        cdef bytes filename_bytes = filename.encode('utf-8')
         cdef bytes stream_tag_bytes = stream_tag.encode('utf-8')
         cdef nanots_ec_t result = nanots_writer_free_blocks(
-            self._writer, stream_tag_bytes, start_timestamp, end_timestamp)
+            filename_bytes, stream_tag_bytes, start_timestamp, end_timestamp)
         _check_result(result)
 
 # Reader wrapper

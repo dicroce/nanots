@@ -1423,7 +1423,7 @@ void test_nanots::test_nanots_free_blocks() {
 
   // Delete blocks in the middle time range (5000 to 15000)
   // This should delete frames with timestamps 5000, 6000, 7000, ..., 15000
-  db.free_blocks("delete_stream", 250, 500);
+  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "delete_stream", 250, 500);
 
   // Debug: Check what blocks exist after deletion
   debug_result = debug_conn.exec(
@@ -1485,7 +1485,7 @@ void test_nanots::test_nanots_query_contiguous_segments() {
     }
   }
 
-  db.free_blocks("test_stream", 250, 500);
+  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "test_stream", 250, 500);
 
   nanots_reader reader("nanots_test_2048_4k_blocks.nts");
   auto segments = reader.query_contiguous_segments("test_stream", 1, 1024);
@@ -1615,7 +1615,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing large window: [%" PRIu64 ", %" PRIu64 "]\n", 
          first_delete_start, first_delete_end);
-  db.free_blocks("test_stream", first_delete_start, first_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", first_delete_start, first_delete_end);
   
   // Should now have 2 contiguous segments
   {
@@ -1639,7 +1639,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing second window: [%" PRIu64 ", %" PRIu64 "]\n", 
          second_delete_start, second_delete_end);
-  db.free_blocks("test_stream", second_delete_start, second_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", second_delete_start, second_delete_end);
   
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
@@ -1661,7 +1661,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing third window: [%" PRIu64 ", %" PRIu64 "]\n", 
          third_delete_start, third_delete_end);
-  db.free_blocks("test_stream", third_delete_start, third_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", third_delete_start, third_delete_end);
   
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
@@ -1690,7 +1690,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   auto segments_before = reader_before.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
   size_t count_before = segments_before.size();
   
-  db.free_blocks("test_stream", tiny_start, tiny_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", tiny_start, tiny_end);
   
   // Check that segment count hasn't changed
   nanots_reader reader_after("nanots_test_progressive_deletion.nts");

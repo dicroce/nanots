@@ -20,4 +20,5 @@ target_include_directories(
 target_link_libraries(
     nanots_ut LINK_PUBLIC 
     nanots
+    platform::platform
 )

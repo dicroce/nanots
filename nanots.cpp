@@ -543,10 +543,11 @@ void nanots_writer::write(write_context& wctx,
   wctx.last_timestamp = timestamp;
 }
 
-void nanots_writer::free_blocks(const std::string& stream_tag,
+void nanots_writer::free_blocks(const std::string& file_name,
+                                const std::string& stream_tag,
                                 int64_t start_timestamp,
                                 int64_t end_timestamp) {
-  auto db_name = _database_name(_file_name);
+  auto db_name = _database_name(file_name);
   nts_sqlite_conn conn(db_name, true, true);
 
   nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
@@ -747,7 +748,7 @@ void nanots_reader::read(
   bool need_binary_search = true;
 
   for (auto& row : results) {
-    std::string metadata = row["metadata"].value();
+    std::string metadata = (row["metadata"])?row["metadata"].value():std::string();
     int64_t block_sequence = std::stoll(row["block_sequence"].value());
     int64_t block_idx = std::stoll(row["block_idx"].value());
     std::string uuid_hex = row["uuid"].value();
@@ -841,38 +842,41 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
   // Contiguous sequences will have the same group_key
 
   auto stmt = db.prepare(
-      "WITH contiguous_groups AS ( "
-      "SELECT "
-      "sb.segment_id, "
-      "sb.sequence, "
-      "sb.start_timestamp, "
-      "sb.end_timestamp, "
-      "ROW_NUMBER() "
-      "OVER (PARTITION BY sb.segment_id ORDER BY sb.sequence) - sb.sequence AS "
-      "group_key "
-      "FROM segment_blocks sb "
-      "JOIN segments s ON sb.segment_id = s.id "
-      "WHERE sb.start_timestamp <= ? "
-      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
-      "AND s.stream_tag = ? "
-      "), "
-      "region_boundaries AS ( "
-      "SELECT "
-      "segment_id, "
-      "group_key, "
-      "MIN(start_timestamp) AS region_start, "
-      "MAX(end_timestamp) AS region_end, "
-      "COUNT(*) AS block_count "
-      "FROM contiguous_groups "
-      "GROUP BY segment_id, group_key "
-      ") "
-      "SELECT "
-      "segment_id, "
-      "region_start, "
-      "region_end, "
-      "block_count "
-      "FROM region_boundaries "
-      "ORDER BY segment_id, region_start;");
+    "WITH contiguous_groups AS ( "
+    "  SELECT "
+    "    sb.segment_id, "
+    "    sb.sequence, "
+    "    sb.start_timestamp, "
+    "    sb.end_timestamp, "
+    "    ROW_NUMBER() OVER (PARTITION BY sb.segment_id ORDER BY sb.sequence) "
+    "      - sb.sequence AS group_key "
+    "  FROM segment_blocks sb "
+    "  JOIN segments s ON sb.segment_id = s.id "
+    "  WHERE sb.start_timestamp <= ? "                    /* bind(1) = window_end    */
+    "    AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) " /* bind(2) = window_start */
+    "    AND s.stream_tag = ? "                           /* bind(3) = stream_tag    */
+    "), "
+    "region_boundaries AS ( "
+    "  SELECT "
+    "    segment_id, "
+    "    group_key, "
+    "    MIN(start_timestamp) AS region_start, "
+    "    CASE "
+    "      WHEN MIN(end_timestamp) = 0 THEN 0 "
+    "      ELSE MAX(end_timestamp) "
+    "    END AS region_end, "
+    "    COUNT(*) AS block_count "
+    "  FROM contiguous_groups "
+    "  GROUP BY segment_id, group_key "
+    ") "
+    "SELECT "
+    "  segment_id, "
+    "  region_start, "
+    "  region_end, "
+    "  block_count "
+    "FROM region_boundaries "
+    "ORDER BY segment_id, region_start;"
+  );
   auto results =
       stmt.bind(1, end_timestamp).bind(2, start_timestamp).bind(3, stream_tag).exec();
 
@@ -1434,16 +1438,16 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
   }
 }
 
-nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
+nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
                                           int64_t end_timestamp) {
-  if (!writer || !writer->writer) {
+  if (!file_name || !stream_tag) {
     return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
-    writer->writer->free_blocks(std::string(stream_tag), start_timestamp, end_timestamp);
+    nanots_writer::free_blocks(std::string(file_name), std::string(stream_tag), start_timestamp, end_timestamp);
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
     return e.get_ec();

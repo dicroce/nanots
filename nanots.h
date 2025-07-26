@@ -127,9 +127,10 @@ class nanots_writer {
              int64_t timestamp,
              uint8_t flags);
 
-  void free_blocks(const std::string& stream_tag,
-                   int64_t start_timestamp,
-                   int64_t end_timestamp);
+  static void free_blocks(const std::string& file_name,
+                          const std::string& stream_tag,
+                          int64_t start_timestamp,
+                          int64_t end_timestamp);
 
   static void allocate(const std::string& file_name,
                        uint32_t block_size,
@@ -313,7 +314,7 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                     int64_t timestamp,
                                     uint8_t flags);
 
-nanots_ec_t nanots_writer_free_blocks(nanots_writer_t writer,
+nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                       const char* stream_tag,
                                       int64_t start_timestamp,
                                       int64_t end_timestamp);

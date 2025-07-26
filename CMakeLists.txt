@@ -4,6 +4,7 @@ project(nanots VERSION 0.0.1)
 set(CMAKE_CXX_STANDARD 17)
 
 include(settings.cmake)
+include(dependencies.cmake)
 
 file(GLOB NANOTS_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/*.h

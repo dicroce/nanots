@@ -3,8 +3,17 @@
 #define UTILS_H
 
 // Export macro for DLL/shared library
-#if defined(_WIN32) && defined(NANOTS_BUILDING_DLL)
-  #define NANOTS_API __declspec(dllexport)
+#if defined(_WIN32)
+  #if defined(NANOTS_BUILDING_DLL)
+    // Building the DLL
+    #define NANOTS_API __declspec(dllexport)
+  #elif defined(NANOTS_USING_DLL)
+    // Using the DLL from another project
+    #define NANOTS_API __declspec(dllimport)
+  #else
+    // Using static library
+    #define NANOTS_API
+  #endif
 #elif defined(__GNUC__)
   #define NANOTS_API __attribute__((visibility("default")))
 #else
@@ -67,7 +76,7 @@ struct sqlite3;
 struct sqlite3_stmt;
 class nts_sqlite_stmt;
 
-class nts_sqlite_conn final {
+class NANOTS_API nts_sqlite_conn final {
  public:
   nts_sqlite_conn(const std::string& fileName,
                   bool rw = true,
@@ -96,7 +105,7 @@ class nts_sqlite_conn final {
   bool _rw;
 };
 
-class nts_sqlite_stmt final {
+class NANOTS_API nts_sqlite_stmt final {
  public:
   nts_sqlite_stmt(sqlite3* db, const std::string& query);
   nts_sqlite_stmt(const nts_sqlite_stmt&) = delete;
@@ -147,7 +156,7 @@ void nts_sqlite_transaction(const nts_sqlite_conn& db, T t) {
 }
 
 // File raii
-class nts_file final {
+class NANOTS_API nts_file final {
  public:
   nts_file() : _f(nullptr) {}
   nts_file(const nts_file&) = delete;
@@ -233,7 +242,7 @@ uint8_t* lower_bound_bytes(uint8_t* start,
 #define FULL_MEM_BARRIER __sync_synchronize
 #endif
 
-class nts_memory_map {
+class NANOTS_API nts_memory_map {
  public:
   enum Flags {
     NMM_TYPE_FILE = 0x01,

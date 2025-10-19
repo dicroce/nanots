@@ -25,7 +25,7 @@ enum nanots_ec_t {
 
 }
 
-class nanots_exception : public std::exception {
+class NANOTS_API nanots_exception : public std::exception {
 public:
   nanots_exception(nanots_ec_t ec, const std::string& message, const std::string& file, int line) : _ec(ec), _message(message), _file(file), _line(line) {}
   nanots_exception(const nanots_exception& other) = default;
@@ -90,7 +90,7 @@ struct segment_block {
   uint8_t uuid[16];
 };
 
-struct write_context final {
+struct NANOTS_API write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;
   write_context& operator=(const write_context&) = delete;
@@ -109,7 +109,7 @@ struct write_context final {
   std::string file_name;
 };
 
-class nanots_writer {
+class NANOTS_API nanots_writer {
  public:
   nanots_writer(const std::string& file_name, bool auto_reclaim = false);
   nanots_writer(const nanots_writer&) = delete;
@@ -154,7 +154,7 @@ struct contiguous_segment {
   int64_t end_timestamp{0};
 };
 
-class nanots_reader {
+class NANOTS_API nanots_reader {
  public:
   nanots_reader(const std::string& file_name);
   nanots_reader(const nanots_reader&) = delete;
@@ -209,7 +209,7 @@ struct block_info {
   bool is_loaded{false};
 };
 
-class nanots_iterator {
+class NANOTS_API nanots_iterator {
  public:
   nanots_iterator(const std::string& file_name, const std::string& stream_tag);
   nanots_iterator(const nanots_iterator&) = delete;

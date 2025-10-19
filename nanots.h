@@ -294,44 +294,44 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        const char* metadata,
                                        void* user_data);
 
-nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
+NANOTS_API nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
 
 // writer
-nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
+NANOTS_API nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
 
-void nanots_writer_destroy(nanots_writer_t writer);
+NANOTS_API void nanots_writer_destroy(nanots_writer_t writer);
 
-nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
+NANOTS_API nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
                                                     const char* stream_tag,
                                                     const char* metadata);
 
-void nanots_write_context_destroy(nanots_write_context_t context);
+NANOTS_API void nanots_write_context_destroy(nanots_write_context_t context);
 
-nanots_ec_t nanots_writer_write(nanots_writer_t writer,
+NANOTS_API nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
                                     int64_t timestamp,
                                     uint8_t flags);
 
-nanots_ec_t nanots_writer_free_blocks(const char* file_name,
+NANOTS_API nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                       const char* stream_tag,
                                       int64_t start_timestamp,
                                       int64_t end_timestamp);
 
 // reader
-nanots_reader_t nanots_reader_create(const char* file_name);
+NANOTS_API nanots_reader_t nanots_reader_create(const char* file_name);
 
-void nanots_reader_destroy(nanots_reader_t reader);
+NANOTS_API void nanots_reader_destroy(nanots_reader_t reader);
 
-nanots_ec_t nanots_reader_read(nanots_reader_t reader,
+NANOTS_API nanots_ec_t nanots_reader_read(nanots_reader_t reader,
                                const char* stream_tag,
                                int64_t start_timestamp,
                                int64_t end_timestamp,
                                nanots_read_callback_t callback,
                                void* user_data);
 
-nanots_ec_t nanots_reader_query_contiguous_segments(
+NANOTS_API nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
@@ -339,37 +339,37 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_contiguous_segment_t** segments,
     size_t* count);
 
-void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
+NANOTS_API void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
 
-nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
+NANOTS_API nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
                                                   int64_t start_timestamp,
                                                   int64_t end_timestamp);
 
-const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);
+NANOTS_API const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);
 
 // iterator
-nanots_iterator_t nanots_iterator_create(const char* file_name,
+NANOTS_API nanots_iterator_t nanots_iterator_create(const char* file_name,
                                          const char* stream_tag);
-void nanots_iterator_destroy(nanots_iterator_t iterator);
+NANOTS_API void nanots_iterator_destroy(nanots_iterator_t iterator);
 
-int nanots_iterator_valid(nanots_iterator_t iterator);
+NANOTS_API int nanots_iterator_valid(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_get_current_frame(
+NANOTS_API nanots_ec_t nanots_iterator_get_current_frame(
     nanots_iterator_t iterator,
     nanots_frame_info_t* frame_info);
 
-nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
+NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
 
-nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 
-int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
+NANOTS_API int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 
-const char* nanots_iterator_current_metadata(nanots_iterator_t iterator);
+NANOTS_API const char* nanots_iterator_current_metadata(nanots_iterator_t iterator);
 
 #ifdef __cplusplus
 }

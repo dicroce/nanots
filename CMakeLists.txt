@@ -46,8 +46,10 @@ set_target_properties(nanots_static PROPERTIES
 
 set_target_properties(nanots PROPERTIES
     OUTPUT_NAME "nanots"
-    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
+
+# Define NANOTS_BUILDING_DLL when building the shared library
+target_compile_definitions(nanots PRIVATE NANOTS_BUILDING_DLL)
 
 # Link platform dependencies to both libraries
 target_link_libraries(nanots_static PUBLIC platform::platform)

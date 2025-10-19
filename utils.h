@@ -2,6 +2,15 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+// Export macro for DLL/shared library
+#if defined(_WIN32) && defined(NANOTS_BUILDING_DLL)
+  #define NANOTS_API __declspec(dllexport)
+#elif defined(__GNUC__)
+  #define NANOTS_API __attribute__((visibility("default")))
+#else
+  #define NANOTS_API
+#endif
+
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>

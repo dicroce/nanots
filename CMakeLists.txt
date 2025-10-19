@@ -46,6 +46,7 @@ set_target_properties(nanots_static PROPERTIES
 
 set_target_properties(nanots PROPERTIES
     OUTPUT_NAME "nanots"
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 # Link platform dependencies to both libraries

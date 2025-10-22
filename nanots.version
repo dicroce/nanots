@@ -1,0 +1,21 @@
+{
+  global:
+    # Export all nanots C API functions
+    nanots_*;
+
+    # Export C++ mangled names for nanots classes
+    # This will include constructors, destructors, and methods
+    *nanots_writer*;
+    *nanots_reader*;
+    *nanots_iterator*;
+    *nanots_exception*;
+    *nts_sqlite_conn*;
+    *nts_sqlite_stmt*;
+    *nts_file*;
+    *nts_memory_map*;
+    *write_context*;
+
+  local:
+    # Hide everything else (including all SQLite symbols)
+    *;
+};

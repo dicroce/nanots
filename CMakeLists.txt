@@ -51,6 +51,23 @@ set_target_properties(nanots PROPERTIES
 # Define NANOTS_BUILDING_DLL when building the shared library
 target_compile_definitions(nanots PRIVATE NANOTS_BUILDING_DLL)
 
+# Make SQLite symbols internal/private on all platforms
+# This ensures SQLITE_API doesn't try to export symbols
+target_compile_definitions(nanots_static PRIVATE SQLITE_API=)
+target_compile_definitions(nanots PRIVATE SQLITE_API=)
+
+# Hide symbols by default on Linux/Unix and make SQLite symbols private
+if(UNIX)
+    # Set default visibility to hidden for both libraries
+    target_compile_options(nanots_static PRIVATE -fvisibility=hidden)
+    target_compile_options(nanots PRIVATE -fvisibility=hidden)
+
+    # Use linker version script for shared library to control exported symbols
+    set_target_properties(nanots PROPERTIES
+        LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nanots.version"
+    )
+endif()
+
 # Link platform dependencies to both libraries
 target_link_libraries(nanots_static PUBLIC platform::platform)
 target_link_libraries(nanots PUBLIC platform::platform)

@@ -14,7 +14,9 @@
     // Using static library
     #define NANOTS_API
   #endif
-#elif defined(__GNUC__)
+#elif defined(__GNUC__) || defined(__clang__)
+  // On GCC/Clang, explicitly mark nanots symbols as visible
+  // (SQLite symbols will remain hidden due to -fvisibility=hidden)
   #define NANOTS_API __attribute__((visibility("default")))
 #else
   #define NANOTS_API

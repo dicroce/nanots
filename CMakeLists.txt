@@ -62,10 +62,18 @@ if(UNIX)
     target_compile_options(nanots_static PRIVATE -fvisibility=hidden)
     target_compile_options(nanots PRIVATE -fvisibility=hidden)
 
-    # Use linker version script for shared library to control exported symbols
-    set_target_properties(nanots PROPERTIES
-        LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nanots.version"
-    )
+    # Platform-specific linker scripts to control exported symbols
+    if(APPLE)
+        # macOS uses -exported_symbols_list
+        set_target_properties(nanots PROPERTIES
+            LINK_FLAGS "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/nanots.exports"
+        )
+    else()
+        # Linux uses --version-script
+        set_target_properties(nanots PROPERTIES
+            LINK_FLAGS "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nanots.version"
+        )
+    endif()
 endif()
 
 # Link platform dependencies to both libraries

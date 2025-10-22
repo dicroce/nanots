@@ -1,0 +1,19 @@
+# macOS exported symbols list
+# Only symbols listed here will be exported from the shared library
+
+# Export all nanots C API functions (C name mangling)
+_nanots_*
+
+# Export C++ mangled names for nanots classes
+# Note: C++ symbols are mangled, so we need wildcards
+*nanots_writer*
+*nanots_reader*
+*nanots_iterator*
+*nanots_exception*
+*write_context*
+
+# Export utility classes if needed
+*nts_sqlite_conn*
+*nts_sqlite_stmt*
+*nts_file*
+*nts_memory_map*

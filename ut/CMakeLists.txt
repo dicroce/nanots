@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.14)
 project(nanots_ut VERSION 0.0.1)
 
 add_executable(

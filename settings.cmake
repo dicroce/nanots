@@ -11,22 +11,6 @@ if(NOT CMAKE_BUILD_TYPE)
     set (CMAKE_BUILD_TYPE Debug)
 endif()
 
-# Remove runtime-check flag from all configs to avoid /O2 vs /RTC1 conflicts
-string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
-string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
-string(REPLACE "/RTC1" "" CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO}")
-string(REPLACE "/RTC1" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
-
-if(WIN32)
-    # Remove the default /D _DEBUG flag that CMake injects
-    string(REPLACE "/D _DEBUG" "" CMAKE_C_FLAGS_DEBUG   "${CMAKE_C_FLAGS_DEBUG}")
-    string(REPLACE "/D _DEBUG" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
-
-    add_compile_definitions(
-        $<$<CONFIG:Debug>:NDEBUG>
-    )
-endif()
-
 # Apply build flags per platform and configuration
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)

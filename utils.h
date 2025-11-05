@@ -143,8 +143,12 @@ class NANOTS_API nts_sqlite_stmt final {
 };
 
 template <typename T>
-void nts_sqlite_transaction(const nts_sqlite_conn& db, T t) {
-  db.exec("BEGIN");
+void nts_sqlite_transaction(const nts_sqlite_conn& db, bool immediate, T t) {
+  if (immediate) {
+    db.exec("BEGIN IMMEDIATE");
+  } else {
+    db.exec("BEGIN");
+  }
   try {
     t(db);
     db.exec("COMMIT");

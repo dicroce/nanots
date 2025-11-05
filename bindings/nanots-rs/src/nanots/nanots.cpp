@@ -1009,7 +1009,7 @@ static void _validate_blocks(const std::string& file_name) {
     }
 
     if (last_valid >= 0) {
-      nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
         uint8_t* last_index_p =
             block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
         int64_t actual_last_timestamp = *(int64_t*)last_index_p;
@@ -1052,7 +1052,7 @@ static void _upgrade_db(const nts_sqlite_conn& conn) {
   switch (current_version) {
     case 0: {
       nts_sqlite_transaction(
-          conn, [&](const nts_sqlite_conn& conn) { _set_db_version(conn, 1); });
+          conn, true, [&](const nts_sqlite_conn& conn) { _set_db_version(conn, 1); });
     }
       [[fallthrough]];
     default:
@@ -1225,7 +1225,7 @@ write_context::~write_context() {
     auto db_name = _database_name(file_name);
     nts_sqlite_conn conn(db_name, true, true);
 
-    nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
       _db_finalize_block(conn, current_block->id, last_timestamp.value());
       // This is a maintenance task that needs to be done periodically.
       _db_trans_finalize_reserved_blocks(conn);
@@ -1276,7 +1276,7 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
   if(_active_stream_tags.find(stream_tag) != _active_stream_tags.end())
     throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Stream tag already exists.", __FILE__, __LINE__);
 
-  nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
     wctx.current_segment = _db_create_segment(conn, stream_tag, metadata);
     if (!wctx.current_segment)
       throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
@@ -1302,7 +1302,7 @@ void nanots_writer::write(write_context& wctx,
   if (!wctx.current_block) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
-    nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
       auto block = _db_get_block(conn, _auto_reclaim);
       if (!block)
         throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
@@ -1356,7 +1356,7 @@ void nanots_writer::write(write_context& wctx,
 
     wctx.mm.flush(wctx.mm.map(), _block_size, true);
 
-    nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
       _db_finalize_block(conn, wctx.current_block->id, wctx.last_timestamp.value());
     });
 
@@ -1394,7 +1394,7 @@ void nanots_writer::free_blocks(const std::string& stream_tag,
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn conn(db_name, true, true);
 
-  nts_sqlite_transaction(conn, [&](const nts_sqlite_conn& conn) {
+  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
     // Find blocks that fall entirely within the deletion time range
     auto stmt = conn.prepare(
         "SELECT sb.id as segment_block_id, sb.block_id "
@@ -1524,7 +1524,7 @@ void nanots_writer::allocate(const std::string& file_name,
   query = "CREATE INDEX idx_blocks_status ON blocks(status);";
   db.exec(query);
 
-  nts_sqlite_transaction(db, [n_blocks](const nts_sqlite_conn& conn) {
+  nts_sqlite_transaction(db, true, [n_blocks](const nts_sqlite_conn& conn) {
     auto stmt =
         conn.prepare("INSERT INTO blocks (idx, status) VALUES (?, 'free')");
     for (uint32_t i = 0; i < n_blocks; i++) {

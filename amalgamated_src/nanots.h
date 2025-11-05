@@ -10,6 +10,26 @@
 #ifndef UTILS_H
 #define UTILS_H
 
+// Export macro for DLL/shared library
+#if defined(_WIN32)
+  #if defined(NANOTS_BUILDING_DLL)
+    // Building the DLL
+    #define NANOTS_API __declspec(dllexport)
+  #elif defined(NANOTS_USING_DLL)
+    // Using the DLL from another project
+    #define NANOTS_API __declspec(dllimport)
+  #else
+    // Using static library
+    #define NANOTS_API
+  #endif
+#elif defined(__GNUC__) || defined(__clang__)
+  // On GCC/Clang, explicitly mark nanots symbols as visible
+  // (SQLite symbols will remain hidden due to -fvisibility=hidden)
+  #define NANOTS_API __attribute__((visibility("default")))
+#else
+  #define NANOTS_API
+#endif
+
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -66,7 +86,7 @@ struct sqlite3;
 struct sqlite3_stmt;
 class nts_sqlite_stmt;
 
-class nts_sqlite_conn final {
+class NANOTS_API nts_sqlite_conn final {
  public:
   nts_sqlite_conn(const std::string& fileName,
                   bool rw = true,
@@ -95,7 +115,7 @@ class nts_sqlite_conn final {
   bool _rw;
 };
 
-class nts_sqlite_stmt final {
+class NANOTS_API nts_sqlite_stmt final {
  public:
   nts_sqlite_stmt(sqlite3* db, const std::string& query);
   nts_sqlite_stmt(const nts_sqlite_stmt&) = delete;
@@ -131,8 +151,12 @@ class nts_sqlite_stmt final {
 };
 
 template <typename T>
-void nts_sqlite_transaction(const nts_sqlite_conn& db, T t) {
-  db.exec("BEGIN");
+void nts_sqlite_transaction(const nts_sqlite_conn& db, bool immediate, T t) {
+  if (immediate) {
+    db.exec("BEGIN IMMEDIATE");
+  } else {
+    db.exec("BEGIN");
+  }
   try {
     t(db);
     db.exec("COMMIT");
@@ -146,7 +170,7 @@ void nts_sqlite_transaction(const nts_sqlite_conn& db, T t) {
 }
 
 // File raii
-class nts_file final {
+class NANOTS_API nts_file final {
  public:
   nts_file() : _f(nullptr) {}
   nts_file(const nts_file&) = delete;
@@ -232,7 +256,7 @@ uint8_t* lower_bound_bytes(uint8_t* start,
 #define FULL_MEM_BARRIER __sync_synchronize
 #endif
 
-class nts_memory_map {
+class NANOTS_API nts_memory_map {
  public:
   enum Flags {
     NMM_TYPE_FILE = 0x01,
@@ -370,7 +394,7 @@ enum nanots_ec_t {
 
 }
 
-class nanots_exception : public std::exception {
+class NANOTS_API nanots_exception : public std::exception {
 public:
   nanots_exception(nanots_ec_t ec, const std::string& message, const std::string& file, int line) : _ec(ec), _message(message), _file(file), _line(line) {}
   nanots_exception(const nanots_exception& other) = default;
@@ -435,7 +459,7 @@ struct segment_block {
   uint8_t uuid[16];
 };
 
-struct write_context final {
+struct NANOTS_API write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;
   write_context& operator=(const write_context&) = delete;
@@ -454,7 +478,7 @@ struct write_context final {
   std::string file_name;
 };
 
-class nanots_writer {
+class NANOTS_API nanots_writer {
  public:
   nanots_writer(const std::string& file_name, bool auto_reclaim = false);
   nanots_writer(const nanots_writer&) = delete;
@@ -499,7 +523,7 @@ struct contiguous_segment {
   int64_t end_timestamp{0};
 };
 
-class nanots_reader {
+class NANOTS_API nanots_reader {
  public:
   nanots_reader(const std::string& file_name);
   nanots_reader(const nanots_reader&) = delete;
@@ -554,7 +578,7 @@ struct block_info {
   bool is_loaded{false};
 };
 
-class nanots_iterator {
+class NANOTS_API nanots_iterator {
  public:
   nanots_iterator(const std::string& file_name, const std::string& stream_tag);
   nanots_iterator(const nanots_iterator&) = delete;
@@ -639,44 +663,44 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        const char* metadata,
                                        void* user_data);
 
-nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
+NANOTS_API nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
 
 // writer
-nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
+NANOTS_API nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);
 
-void nanots_writer_destroy(nanots_writer_t writer);
+NANOTS_API void nanots_writer_destroy(nanots_writer_t writer);
 
-nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
+NANOTS_API nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
                                                     const char* stream_tag,
                                                     const char* metadata);
 
-void nanots_write_context_destroy(nanots_write_context_t context);
+NANOTS_API void nanots_write_context_destroy(nanots_write_context_t context);
 
-nanots_ec_t nanots_writer_write(nanots_writer_t writer,
+NANOTS_API nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
                                     int64_t timestamp,
                                     uint8_t flags);
 
-nanots_ec_t nanots_writer_free_blocks(const char* file_name,
+NANOTS_API nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                       const char* stream_tag,
                                       int64_t start_timestamp,
                                       int64_t end_timestamp);
 
 // reader
-nanots_reader_t nanots_reader_create(const char* file_name);
+NANOTS_API nanots_reader_t nanots_reader_create(const char* file_name);
 
-void nanots_reader_destroy(nanots_reader_t reader);
+NANOTS_API void nanots_reader_destroy(nanots_reader_t reader);
 
-nanots_ec_t nanots_reader_read(nanots_reader_t reader,
+NANOTS_API nanots_ec_t nanots_reader_read(nanots_reader_t reader,
                                const char* stream_tag,
                                int64_t start_timestamp,
                                int64_t end_timestamp,
                                nanots_read_callback_t callback,
                                void* user_data);
 
-nanots_ec_t nanots_reader_query_contiguous_segments(
+NANOTS_API nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
@@ -684,37 +708,37 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_contiguous_segment_t** segments,
     size_t* count);
 
-void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
+NANOTS_API void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments);
 
-nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
+NANOTS_API nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
                                                   int64_t start_timestamp,
                                                   int64_t end_timestamp);
 
-const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);
+NANOTS_API const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);
 
 // iterator
-nanots_iterator_t nanots_iterator_create(const char* file_name,
+NANOTS_API nanots_iterator_t nanots_iterator_create(const char* file_name,
                                          const char* stream_tag);
-void nanots_iterator_destroy(nanots_iterator_t iterator);
+NANOTS_API void nanots_iterator_destroy(nanots_iterator_t iterator);
 
-int nanots_iterator_valid(nanots_iterator_t iterator);
+NANOTS_API int nanots_iterator_valid(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_get_current_frame(
+NANOTS_API nanots_ec_t nanots_iterator_get_current_frame(
     nanots_iterator_t iterator,
     nanots_frame_info_t* frame_info);
 
-nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
 
-nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
+NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
 
-nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
+NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 
-int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
+NANOTS_API int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 
-const char* nanots_iterator_current_metadata(nanots_iterator_t iterator);
+NANOTS_API const char* nanots_iterator_current_metadata(nanots_iterator_t iterator);
 
 #ifdef __cplusplus
 }

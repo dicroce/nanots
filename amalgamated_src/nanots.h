@@ -476,6 +476,7 @@ struct NANOTS_API write_context final {
   nts_file file;
   nts_memory_map mm;
   std::string file_name;
+  uint32_t _block_size{0};
 };
 
 class NANOTS_API nanots_writer {

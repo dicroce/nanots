@@ -161,6 +161,10 @@ static void _validate_blocks(const std::string& file_name) {
         rowsToProcess.clear();
         continue;
       } else {
+        // Truncating corrupt block
+        *(uint32_t*)(block_p + 8) = last_valid + 1;
+        mm.flush(mm.map(), block_size, true);
+
         nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
           uint8_t* last_index_p =
               block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
@@ -173,10 +177,6 @@ static void _validate_blocks(const std::string& file_name) {
               .bind(3, uuid_hex)
               .exec_no_result();
         });
-
-        // Truncating corrupt block
-        *(uint32_t*)(block_p + 8) = last_valid + 1;
-        mm.flush(mm.map(), block_size, true);
       }
     }
   }
@@ -373,6 +373,8 @@ write_context::~write_context() {
   current_stream_tags.erase(key);
 
   if (last_timestamp && current_block) {
+    mm.flush(mm.map(), _block_size, true);
+
     auto db_name = _database_name(file_name);
     nts_sqlite_conn conn(db_name, true, true);
 
@@ -420,6 +422,7 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
   wctx.metadata = metadata;
   wctx.stream_tag = stream_tag;
   wctx.file_name = _file_name;
+  wctx._block_size = _block_size;
 
   auto db_name = _database_name(_file_name);
 

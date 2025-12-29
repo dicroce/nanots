@@ -262,6 +262,10 @@ class NANOTS_API nanots_iterator {
   frame_info _current_frame;
   bool _valid;
   bool _initialized;
+
+  // Lazily-initialized database connection for read operations
+  std::optional<nts_sqlite_conn> _db_conn;
+  nts_sqlite_conn& _ensure_db_connection();
 };
 
 #ifdef __cplusplus

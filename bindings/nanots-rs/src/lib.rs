@@ -1,38 +1,38 @@
 //! # nanots-rs
-//! 
+//!
 //! Rust bindings for the nanots time series database.
-//! 
+//!
 //! This crate provides safe, idiomatic Rust wrappers around the nanots C++ library.
-//! 
+//!
 //! ## Example
-//! 
+//!
 //! ```no_run
 //! use nanots_rs::{Writer, Reader};
-//! 
+//!
 //! # fn main() -> nanots_rs::Result<()> {
 //! // Allocate a new database file
 //! Writer::allocate_file("data.nts", 1024 * 1024, 100)?;
-//! 
+//!
 //! // Write some data
 //! let writer = Writer::new("data.nts", false)?;
 //! let context = writer.create_context("sensor_data", "temperature readings")?;
 //! writer.write(&context, b"hello world", 1234567890, 0)?;
-//! 
+//!
 //! // Read it back
 //! let reader = Reader::new("data.nts")?;
-//! reader.read("sensor_data", 0, i64::MAX, |data, flags, timestamp, block_seq| {
-//!     println!("Read {} bytes at timestamp {}", data.len(), timestamp);
+//! reader.read("sensor_data", 0, i64::MAX, |data, flags, timestamp, block_seq, metadata| {
+//!     println!("Read {} bytes at timestamp {}, metadata: {}", data.len(), timestamp, metadata);
 //! })?;
 //! # Ok(())
 //! # }
 //! ```
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
 
-// Error codes matching the C enum
+/// Error codes matching the C enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum ErrorCode {
@@ -49,6 +49,7 @@ pub enum ErrorCode {
     UnableToAllocateFile = 10,
     InvalidArgument = 11,
     Unknown = 12,
+    NotFound = 13,
 }
 
 impl ErrorCode {
@@ -66,6 +67,7 @@ impl ErrorCode {
             9 => ErrorCode::RowSizeTooBig,
             10 => ErrorCode::UnableToAllocateFile,
             11 => ErrorCode::InvalidArgument,
+            13 => ErrorCode::NotFound,
             _ => ErrorCode::Unknown,
         }
     }
@@ -87,6 +89,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::UnableToAllocateFile => "Unable to allocate file",
             ErrorCode::InvalidArgument => "Invalid argument",
             ErrorCode::Unknown => "Unknown error",
+            ErrorCode::NotFound => "Not found",
         };
         write!(f, "{}", msg)
     }
@@ -97,9 +100,9 @@ impl std::error::Error for ErrorCode {}
 /// Result type for nanots operations
 pub type Result<T> = std::result::Result<T, ErrorCode>;
 
-// C struct representations
+/// Contiguous segment information
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ContiguousSegment {
     pub segment_id: i64,
     pub start_timestamp: i64,
@@ -126,13 +129,14 @@ type WriteContextPtr = *mut WriteContextHandle;
 type ReaderPtr = *mut ReaderHandle;
 type IteratorPtr = *mut IteratorHandle;
 
-// C callback type
+// C callback type - includes metadata parameter
 type ReadCallback = extern "C" fn(
     data: *const u8,
     size: usize,
     flags: u8,
     timestamp: i64,
     block_sequence: i64,
+    metadata: *const c_char,
     user_data: *mut c_void,
 );
 
@@ -143,7 +147,7 @@ extern "C" {
         block_size: u32,
         n_blocks: u32,
     ) -> u32;
-    
+
     fn nanots_writer_create(file_name: *const c_char, auto_reclaim: c_int) -> WriterPtr;
     fn nanots_writer_destroy(writer: WriterPtr);
     fn nanots_writer_create_context(
@@ -160,13 +164,15 @@ extern "C" {
         timestamp: i64,
         flags: u8,
     ) -> u32;
+
+    // Note: free_blocks takes file_name, not writer
     fn nanots_writer_free_blocks(
-        writer: WriterPtr,
+        file_name: *const c_char,
         stream_tag: *const c_char,
         start_timestamp: i64,
         end_timestamp: i64,
     ) -> u32;
-    
+
     fn nanots_reader_create(file_name: *const c_char) -> ReaderPtr;
     fn nanots_reader_destroy(reader: ReaderPtr);
     fn nanots_reader_read(
@@ -186,28 +192,36 @@ extern "C" {
         count: *mut usize,
     ) -> u32;
     fn nanots_free_contiguous_segments(segments: *mut ContiguousSegment);
-    
-    fn nanots_iterator_create(file_name: *const c_char, stream_tag: *const c_char) -> IteratorPtr;
-    fn nanots_iterator_destroy(iterator: IteratorPtr);
-    fn nanots_iterator_valid(iterator: IteratorPtr) -> c_int;
-    fn nanots_iterator_get_current_frame(iterator: IteratorPtr, frame_info: *mut FrameInfo) -> u32;
-    fn nanots_iterator_next(iterator: IteratorPtr) -> u32;
-    fn nanots_iterator_prev(iterator: IteratorPtr) -> u32;
-    fn nanots_iterator_find(iterator: IteratorPtr, timestamp: i64) -> u32;
-    fn nanots_iterator_reset(iterator: IteratorPtr) -> u32;
-    fn nanots_iterator_current_block_sequence(iterator: IteratorPtr) -> i64;
-    
+
     fn nanots_reader_query_stream_tags_start(
         reader: ReaderPtr,
         start_timestamp: i64,
         end_timestamp: i64,
     ) -> u32;
     fn nanots_reader_query_stream_tags_next(reader: ReaderPtr) -> *const c_char;
+
+    fn nanots_iterator_create(
+        file_name: *const c_char,
+        stream_tag: *const c_char,
+    ) -> IteratorPtr;
+    fn nanots_iterator_destroy(iterator: IteratorPtr);
+    fn nanots_iterator_valid(iterator: IteratorPtr) -> c_int;
+    fn nanots_iterator_get_current_frame(
+        iterator: IteratorPtr,
+        frame_info: *mut FrameInfo,
+    ) -> u32;
+    fn nanots_iterator_next(iterator: IteratorPtr) -> u32;
+    fn nanots_iterator_prev(iterator: IteratorPtr) -> u32;
+    fn nanots_iterator_find(iterator: IteratorPtr, timestamp: i64) -> u32;
+    fn nanots_iterator_reset(iterator: IteratorPtr) -> u32;
+    fn nanots_iterator_current_block_sequence(iterator: IteratorPtr) -> i64;
+    fn nanots_iterator_current_metadata(iterator: IteratorPtr) -> *const c_char;
 }
 
 /// Writer for nanots database
 pub struct Writer {
     ptr: WriterPtr,
+    file_name: CString,
 }
 
 impl Writer {
@@ -218,7 +232,10 @@ impl Writer {
         if ptr.is_null() {
             Err(ErrorCode::CantOpen)
         } else {
-            Ok(Writer { ptr })
+            Ok(Writer {
+                ptr,
+                file_name: c_file_name,
+            })
         }
     }
 
@@ -237,9 +254,22 @@ impl Writer {
     }
 
     /// Write data to the database
-    pub fn write(&self, context: &WriteContext, data: &[u8], timestamp: i64, flags: u8) -> Result<()> {
+    pub fn write(
+        &self,
+        context: &WriteContext,
+        data: &[u8],
+        timestamp: i64,
+        flags: u8,
+    ) -> Result<()> {
         let result = unsafe {
-            nanots_writer_write(self.ptr, context.ptr, data.as_ptr(), data.len(), timestamp, flags)
+            nanots_writer_write(
+                self.ptr,
+                context.ptr,
+                data.as_ptr(),
+                data.len(),
+                timestamp,
+                flags,
+            )
         };
         let error_code = ErrorCode::from_c(result);
         if error_code == ErrorCode::Ok {
@@ -250,10 +280,20 @@ impl Writer {
     }
 
     /// Free blocks in a time range for a stream
-    pub fn free_blocks(&self, stream_tag: &str, start_timestamp: i64, end_timestamp: i64) -> Result<()> {
+    pub fn free_blocks(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        end_timestamp: i64,
+    ) -> Result<()> {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
         let result = unsafe {
-            nanots_writer_free_blocks(self.ptr, c_stream_tag.as_ptr(), start_timestamp, end_timestamp)
+            nanots_writer_free_blocks(
+                self.file_name.as_ptr(),
+                c_stream_tag.as_ptr(),
+                start_timestamp,
+                end_timestamp,
+            )
         };
         let error_code = ErrorCode::from_c(result);
         if error_code == ErrorCode::Ok {
@@ -266,7 +306,8 @@ impl Writer {
     /// Allocate a new database file
     pub fn allocate_file(file_name: &str, block_size: u32, n_blocks: u32) -> Result<()> {
         let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
-        let result = unsafe { nanots_writer_allocate_file(c_file_name.as_ptr(), block_size, n_blocks) };
+        let result =
+            unsafe { nanots_writer_allocate_file(c_file_name.as_ptr(), block_size, n_blocks) };
         let error_code = ErrorCode::from_c(result);
         if error_code == ErrorCode::Ok {
             Ok(())
@@ -296,6 +337,31 @@ impl Drop for WriteContext {
     }
 }
 
+/// Free blocks in a time range for a stream (standalone function)
+pub fn free_blocks(
+    file_name: &str,
+    stream_tag: &str,
+    start_timestamp: i64,
+    end_timestamp: i64,
+) -> Result<()> {
+    let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
+    let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
+    let result = unsafe {
+        nanots_writer_free_blocks(
+            c_file_name.as_ptr(),
+            c_stream_tag.as_ptr(),
+            start_timestamp,
+            end_timestamp,
+        )
+    };
+    let error_code = ErrorCode::from_c(result);
+    if error_code == ErrorCode::Ok {
+        Ok(())
+    } else {
+        Err(error_code)
+    }
+}
+
 /// Reader for nanots database
 pub struct Reader {
     ptr: ReaderPtr,
@@ -314,32 +380,54 @@ impl Reader {
     }
 
     /// Read data from a stream in a time range
-    pub fn read<F>(&self, stream_tag: &str, start_timestamp: i64, end_timestamp: i64, mut callback: F) -> Result<()>
+    ///
+    /// The callback receives: data slice, flags, timestamp, block_sequence, and metadata
+    pub fn read<F>(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        end_timestamp: i64,
+        mut callback: F,
+    ) -> Result<()>
     where
-        F: FnMut(&[u8], u8, i64, i64),
+        F: FnMut(&[u8], u8, i64, i64, &str),
     {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
-        
+
         extern "C" fn c_callback(
             data: *const u8,
             size: usize,
             flags: u8,
             timestamp: i64,
             block_sequence: i64,
+            metadata: *const c_char,
             user_data: *mut c_void,
         ) {
-            let callback = unsafe { &mut *(user_data as *mut &mut dyn FnMut(&[u8], u8, i64, i64)) };
+            let callback =
+                unsafe { &mut *(user_data as *mut &mut dyn FnMut(&[u8], u8, i64, i64, &str)) };
             let data_slice = unsafe { slice::from_raw_parts(data, size) };
-            callback(data_slice, flags, timestamp, block_sequence);
+            let metadata_str = if metadata.is_null() {
+                ""
+            } else {
+                unsafe { CStr::from_ptr(metadata) }.to_str().unwrap_or("")
+            };
+            callback(data_slice, flags, timestamp, block_sequence, metadata_str);
         }
 
-        let mut callback_ref: &mut dyn FnMut(&[u8], u8, i64, i64) = &mut callback;
+        let mut callback_ref: &mut dyn FnMut(&[u8], u8, i64, i64, &str) = &mut callback;
         let user_data = &mut callback_ref as *mut _ as *mut c_void;
 
         let result = unsafe {
-            nanots_reader_read(self.ptr, c_stream_tag.as_ptr(), start_timestamp, end_timestamp, c_callback, user_data)
+            nanots_reader_read(
+                self.ptr,
+                c_stream_tag.as_ptr(),
+                start_timestamp,
+                end_timestamp,
+                c_callback,
+                user_data,
+            )
         };
-        
+
         let error_code = ErrorCode::from_c(result);
         if error_code == ErrorCode::Ok {
             Ok(())
@@ -349,14 +437,24 @@ impl Reader {
     }
 
     /// Query contiguous segments in a time range
-    pub fn query_contiguous_segments(&self, stream_tag: &str, start_timestamp: i64, end_timestamp: i64) -> Result<Vec<ContiguousSegment>> {
+    pub fn query_contiguous_segments(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        end_timestamp: i64,
+    ) -> Result<Vec<ContiguousSegment>> {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
         let mut segments_ptr: *mut ContiguousSegment = ptr::null_mut();
         let mut count: usize = 0;
 
         let result = unsafe {
             nanots_reader_query_contiguous_segments(
-                self.ptr, c_stream_tag.as_ptr(), start_timestamp, end_timestamp, &mut segments_ptr, &mut count
+                self.ptr,
+                c_stream_tag.as_ptr(),
+                start_timestamp,
+                end_timestamp,
+                &mut segments_ptr,
+                &mut count,
             )
         };
 
@@ -375,11 +473,14 @@ impl Reader {
     }
 
     /// Query stream tags in a time range
-    pub fn query_stream_tags(&self, start_timestamp: i64, end_timestamp: i64) -> Result<Vec<String>> {
-        let result = unsafe {
-            nanots_reader_query_stream_tags_start(self.ptr, start_timestamp, end_timestamp)
-        };
-        
+    pub fn query_stream_tags(
+        &self,
+        start_timestamp: i64,
+        end_timestamp: i64,
+    ) -> Result<Vec<String>> {
+        let result =
+            unsafe { nanots_reader_query_stream_tags_start(self.ptr, start_timestamp, end_timestamp) };
+
         let error_code = ErrorCode::from_c(result);
         if error_code != ErrorCode::Ok {
             return Err(error_code);
@@ -391,14 +492,14 @@ impl Reader {
             if tag_ptr.is_null() {
                 break;
             }
-            
-            let c_str = unsafe { std::ffi::CStr::from_ptr(tag_ptr) };
+
+            let c_str = unsafe { CStr::from_ptr(tag_ptr) };
             match c_str.to_str() {
                 Ok(tag) => tags.push(tag.to_string()),
                 Err(_) => return Err(ErrorCode::InvalidArgument),
             }
         }
-        
+
         Ok(tags)
     }
 }
@@ -422,7 +523,8 @@ impl Iterator {
     pub fn new(file_name: &str, stream_tag: &str) -> Result<Self> {
         let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
-        let ptr = unsafe { nanots_iterator_create(c_file_name.as_ptr(), c_stream_tag.as_ptr()) };
+        let ptr =
+            unsafe { nanots_iterator_create(c_file_name.as_ptr(), c_stream_tag.as_ptr()) };
         if ptr.is_null() {
             Err(ErrorCode::CantOpen)
         } else {
@@ -463,6 +565,19 @@ impl Iterator {
             timestamp: frame_info.timestamp,
             block_sequence: frame_info.block_sequence,
         })
+    }
+
+    /// Get the metadata for the current position
+    pub fn current_metadata(&self) -> Option<String> {
+        let ptr = unsafe { nanots_iterator_current_metadata(self.ptr) };
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { CStr::from_ptr(ptr) }
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        }
     }
 
     /// Move to the next frame
@@ -534,12 +649,14 @@ mod tests {
     fn test_error_code_display() {
         assert_eq!(ErrorCode::Ok.to_string(), "Success");
         assert_eq!(ErrorCode::CantOpen.to_string(), "Cannot open file");
+        assert_eq!(ErrorCode::NotFound.to_string(), "Not found");
     }
 
     #[test]
     fn test_error_code_from_c() {
         assert_eq!(ErrorCode::from_c(0), ErrorCode::Ok);
         assert_eq!(ErrorCode::from_c(1), ErrorCode::CantOpen);
+        assert_eq!(ErrorCode::from_c(13), ErrorCode::NotFound);
         assert_eq!(ErrorCode::from_c(999), ErrorCode::Unknown);
     }
 }

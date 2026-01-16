@@ -23,7 +23,7 @@ fn test_basic_write_read_cycle() {
         let reader = Reader::new(file_path).unwrap();
         let mut records = Vec::new();
         
-        reader.read("test_stream", 0, i64::MAX, |data, flags, timestamp, _block_seq| {
+        reader.read("test_stream", 0, i64::MAX, |data, flags, timestamp, _block_seq, _metadata| {
             records.push((data.to_vec(), flags, timestamp));
         }).unwrap();
         
@@ -185,7 +185,7 @@ fn test_multiple_streams() {
         
         // Read stream1
         let mut stream1_data = Vec::new();
-        reader.read("stream1", 0, i64::MAX, |data, _flags, timestamp, _block| {
+        reader.read("stream1", 0, i64::MAX, |data, _flags, timestamp, _block, _metadata| {
             stream1_data.push((data.to_vec(), timestamp));
         }).unwrap();
         
@@ -197,7 +197,7 @@ fn test_multiple_streams() {
         
         // Read stream2
         let mut stream2_data = Vec::new();
-        reader.read("stream2", 0, i64::MAX, |data, _flags, timestamp, _block| {
+        reader.read("stream2", 0, i64::MAX, |data, _flags, timestamp, _block, _metadata| {
             stream2_data.push((data.to_vec(), timestamp));
         }).unwrap();
         

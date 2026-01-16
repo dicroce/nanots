@@ -29,10 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reader = Reader::new(file_path)?;
         let mut count = 0;
         
-        reader.read("sensor_data", 0, i64::MAX, |data, flags, timestamp, block_seq| {
+        reader.read("sensor_data", 0, i64::MAX, |data, flags, timestamp, block_seq, metadata| {
             let data_str = String::from_utf8_lossy(data);
-            println!("  [{}] {} at timestamp {} (flags: {}, block: {})", 
-                     count, data_str, timestamp, flags, block_seq);
+            println!("  [{}] {} at timestamp {} (flags: {}, block: {}, metadata: {})",
+                     count, data_str, timestamp, flags, block_seq, metadata);
             count += 1;
         })?;
         

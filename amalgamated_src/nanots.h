@@ -49,6 +49,7 @@
 #include <atomic>
 #include <mutex>
 #include <set>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <Rpc.h>

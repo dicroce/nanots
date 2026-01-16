@@ -1831,6 +1831,14 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
   reset();
 }
 
+nts_sqlite_conn& nanots_iterator::_ensure_db_connection() {
+  if (!_db_conn.has_value()) {
+    auto db_name = _database_name(_file_name);
+    _db_conn.emplace(db_name, false, true);
+  }
+  return _db_conn.value();
+}
+
 block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence) {
   std::string cache_key = std::to_string(segment_id) + ":" + std::to_string(sequence);
   auto it = _block_cache.find(cache_key);
@@ -1839,8 +1847,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   }
 
   // Query database for this specific block
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, false, true);
+  auto& db = _ensure_db_connection();
 
   auto stmt = db.prepare(
       "SELECT "
@@ -1876,8 +1883,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
 }
 
 block_info* nanots_iterator::_get_first_block() {
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, false, true);
+  auto& db = _ensure_db_connection();
 
   auto stmt = db.prepare(
       "SELECT sb.segment_id, sb.sequence "
@@ -1898,8 +1904,7 @@ block_info* nanots_iterator::_get_first_block() {
 }
 
 block_info* nanots_iterator::_get_next_block() {
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, false, true);
+  auto& db = _ensure_db_connection();
 
   // First try to find next block within the same segment
   auto stmt = db.prepare(
@@ -1938,8 +1943,7 @@ block_info* nanots_iterator::_get_next_block() {
 }
 
 block_info* nanots_iterator::_get_prev_block() {
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, false, true);
+  auto& db = _ensure_db_connection();
 
   // First try to find previous block within the same segment
   auto stmt = db.prepare(
@@ -1978,8 +1982,7 @@ block_info* nanots_iterator::_get_prev_block() {
 }
 
 block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, false, true);
+  auto& db = _ensure_db_connection();
 
   // First try to find block that contains the timestamp
   auto stmt = db.prepare(

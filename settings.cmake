@@ -22,14 +22,12 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
             -g3
             -ggdb3
             -O0
-            -fsanitize=address
             -fno-omit-frame-pointer
             -fasynchronous-unwind-tables
         )
         add_link_options(
             -g3
             -ggdb3
-            -fsanitize=address
             -fno-omit-frame-pointer
             -fasynchronous-unwind-tables
         )

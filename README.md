@@ -2,7 +2,7 @@
 
 A lightweight, high-performance, embedded (like sqlite) time-series database optimized for real-time streaming applications like video, finance, and IoT sensor data.
 
-** I think what makes NanoTS special in comparison to anything else is how disconnected reads are from writes. You should be able to have as many simultaneous readers as you want. In some ways, its almost more of an in memory datastructure than a storage system. **
+**I think what makes NanoTS special in comparison to anything else is how disconnected reads are from writes. You should be able to have as many simultaneous readers as you want. In some ways, its almost more of an in memory datastructure than a storage system.**
 
 ## Key Features
 

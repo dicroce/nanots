@@ -34,6 +34,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_progressive_block_deletion);
   TEST(test_nanots::test_nanots_iterator_block_transition_flag_search);
   TEST(test_nanots::test_nanots_iterator_performance_benchmark);
+  TEST(test_nanots::test_nanots_iterator_seek_end);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -72,4 +73,5 @@ class test_nanots : public test_fixture {
   void test_nanots_progressive_block_deletion();
   void test_nanots_iterator_block_transition_flag_search();
   void test_nanots_iterator_performance_benchmark();
+  void test_nanots_iterator_seek_end();
 };

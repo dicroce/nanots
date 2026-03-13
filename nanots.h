@@ -228,6 +228,7 @@ class NANOTS_API nanots_iterator {
   nanots_iterator& operator++();  // Move to next frame
   nanots_iterator& operator--();  // Move to previous frame
   bool find(int64_t timestamp);  // Find first frame >= timestamp
+  bool seek_end();               // Go to last frame
   void reset();                   // Go to first frame
 
   // Utility
@@ -237,6 +238,7 @@ class NANOTS_API nanots_iterator {
  private:
   block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
   block_info* _get_first_block();
+  block_info* _get_last_block();
   block_info* _get_next_block();
   block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
@@ -371,6 +373,8 @@ NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
 
 NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
+
+NANOTS_API nanots_ec_t nanots_iterator_seek_end(nanots_iterator_t iterator);
 
 NANOTS_API int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 

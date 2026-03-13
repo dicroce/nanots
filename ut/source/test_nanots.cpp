@@ -1948,3 +1948,85 @@ void test_nanots::test_nanots_iterator_performance_benchmark() {
   // Verify at least most finds were successful
   RTF_ASSERT(successful_finds >= num_iterations * 0.9);  // At least 90% success rate
 }
+
+void test_nanots::test_nanots_iterator_seek_end() {
+  // --- Case 1: single segment, seek_end lands on last written frame ---
+  {
+    nanots_writer db("nanots_test_4mb.nts", false);
+    auto wctx = db.create_write_context("seek_end_stream", "seek_end test");
+    for (int i = 0; i < 10; i++) {
+      std::string data = "frame_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 1000 + i * 100, (uint8_t)i);
+    }
+  }
+
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "seek_end_stream");
+    RTF_ASSERT(iter.seek_end());
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->timestamp == 1900);
+    RTF_ASSERT(iter->flags == 9);
+    std::string expected = "frame_9";
+    RTF_ASSERT(iter->size == expected.size());
+    RTF_ASSERT(memcmp(iter->data, expected.c_str(), iter->size) == 0);
+
+    // Can navigate backwards from the end
+    --iter;
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->timestamp == 1800);
+    RTF_ASSERT(iter->flags == 8);
+
+    // Going forward from last frame becomes invalid
+    iter.seek_end();
+    ++iter;
+    RTF_ASSERT(!iter.valid());
+  }
+
+  // --- Case 2: multiple segments, seek_end lands in the last segment ---
+  {
+    nanots_writer db("nanots_test_16mb.nts", false);
+
+    {
+      auto wctx = db.create_write_context("seek_end_multi", "segment 1");
+      for (int i = 0; i < 5; i++) {
+        std::string data = "seg1_" + std::to_string(i);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 1000 + i * 100, 0x01);
+      }
+    }
+
+    {
+      auto wctx = db.create_write_context("seek_end_multi", "segment 2");
+      for (int i = 0; i < 5; i++) {
+        std::string data = "seg2_" + std::to_string(i);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 2000 + i * 100, 0x02);
+      }
+    }
+
+    {
+      auto wctx = db.create_write_context("seek_end_multi", "segment 3");
+      for (int i = 0; i < 5; i++) {
+        std::string data = "seg3_" + std::to_string(i);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 3000 + i * 100, 0x03);
+      }
+    }
+  }
+
+  {
+    nanots_iterator iter("nanots_test_16mb.nts", "seek_end_multi");
+    RTF_ASSERT(iter.seek_end());
+    RTF_ASSERT(iter.valid());
+    // Last frame is in segment 3
+    RTF_ASSERT(iter->timestamp == 3400);
+    RTF_ASSERT(iter->flags == 0x03);
+    std::string expected = "seg3_4";
+    RTF_ASSERT(iter->size == expected.size());
+    RTF_ASSERT(memcmp(iter->data, expected.c_str(), iter->size) == 0);
+  }
+
+  // --- Case 3: empty stream returns false and invalidates the iterator ---
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "nonexistent_stream");
+    RTF_ASSERT(!iter.seek_end());
+    RTF_ASSERT(!iter.valid());
+  }
+}

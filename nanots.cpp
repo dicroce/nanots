@@ -990,6 +990,27 @@ block_info* nanots_iterator::_get_first_block() {
   return _get_block_by_segment_and_sequence(segment_id, sequence);
 }
 
+block_info* nanots_iterator::_get_last_block() {
+  auto& db = _ensure_db_connection();
+
+  auto stmt = db.prepare(
+      "SELECT sb.segment_id, sb.sequence "
+      "FROM segments s "
+      "JOIN segment_blocks sb ON sb.segment_id = s.id "
+      "WHERE s.stream_tag = ? "
+      "ORDER BY s.id DESC, sb.sequence DESC "
+      "LIMIT 1");
+
+  auto results = stmt.bind(1, _stream_tag).exec();
+
+  if (results.empty())
+    return nullptr;
+
+  int64_t segment_id = std::stoll(results[0]["segment_id"].value());
+  int64_t sequence = std::stoll(results[0]["sequence"].value());
+  return _get_block_by_segment_and_sequence(segment_id, sequence);
+}
+
 block_info* nanots_iterator::_get_next_block() {
   auto& db = _ensure_db_connection();
 
@@ -1317,6 +1338,24 @@ void nanots_iterator::reset() {
   _current_block_sequence = first_block->block_sequence;
   _current_frame_idx = 0;
   _load_current_frame();
+}
+
+bool nanots_iterator::seek_end() {
+  auto* block = _get_last_block();
+  if (!block) {
+    _valid = false;
+    return false;
+  }
+
+  if (!_load_block_data(*block)) {
+    _valid = false;
+    return false;
+  }
+
+  _current_segment_id = block->segment_id;
+  _current_block_sequence = block->block_sequence;
+  _current_frame_idx = block->n_valid_indexes - 1;
+  return _load_current_frame();
 }
 
 const std::string& nanots_iterator::current_metadata() const {
@@ -1745,6 +1784,25 @@ nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator) {
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
     fprintf(stderr,"Exception in nanots_iterator_reset\n");
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
+nanots_ec_t nanots_iterator_seek_end(nanots_iterator_t iterator) {
+  if (!iterator || !iterator->iterator) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+
+  try {
+    iterator->iterator->seek_end();
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (const std::exception& e) {
+    fprintf(stderr,"Exception in nanots_iterator_seek_end: %s\n", e.what());
+    return NANOTS_EC_UNKNOWN;
+  } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_seek_end\n");
     return NANOTS_EC_UNKNOWN;
   }
 }

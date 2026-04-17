@@ -54,6 +54,7 @@
 #ifdef _WIN32
 #include <Rpc.h>
 #include <Windows.h>
+#include <winternl.h>
 #include <io.h>
 
 #define F_OK 0

@@ -737,12 +737,34 @@ void nts_memory_map::flush(void* addr, size_t length, bool now) {
   if (err != 0)
     throw std::runtime_error("Unable to sync memory mapped file.");
 #else
-  if (!FlushViewOfFile((addr) ? addr : _mem, (length > 0) ? length : _length))
+  void*  flush_addr = (addr)   ? addr   : _mem;
+  size_t flush_len  = (length) ? length : _length;
+
+  if (!FlushViewOfFile(flush_addr, flush_len))
     throw std::runtime_error("Unable to sync memory mapped file.");
 
   if (now) {
-    if (!FlushFileBuffers(_fileHandle))
-      throw std::runtime_error("Unable to flush file handle.");
+    // NtFlushVirtualMemory is the Windows equivalent of msync(MS_SYNC): it
+    // syncs only the dirty pages in [flush_addr, flush_addr+flush_len] to
+    // durable storage, unlike FlushFileBuffers which flushes the entire file.
+    using PFN_NtFlushVirtualMemory = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T,
+                                                      PIO_STATUS_BLOCK);
+    static const auto nt_flush_vm = []() -> PFN_NtFlushVirtualMemory {
+      HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+      if (!ntdll) return nullptr;
+      return reinterpret_cast<PFN_NtFlushVirtualMemory>(
+          GetProcAddress(ntdll, "NtFlushVirtualMemory"));
+    }();
+
+    if (nt_flush_vm) {
+      IO_STATUS_BLOCK iosb{};
+      PVOID  base = flush_addr;
+      SIZE_T size = flush_len;
+      nt_flush_vm(GetCurrentProcess(), &base, &size, &iosb);
+    } else {
+      if (!FlushFileBuffers(_fileHandle))
+        throw std::runtime_error("Unable to flush file handle.");
+    }
   }
 #endif
 }

@@ -255,6 +255,8 @@ class NANOTS_API nanots_iterator {
   int64_t _current_block_sequence;
   int64_t _current_segment_id;
   size_t _current_frame_idx;
+  int64_t _current_block_start_ts;
+  int64_t _current_block_end_ts;
 
   // Cache of visited blocks (segment_id:sequence -> block_info)
   // Using string key for simplicity: "segment_id:sequence"
@@ -268,6 +270,17 @@ class NANOTS_API nanots_iterator {
   // Lazily-initialized database connection for read operations
   std::optional<nts_sqlite_conn> _db_conn;
   nts_sqlite_conn& _ensure_db_connection();
+
+  // Cached prepared statements (lazily initialized on first use)
+  std::optional<nts_sqlite_stmt> _stmt_get_block_by_id;
+  std::optional<nts_sqlite_stmt> _stmt_get_first_block;
+  std::optional<nts_sqlite_stmt> _stmt_get_last_block;
+  std::optional<nts_sqlite_stmt> _stmt_next_in_segment;
+  std::optional<nts_sqlite_stmt> _stmt_next_cross_segment;
+  std::optional<nts_sqlite_stmt> _stmt_prev_in_segment;
+  std::optional<nts_sqlite_stmt> _stmt_prev_cross_segment;
+  std::optional<nts_sqlite_stmt> _stmt_find_block_containing;
+  std::optional<nts_sqlite_stmt> _stmt_find_block_ge;
 };
 
 #ifdef __cplusplus

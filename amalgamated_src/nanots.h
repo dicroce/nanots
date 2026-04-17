@@ -599,6 +599,7 @@ class NANOTS_API nanots_iterator {
   nanots_iterator& operator++();  // Move to next frame
   nanots_iterator& operator--();  // Move to previous frame
   bool find(int64_t timestamp);  // Find first frame >= timestamp
+  bool seek_end();               // Go to last frame
   void reset();                   // Go to first frame
 
   // Utility
@@ -608,6 +609,7 @@ class NANOTS_API nanots_iterator {
  private:
   block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
   block_info* _get_first_block();
+  block_info* _get_last_block();
   block_info* _get_next_block();
   block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
@@ -624,6 +626,8 @@ class NANOTS_API nanots_iterator {
   int64_t _current_block_sequence;
   int64_t _current_segment_id;
   size_t _current_frame_idx;
+  int64_t _current_block_start_ts;
+  int64_t _current_block_end_ts;
 
   // Cache of visited blocks (segment_id:sequence -> block_info)
   // Using string key for simplicity: "segment_id:sequence"
@@ -637,6 +641,17 @@ class NANOTS_API nanots_iterator {
   // Lazily-initialized database connection for read operations
   std::optional<nts_sqlite_conn> _db_conn;
   nts_sqlite_conn& _ensure_db_connection();
+
+  // Cached prepared statements (lazily initialized on first use)
+  std::optional<nts_sqlite_stmt> _stmt_get_block_by_id;
+  std::optional<nts_sqlite_stmt> _stmt_get_first_block;
+  std::optional<nts_sqlite_stmt> _stmt_get_last_block;
+  std::optional<nts_sqlite_stmt> _stmt_next_in_segment;
+  std::optional<nts_sqlite_stmt> _stmt_next_cross_segment;
+  std::optional<nts_sqlite_stmt> _stmt_prev_in_segment;
+  std::optional<nts_sqlite_stmt> _stmt_prev_cross_segment;
+  std::optional<nts_sqlite_stmt> _stmt_find_block_containing;
+  std::optional<nts_sqlite_stmt> _stmt_find_block_ge;
 };
 
 #ifdef __cplusplus
@@ -742,6 +757,8 @@ NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
 
 NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
+
+NANOTS_API nanots_ec_t nanots_iterator_seek_end(nanots_iterator_t iterator);
 
 NANOTS_API int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator);
 

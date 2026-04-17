@@ -1839,6 +1839,8 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _current_block_sequence(0),
       _current_segment_id(0),
       _current_frame_idx(0),
+      _current_block_start_ts(0),
+      _current_block_end_ts(0),
       _valid(false),
       _initialized(false) {
   // Read block size from file header
@@ -1869,21 +1871,22 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   }
 
   // Query database for this specific block
-  auto& db = _ensure_db_connection();
+  if (!_stmt_get_block_by_id.has_value())
+    _stmt_get_block_by_id.emplace(_ensure_db_connection().prepare(
+        "SELECT "
+        "s.metadata as metadata, "
+        "sb.segment_id as segment_id, "
+        "sb.sequence as block_sequence, "
+        "sb.block_idx as block_idx, "
+        "sb.start_timestamp as start_timestamp, "
+        "sb.end_timestamp as end_timestamp, "
+        "sb.uuid as uuid "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE sb.segment_id = ? AND sb.sequence = ?"));
 
-  auto stmt = db.prepare(
-      "SELECT "
-      "s.metadata as metadata, "
-      "sb.segment_id as segment_id, "
-      "sb.sequence as block_sequence, "
-      "sb.block_idx as block_idx, "
-      "sb.start_timestamp as start_timestamp, "
-      "sb.end_timestamp as end_timestamp, "
-      "sb.uuid as uuid "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE sb.segment_id = ? AND sb.sequence = ?");
-
+  auto& stmt = *_stmt_get_block_by_id;
+  stmt.reset();
   auto results = stmt.bind(1, segment_id).bind(2, sequence).exec();
 
   if (results.empty()) {
@@ -1905,16 +1908,39 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
 }
 
 block_info* nanots_iterator::_get_first_block() {
-  auto& db = _ensure_db_connection();
+  if (!_stmt_get_first_block.has_value())
+    _stmt_get_first_block.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "ORDER BY s.id ASC, sb.sequence ASC "
+        "LIMIT 1"));
 
-  auto stmt = db.prepare(
-      "SELECT sb.segment_id, sb.sequence "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE s.stream_tag = ? "
-      "ORDER BY s.id ASC, sb.sequence ASC "
-      "LIMIT 1");
+  auto& stmt = *_stmt_get_first_block;
+  stmt.reset();
+  auto results = stmt.bind(1, _stream_tag).exec();
 
+  if (results.empty())
+    return nullptr;
+
+  int64_t segment_id = std::stoll(results[0]["segment_id"].value());
+  int64_t sequence = std::stoll(results[0]["sequence"].value());
+  return _get_block_by_segment_and_sequence(segment_id, sequence);
+}
+
+block_info* nanots_iterator::_get_last_block() {
+  if (!_stmt_get_last_block.has_value())
+    _stmt_get_last_block.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "ORDER BY s.id DESC, sb.sequence DESC "
+        "LIMIT 1"));
+
+  auto& stmt = *_stmt_get_last_block;
+  stmt.reset();
   auto results = stmt.bind(1, _stream_tag).exec();
 
   if (results.empty())
@@ -1926,17 +1952,18 @@ block_info* nanots_iterator::_get_first_block() {
 }
 
 block_info* nanots_iterator::_get_next_block() {
-  auto& db = _ensure_db_connection();
+  if (!_stmt_next_in_segment.has_value())
+    _stmt_next_in_segment.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.id, sb.sequence "
+        "FROM segment_blocks sb "
+        "WHERE sb.segment_id = ? AND sb.sequence > ? "
+        "ORDER BY sb.sequence ASC "
+        "LIMIT 1"));
 
   // First try to find next block within the same segment
-  auto stmt = db.prepare(
-      "SELECT sb.id, sb.sequence "
-      "FROM segment_blocks sb "
-      "WHERE sb.segment_id = ? AND sb.sequence > ? "
-      "ORDER BY sb.sequence ASC "
-      "LIMIT 1");
-
-  auto results = stmt.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
+  auto& stmt_seg = *_stmt_next_in_segment;
+  stmt_seg.reset();
+  auto results = stmt_seg.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
 
   if (!results.empty()) {
     // Found next block in same segment
@@ -1944,17 +1971,20 @@ block_info* nanots_iterator::_get_next_block() {
     return _get_block_by_segment_and_sequence(_current_segment_id, next_sequence);
   }
 
-  // No more blocks in current segment, look for first block in next segment
-  stmt = db.prepare(
-      "SELECT sb.segment_id, sb.sequence "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE s.stream_tag = ? "
-      "AND s.id > ? "
-      "ORDER BY s.id ASC, sb.sequence ASC "
-      "LIMIT 1");
+  if (!_stmt_next_cross_segment.has_value())
+    _stmt_next_cross_segment.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "AND s.id > ? "
+        "ORDER BY s.id ASC, sb.sequence ASC "
+        "LIMIT 1"));
 
-  results = stmt.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
+  // No more blocks in current segment, look for first block in next segment
+  auto& stmt_cross = *_stmt_next_cross_segment;
+  stmt_cross.reset();
+  results = stmt_cross.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
 
   if (results.empty())
     return nullptr;
@@ -1965,17 +1995,18 @@ block_info* nanots_iterator::_get_next_block() {
 }
 
 block_info* nanots_iterator::_get_prev_block() {
-  auto& db = _ensure_db_connection();
+  if (!_stmt_prev_in_segment.has_value())
+    _stmt_prev_in_segment.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.id, sb.sequence "
+        "FROM segment_blocks sb "
+        "WHERE sb.segment_id = ? AND sb.sequence < ? "
+        "ORDER BY sb.sequence DESC "
+        "LIMIT 1"));
 
   // First try to find previous block within the same segment
-  auto stmt = db.prepare(
-      "SELECT sb.id, sb.sequence "
-      "FROM segment_blocks sb "
-      "WHERE sb.segment_id = ? AND sb.sequence < ? "
-      "ORDER BY sb.sequence DESC "
-      "LIMIT 1");
-
-  auto results = stmt.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
+  auto& stmt_seg = *_stmt_prev_in_segment;
+  stmt_seg.reset();
+  auto results = stmt_seg.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
 
   if (!results.empty()) {
     // Found previous block in same segment
@@ -1983,17 +2014,20 @@ block_info* nanots_iterator::_get_prev_block() {
     return _get_block_by_segment_and_sequence(_current_segment_id, prev_sequence);
   }
 
-  // No previous blocks in current segment, look for last block in previous segment
-  stmt = db.prepare(
-      "SELECT sb.segment_id, sb.sequence "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE s.stream_tag = ? "
-      "AND s.id < ? "
-      "ORDER BY s.id DESC, sb.sequence DESC "
-      "LIMIT 1");
+  if (!_stmt_prev_cross_segment.has_value())
+    _stmt_prev_cross_segment.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "AND s.id < ? "
+        "ORDER BY s.id DESC, sb.sequence DESC "
+        "LIMIT 1"));
 
-  results = stmt.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
+  // No previous blocks in current segment, look for last block in previous segment
+  auto& stmt_cross = *_stmt_prev_cross_segment;
+  stmt_cross.reset();
+  results = stmt_cross.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
 
   if (results.empty())
     return nullptr;
@@ -2004,47 +2038,50 @@ block_info* nanots_iterator::_get_prev_block() {
 }
 
 block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
-  auto& db = _ensure_db_connection();
+  if (!_stmt_find_block_containing.has_value())
+    _stmt_find_block_containing.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "AND sb.start_timestamp <= ? "
+        "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
+        "ORDER BY s.id ASC, sb.sequence ASC "
+        "LIMIT 1"));
 
   // First try to find block that contains the timestamp
-  auto stmt = db.prepare(
-      "SELECT sb.segment_id, sb.sequence "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE s.stream_tag = ? "
-      "AND sb.start_timestamp <= ? "
-      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
-      "ORDER BY s.id ASC, sb.sequence ASC "
-      "LIMIT 1");
-
+  auto& stmt_containing = *_stmt_find_block_containing;
+  stmt_containing.reset();
   auto results =
-      stmt.bind(1, _stream_tag).bind(2, timestamp).bind(3, timestamp).exec();
+      stmt_containing.bind(1, _stream_tag).bind(2, timestamp).bind(3, timestamp).exec();
 
-  if(!results.empty())
-  {
+  if (!results.empty()) {
     int64_t segment_id = std::stoll(results[0]["segment_id"].value());
     int64_t sequence = std::stoll(results[0]["sequence"].value());
     return _get_block_by_segment_and_sequence(segment_id, sequence);
   }
 
+  if (!_stmt_find_block_ge.has_value())
+    _stmt_find_block_ge.emplace(_ensure_db_connection().prepare(
+        "SELECT sb.segment_id, sb.sequence "
+        "FROM segments s "
+        "JOIN segment_blocks sb ON sb.segment_id = s.id "
+        "WHERE s.stream_tag = ? "
+        "AND sb.start_timestamp >= ? "
+        "ORDER BY s.id ASC, sb.sequence ASC "
+        "LIMIT 1"));
+
   // If no block contains the timestamp, find the first block with start_timestamp >=
   // timestamp. This explicitly allows a find() before the first timsestamp to still find the first block.
-  stmt = db.prepare(
-      "SELECT sb.segment_id, sb.sequence "
-      "FROM segments s "
-      "JOIN segment_blocks sb ON sb.segment_id = s.id "
-      "WHERE s.stream_tag = ? "
-      "AND sb.start_timestamp >= ? "
-      "ORDER BY s.id ASC, sb.sequence ASC "
-      "LIMIT 1");
+  auto& stmt_ge = *_stmt_find_block_ge;
+  stmt_ge.reset();
+  auto results2 = stmt_ge.bind(1, _stream_tag).bind(2, timestamp).exec();
 
-  results = stmt.bind(1, _stream_tag).bind(2, timestamp).exec();
-
-  if (results.empty())
+  if (results2.empty())
     return nullptr;  // No blocks at all, or timestamp is after everything
 
-  int64_t segment_id = std::stoll(results[0]["segment_id"].value());
-  int64_t sequence = std::stoll(results[0]["sequence"].value());
+  int64_t segment_id = std::stoll(results2[0]["segment_id"].value());
+  int64_t sequence = std::stoll(results2[0]["sequence"].value());
   return _get_block_by_segment_and_sequence(segment_id, sequence);
 }
 
@@ -2177,7 +2214,18 @@ nanots_iterator& nanots_iterator::operator--() {
 }
 
 bool nanots_iterator::find(int64_t timestamp) {
-  auto* block = _find_block_for_timestamp(timestamp);
+  block_info* block = nullptr;
+
+  // Fast path: if the target is within the already-loaded block's range, skip
+  // the SQL lookup entirely and go straight to the binary search.
+  if (_valid && _current_block_end_ts != 0 &&
+      timestamp >= _current_block_start_ts && timestamp <= _current_block_end_ts) {
+    block = _get_block_by_segment_and_sequence(_current_segment_id, _current_block_sequence);
+  }
+
+  if (!block)
+    block = _find_block_for_timestamp(timestamp);
+
   if (!block) {
     _valid = false;
     return false;
@@ -2187,6 +2235,9 @@ bool nanots_iterator::find(int64_t timestamp) {
     _valid = false;
     return false;
   }
+
+  _current_block_start_ts = block->start_timestamp;
+  _current_block_end_ts   = block->end_timestamp;
 
   _current_segment_id = block->segment_id;
   _current_block_sequence = block->block_sequence;
@@ -2252,6 +2303,24 @@ void nanots_iterator::reset() {
   _current_block_sequence = first_block->block_sequence;
   _current_frame_idx = 0;
   _load_current_frame();
+}
+
+bool nanots_iterator::seek_end() {
+  auto* block = _get_last_block();
+  if (!block) {
+    _valid = false;
+    return false;
+  }
+
+  if (!_load_block_data(*block)) {
+    _valid = false;
+    return false;
+  }
+
+  _current_segment_id = block->segment_id;
+  _current_block_sequence = block->block_sequence;
+  _current_frame_idx = block->n_valid_indexes - 1;
+  return _load_current_frame();
 }
 
 const std::string& nanots_iterator::current_metadata() const {
@@ -2680,6 +2749,25 @@ nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator) {
     return NANOTS_EC_UNKNOWN;
   } catch (...) {
     fprintf(stderr,"Exception in nanots_iterator_reset\n");
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
+nanots_ec_t nanots_iterator_seek_end(nanots_iterator_t iterator) {
+  if (!iterator || !iterator->iterator) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+
+  try {
+    iterator->iterator->seek_end();
+    return NANOTS_EC_OK;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (const std::exception& e) {
+    fprintf(stderr,"Exception in nanots_iterator_seek_end: %s\n", e.what());
+    return NANOTS_EC_UNKNOWN;
+  } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_seek_end\n");
     return NANOTS_EC_UNKNOWN;
   }
 }

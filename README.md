@@ -4,6 +4,8 @@ A lightweight, high-performance, embedded (like sqlite) time-series database opt
 
 **I think what makes NanoTS special in comparison to anything else is how disconnected reads are from writes. You should be able to have as many simultaneous readers as you want. In some ways, its almost more of an in memory datastructure than a storage system.**
 
+**Note: If you plan to use nanots in an embedded system where you want to keep the newest data but overwriting the oldest is OK make sure you checkout the auto_reclaim feature.**
+
 ## Key Features
 
 - **Ultra-fast writes**: 8.83μs per write on SSD, 300μs on spinning disk

@@ -24,6 +24,8 @@ NanoTS is designed for high-throughput, low-latency applications:
 - **Sub-microsecond reads** via memory mapping
 - **Efficient seeks** using binary search on timestamps
 
+Benchmarks are tracked in a dedicated repo: [nanots_bench](https://github.com/dicroce/nanots_bench). See [RESULTS.md](https://github.com/dicroce/nanots_bench/blob/main/RESULTS.md) for current numbers.
+
 ## Architecture
 
 ### Storage Layout

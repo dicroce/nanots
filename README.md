@@ -12,7 +12,7 @@ A lightweight, high-performance, embedded (like sqlite) time-series database opt
 - **Memory-mapped storage**: Lock free storage data structure on memory mapped file allows for maximum throughput.
 - **Configurable durability**: Trade-off between performance and data safety with configurable block sizes
 - **Crash recovery**: Automatic detection and recovery from unexpected shutdowns
-- **Preallocated storage**: Preallocated storage files avoid filesystem fragmentation and administration hassles. In auto-recyle mode you always have the latest data.
+- **Two storage modes**: *Preallocated* (fixed-size files, no surprises on disk usage — ideal for surveillance/embedded) or *Growable* (file extends on demand using BoltDB-style doubling, capped at 1 GiB per grow).
 - **Multiple streams**: Store different data streams in the same database file
 - **Iterator interface**: Efficient navigation with bidirectional iteration and timestamp-based seeking
 - **Cross Platform**: Currently works on Linux, Windows and MacOS.
@@ -60,8 +60,14 @@ Each block contains:
 ```cpp
 #include "nanots.h"
 
-// Create database with 1MB blocks, 16 total blocks
+// Option A: Preallocated — 1MB blocks, 16 total blocks. File is the full
+// size up front; never grows. Best for fixed-budget storage (surveillance,
+// embedded).
 nanots_writer::allocate("video.nts", 1024*1024, 16);
+
+// Option B: Growable — file starts at just the 64KB header and extends on
+// demand. Pass 0 for max_blocks to grow until disk-full.
+nanots_writer::allocate_growable("video.nts", 1024*1024, 0);
 
 // Open the db in auto recycle mode (once full, new data will re-use the oldest blocks).
 nanots_writer db("video.nts", true);
@@ -129,6 +135,33 @@ nanots_writer::allocate("data.nts", 16 * 1024 * 1024, 8);  // 16MB blocks
 // What I use for h.264 video streams
 nanots_writer::allocate("data.nts", 10 * 1024 * 1024, 100); // 100 10mb blocks
 ```
+
+### Preallocated vs. Growable
+
+NanoTS supports two storage modes, both using the same on-disk block layout:
+
+```cpp
+// Preallocated: file is fully allocated up front and never changes size.
+// Predictable disk usage, no fragmentation, fast steady-state writes.
+nanots_writer::allocate("data.nts", 1024 * 1024, 100);
+
+// Growable: file starts as just a 64KB header and is extended on demand.
+// File size grows BoltDB-style (doubles each time, capped at 1 GiB per
+// grow event). Pass max_blocks > 0 to bound the maximum file size.
+nanots_writer::allocate_growable("data.nts", 1024 * 1024, /*max_blocks=*/0);
+```
+
+Pick **preallocated** when you care about predictable disk usage (surveillance
+systems, embedded devices, anything where surprise disk-full failures are
+unacceptable). Pick **growable** when you want the file to fit the data —
+useful for general time-series workloads where you don't know the data
+volume up front.
+
+Growable mode can be combined with `auto_reclaim`: grow until the cap (or
+disk-full) is reached, then start recycling the oldest blocks.
+
+Internally, growable files are marked by `n_blocks == 0` in the file header.
+Existing preallocated files are unaffected and continue to open as before.
 
 ## Use Cases
 

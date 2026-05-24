@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/amalgamate/amalgamate.py)",
+      "PowerShell(cargo --version 2>&1)",
+      "PowerShell(rustc --version 2>&1)",
+      "PowerShell(python --version 2>&1)",
+      "Bash(grep -E \"\\\\.\\(c|cpp|so|pyd|o\\)$\")"
+    ]
+  }
+}

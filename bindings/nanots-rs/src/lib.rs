@@ -148,6 +148,12 @@ extern "C" {
         n_blocks: u32,
     ) -> u32;
 
+    fn nanots_writer_allocate_growable_file(
+        file_name: *const c_char,
+        block_size: u32,
+        max_blocks: u32,
+    ) -> u32;
+
     fn nanots_writer_create(file_name: *const c_char, auto_reclaim: c_int) -> WriterPtr;
     fn nanots_writer_destroy(writer: WriterPtr);
     fn nanots_writer_create_context(
@@ -303,11 +309,38 @@ impl Writer {
         }
     }
 
-    /// Allocate a new database file
+    /// Allocate a new fixed-size database file.
+    ///
+    /// The file is pre-allocated to hold exactly `n_blocks` blocks and will
+    /// never grow. For an on-demand-growing file, use
+    /// [`allocate_growable_file`](Self::allocate_growable_file).
     pub fn allocate_file(file_name: &str, block_size: u32, n_blocks: u32) -> Result<()> {
         let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
         let result =
             unsafe { nanots_writer_allocate_file(c_file_name.as_ptr(), block_size, n_blocks) };
+        let error_code = ErrorCode::from_c(result);
+        if error_code == ErrorCode::Ok {
+            Ok(())
+        } else {
+            Err(error_code)
+        }
+    }
+
+    /// Allocate a new growable database file.
+    ///
+    /// The file starts at just the 64KB header and is extended on demand
+    /// using a BoltDB-style doubling strategy (capped at 1 GiB per grow).
+    /// Pass `max_blocks = 0` for unbounded growth (grow until the disk is
+    /// full).
+    pub fn allocate_growable_file(
+        file_name: &str,
+        block_size: u32,
+        max_blocks: u32,
+    ) -> Result<()> {
+        let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
+        let result = unsafe {
+            nanots_writer_allocate_growable_file(c_file_name.as_ptr(), block_size, max_blocks)
+        };
         let error_code = ErrorCode::from_c(result);
         if error_code == ErrorCode::Ok {
             Ok(())

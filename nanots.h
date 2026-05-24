@@ -133,18 +133,38 @@ class NANOTS_API nanots_writer {
                           int64_t start_timestamp,
                           int64_t end_timestamp);
 
+  // Preallocated: fixed-size file with n_blocks slots, never grows.
+  // Pass n_blocks == 0 to create a growable file (see allocate_growable).
   static void allocate(const std::string& file_name,
                        uint32_t block_size,
                        uint32_t n_blocks);
 
+  // Growable: file starts at just the header and extends on demand.
+  // max_blocks == 0 means unbounded (grow until disk is full).
+  static void allocate_growable(const std::string& file_name,
+                                uint32_t block_size,
+                                uint32_t max_blocks = 0);
+
+  bool is_growable() const { return _n_blocks == 0; }
+
+  // Grow the file by some number of blocks (BoltDB-style: doubles up to a
+  // 1 GiB-per-grow cap, then linear). Caller must already hold a sqlite
+  // IMMEDIATE transaction. Returns the first new block (status='reserved');
+  // any extras are inserted as 'free'. Returns nullopt if max_blocks cap
+  // is already reached. Public only so _db_get_block can call it; treat as
+  // internal.
+  std::optional<block> _grow_blocks(const nts_sqlite_conn& conn);
+
  private:
+
   std::string _file_name;
   uint64_t _file_size;
   nts_file _file;
   nts_memory_map _file_header_mm;
   uint8_t* _file_header_p;
   uint32_t _block_size;
-  uint32_t _n_blocks;
+  uint32_t _n_blocks;       // 0 == growable mode (sentinel)
+  uint32_t _max_blocks;     // growable cap; 0 == unbounded; ignored if !growable
   bool _auto_reclaim;
   std::set<std::string> _active_stream_tags;
 };
@@ -315,6 +335,8 @@ typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        void* user_data);
 
 NANOTS_API nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_size, uint32_t n_blocks);
+
+NANOTS_API nanots_ec_t nanots_writer_allocate_growable_file(const char* file_name, uint32_t block_size, uint32_t max_blocks);
 
 // writer
 NANOTS_API nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim);

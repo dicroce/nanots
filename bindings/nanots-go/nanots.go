@@ -95,12 +95,28 @@ func newError(code ErrorCode) error {
 	return &Error{Code: code, Message: msg}
 }
 
-// AllocateFile creates a new nanots database file with the specified block size and number of blocks
+// AllocateFile creates a new fixed-size nanots database file.
+//
+// The file is pre-allocated to hold exactly nBlocks blocks and will never
+// grow. For an on-demand-growing file, use AllocateGrowableFile.
 func AllocateFile(fileName string, blockSize, nBlocks uint32) error {
 	cFileName := C.CString(fileName)
 	defer C.free(unsafe.Pointer(cFileName))
 
 	ec := C.nanots_writer_allocate_file(cFileName, C.uint32_t(blockSize), C.uint32_t(nBlocks))
+	return newError(ErrorCode(ec))
+}
+
+// AllocateGrowableFile creates a new growable nanots database file.
+//
+// The file starts at just the 64KB header and is extended on demand using a
+// BoltDB-style doubling strategy (capped at 1 GiB per grow). Pass maxBlocks=0
+// for unbounded growth (grow until the disk is full).
+func AllocateGrowableFile(fileName string, blockSize, maxBlocks uint32) error {
+	cFileName := C.CString(fileName)
+	defer C.free(unsafe.Pointer(cFileName))
+
+	ec := C.nanots_writer_allocate_growable_file(cFileName, C.uint32_t(blockSize), C.uint32_t(maxBlocks))
 	return newError(ErrorCode(ec))
 }
 

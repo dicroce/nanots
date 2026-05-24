@@ -154,9 +154,6 @@ void nts_sqlite_transaction(const nts_sqlite_conn& db, bool immediate, T t) {
   try {
     t(db);
     db.exec("COMMIT");
-  } catch (const std::exception& ex) {
-    db.exec("ROLLBACK");
-    throw ex;
   } catch (...) {
     db.exec("ROLLBACK");
     throw;

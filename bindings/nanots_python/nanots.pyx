@@ -67,6 +67,9 @@ cdef extern from "nanots.h":
     nanots_ec_t nanots_writer_allocate_file(const char* file_name,
                                             uint32_t block_size,
                                             uint32_t n_blocks)
+    nanots_ec_t nanots_writer_allocate_growable_file(const char* file_name,
+                                                     uint32_t block_size,
+                                                     uint32_t max_blocks)
     
     nanots_reader_t nanots_reader_create(const char* file_name)
     void nanots_reader_destroy(nanots_reader_t reader)
@@ -187,9 +190,26 @@ cdef void _check_result(nanots_ec_t result):
 
 # Utility function to create database files
 def allocate_file(str filename, uint32_t block_size, uint32_t n_blocks):
-    """Allocate a new nanots database file."""
+    """Allocate a new fixed-size nanots database file.
+
+    The file is pre-allocated to hold exactly ``n_blocks`` blocks and will
+    never grow. Use ``allocate_growable_file`` for an on-demand-growing file.
+    """
     cdef bytes filename_bytes = filename.encode('utf-8')
     cdef nanots_ec_t result = nanots_writer_allocate_file(filename_bytes, block_size, n_blocks)
+    _check_result(result)
+
+def allocate_growable_file(str filename, uint32_t block_size, uint32_t max_blocks=0):
+    """Allocate a new growable nanots database file.
+
+    The file starts at just the 64KB header and is extended on demand using
+    a BoltDB-style doubling strategy (capped at 1 GiB per grow). Set
+    ``max_blocks`` to bound the maximum file size; 0 (the default) means
+    grow until the disk is full.
+    """
+    cdef bytes filename_bytes = filename.encode('utf-8')
+    cdef nanots_ec_t result = nanots_writer_allocate_growable_file(
+        filename_bytes, block_size, max_blocks)
     _check_result(result)
 
 # Write Context wrapper

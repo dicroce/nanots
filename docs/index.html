@@ -401,14 +401,14 @@
             <h2 class="section-title">Use Cases</h2>
             <div class="use-cases">
                 <div class="use-case">
-                    <div class="use-case-icon">🤖</div>
-                    <h3 class="use-case-title">Robotic Vision</h3>
-                    <p>Perfect for embedded robotics systems with continuous camera feeds. Pre-allocated storage eliminates administration - just set your buffer size and always have the newest frames for real-time processing.</p>
+                    <div class="use-case-icon">📹</div>
+                    <h3 class="use-case-title">Video Surveillance</h3>
+                    <p>Built for this from day one. Capture dozens of camera streams concurrently while reviewers scrub through history with frame-accurate seeking — no keyframe snapping, no playback lag.</p>
                 </div>
                 <div class="use-case">
                     <div class="use-case-icon">🚗</div>
                     <h3 class="use-case-title">Self-Driving Cars</h3>
-                    <p>Ultra-fast writes handle multiple camera streams in real-time. Fixed storage allocation ensures consistent performance without filesystem administration in safety-critical autonomous systems.</p>
+                    <p>Ultra-fast writes handle multiple camera and sensor streams in real time. Microsecond timestamps and lock-free reads make on-vehicle log replay practical for debugging and ML pipeline development.</p>
                 </div>
                 <div class="use-case">
                     <div class="use-case-icon">📊</div>
@@ -424,6 +424,37 @@
         </div>
     </section>
 
+    <section class="section">
+        <div class="container">
+            <h2 class="section-title">Scientific Applications</h2>
+            <p style="text-align: center; max-width: 800px; margin: 0 auto 3rem; color: #555; font-size: 1.05rem;">
+                Anywhere you have multiple synchronized data streams, monotonic timestamps, and need to seek to an event and replay a window around it, NanoTS is in its element. The same primitives that power surveillance scrubbing are useful across the sciences.
+            </p>
+            <div class="use-cases">
+                <div class="use-case">
+                    <div class="use-case-icon">🔭</div>
+                    <h3 class="use-case-title">Radio Astronomy & Interferometry</h3>
+                    <p>Multi-antenna acquisition with nanosecond timestamp alignment. Capture continuous I/Q samples at line rate and seek directly to events of interest without paying for full-file scans.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">🧠</div>
+                    <h3 class="use-case-title">Electrophysiology & Neuroscience</h3>
+                    <p>Hundreds-to-thousands of electrode channels at kHz–MHz rates. Stream-per-channel storage with fast windowed retrieval around behavioral or stimulus events — the foundational access pattern for spike-sorting and trial analysis.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">🌍</div>
+                    <h3 class="use-case-title">Seismology & Geophysics</h3>
+                    <p>Continuous 24/7 acquisition from station networks. When an event occurs, pull the same time window from every nearby station instantly — no miniSEED file juggling, no per-query parsing overhead.</p>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">🦾</div>
+                    <h3 class="use-case-title">Robotics & SLAM</h3>
+                    <p>Lidar, IMU, GPS, and camera streams captured at native rates with precise time alignment. Frame-accurate scrubbing across heterogeneous sensors makes log replay and dataset curation a first-class workflow.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <section id="features" class="section">
         <div class="container">
             <h2 class="section-title">Key Features</h2>
@@ -434,9 +465,9 @@
                     <p>Memory-mapped storage with lock-free data structures enables maximum throughput with sub-microsecond performance.</p>
                 </div>
                 <div class="feature-card">
-                    <div class="feature-icon">💾</div>
-                    <h3 class="feature-title">Preallocated Storage</h3>
-                    <p>Avoid filesystem fragmentation and administration hassles with auto-recycle mode for continuous operation.</p>
+                    <div class="feature-icon">🧵</div>
+                    <h3 class="feature-title">Lock-Free Reads</h3>
+                    <p>Memory-mapped data structures let any number of readers iterate, seek, and scrub concurrently while a writer is appending — no contention, no locks, no surprises.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">🔧</div>
@@ -480,11 +511,11 @@ Or use CMake to build as a static library and link it (mkdir build && cd build &
                     <div class="code-title">Writing Data</div>
                     <pre><code>#include "nanots.h"
 
-// Create database with 1MB blocks, 16 total blocks
-nanots_writer::allocate("video.nts", 1024*1024, 16);
+// Create a growable database with 1MB blocks. The file starts at just
+// the 64KB header and extends on demand as you write.
+nanots_writer::allocate_growable("video.nts", 1024*1024);
 
-// Open the db in auto recycle mode
-nanots_writer db("video.nts", true);
+nanots_writer db("video.nts");
 
 // Create write context for a stream
 auto wctx = db.create_write_context("camera_1", "stream metadata");
@@ -558,8 +589,8 @@ if (iter.find(target_timestamp)) {
                     <p>NanoTS allows any number of writing threads as long as each writes to its own logical stream, plus any number of read threads (1 writer per stream + N readers).</p>
                 </div>
                 <div style="margin-bottom: 2rem; padding: 1.5rem; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-                    <h3 style="color: #667eea; margin-bottom: 1rem;">What about pre-allocated storage?</h3>
-                    <p>NanoTS pre-allocates storage space, which prevents server downtime from disk space issues, enables recycling of oldest data when full, and eliminates filesystem fragmentation concerns.</p>
+                    <h3 style="color: #667eea; margin-bottom: 1rem;">How does storage allocation work?</h3>
+                    <p>By default, NanoTS files grow on demand — the file starts as just a 64KB header and extends as you write, using a BoltDB-style doubling strategy capped at 1 GiB per grow event. For embedded or fixed-budget deployments you can also allocate a file at a fixed size up front and combine it with auto-recycle mode so the oldest data is reclaimed when the file is full.</p>
                 </div>
             </div>
         </div>

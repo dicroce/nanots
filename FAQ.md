@@ -18,20 +18,11 @@
    N readers).  
 
 **Q: What should I know about NanoTS?**  
-**A:** Pre allocated storage, blazing fast mostly lock free reads and writes.  
+**A:** Blazing fast mostly lock free reads and writes. Almost never contend.
 
 **Q: How to integrate it with your project?**  
 **A:** Copy the 4 source files in the amalgamated_src/ dir into your source tree and add it to your build.
 
-**Q: What is up with pre-allocating storage?**  
-**A:** NanoTS chooses to pre-allocate its storage space. This may not be a good fit  
-   for everyone, but it does have some useful properties:
-   - You won't find your server down because your time series database filled
-     up the disk.
-   - If you are recycling blocks then what you lose is the oldest data when you
-     run out of space.
-   - Filesystem fragmentation is not an issue.
-     
 **Q: What does a NanoTS data file look like?**  
 **A:** A NanoTS data file consists of a small header plus an array of large fixed
    size blocks. The size of a block is configurable but it should be fairly

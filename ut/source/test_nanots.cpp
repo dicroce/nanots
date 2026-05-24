@@ -21,6 +21,18 @@ static void _whack_files() {
     rtf_remove_file("nanots_test_4mb.nts");
   if (rtf_file_exists("nanots_test_2048_4k_blocks.nts"))
     rtf_remove_file("nanots_test_2048_4k_blocks.nts");
+
+  for (const char* name :
+       {"nanots_growable_basic", "nanots_growable_doubling", "nanots_growable_cap"}) {
+    std::string nts = std::string(name) + ".nts";
+    std::string db  = std::string(name) + ".db";
+    std::string shm = db + "-shm";
+    std::string wal = db + "-wal";
+    if (rtf_file_exists(nts.c_str())) rtf_remove_file(nts.c_str());
+    if (rtf_file_exists(db.c_str())) rtf_remove_file(db.c_str());
+    if (rtf_file_exists(shm.c_str())) rtf_remove_file(shm.c_str());
+    if (rtf_file_exists(wal.c_str())) rtf_remove_file(wal.c_str());
+  }
 }
 
 void test_nanots::setup() {
@@ -2029,4 +2041,134 @@ void test_nanots::test_nanots_iterator_seek_end() {
     RTF_ASSERT(!iter.seek_end());
     RTF_ASSERT(!iter.valid());
   }
+}
+
+// File starts empty (header only). Writing frames must extend the file and
+// read-back must work exactly like a preallocated file.
+void test_nanots::test_nanots_growable_basic() {
+  const char* nts = "nanots_growable_basic.nts";
+  const uint32_t block_size = 64 * 1024;
+
+  nanots_writer::allocate_growable(nts, block_size, 0);
+
+  // File should start at just the header (64KB), no blocks yet.
+  RTF_ASSERT(file_size(nts) == 64 * 1024);
+
+  {
+    nanots_writer db(nts, false);
+    RTF_ASSERT(db.is_growable());
+
+    auto wctx = db.create_write_context("grow_stream", "growable test");
+
+    // Write frames small enough that several fit in one block, large enough
+    // to force several blocks total. Block payload area is roughly
+    // (block_size - header - index_overhead). Write ~10 blocks' worth.
+    const size_t frame_size = 4 * 1024;
+    std::vector<uint8_t> data(frame_size, 0x5A);
+
+    for (int i = 0; i < 200; i++) {
+      db.write(wctx, data.data(), frame_size, 1000 + i * 100, (uint8_t)(i & 0xff));
+    }
+  }
+
+  // File should have grown beyond the bare header.
+  uint64_t after_size = file_size(nts);
+  printf("growable_basic: file size after writes = %llu bytes\n",
+         (unsigned long long)after_size);
+  RTF_ASSERT(after_size > 64 * 1024);
+  // Must still be header + integer multiple of block_size.
+  RTF_ASSERT(((after_size - 64 * 1024) % block_size) == 0);
+
+  // Reopen and read everything back.
+  {
+    nanots_iterator iter(nts, "grow_stream");
+    int n = 0;
+    int64_t last_ts = 0;
+    while (iter.valid()) {
+      RTF_ASSERT(iter->size == 4 * 1024);
+      RTF_ASSERT(iter->timestamp > last_ts);
+      last_ts = iter->timestamp;
+      n++;
+      ++iter;
+    }
+    RTF_ASSERT(n == 200);
+  }
+}
+
+// Verify the doubling growth pattern: file size after each grow event should
+// be roughly 2x the previous size (until the 1 GiB-per-grow cap kicks in).
+void test_nanots::test_nanots_growable_doubling() {
+  const char* nts = "nanots_growable_doubling.nts";
+  const uint32_t block_size = 64 * 1024;
+
+  nanots_writer::allocate_growable(nts, block_size, 0);
+
+  nanots_writer db(nts, false);
+  auto wctx = db.create_write_context("doubling", "");
+
+  // Each frame is just under block-payload size so each frame ends up in
+  // its own block. That makes every write a grow-or-recycle event.
+  const size_t frame_size = block_size / 2;
+  std::vector<uint8_t> data(frame_size, 0xCD);
+
+  std::vector<uint64_t> sizes;
+  sizes.push_back(file_size(nts));
+  for (int i = 0; i < 8; i++) {
+    db.write(wctx, data.data(), frame_size, 1000 + i, 0);
+    sizes.push_back(file_size(nts));
+  }
+
+  printf("growable_doubling: sizes (bytes): ");
+  for (auto s : sizes) printf("%llu ", (unsigned long long)s);
+  printf("\n");
+
+  // After the first write we have 1 block. After subsequent grows we should
+  // see 2, 4, 8, ... blocks (until we stop forcing growth).
+  // Each entry should monotonically increase.
+  for (size_t i = 1; i < sizes.size(); i++) {
+    RTF_ASSERT(sizes[i] >= sizes[i - 1]);
+  }
+  // First write should have grown the file by exactly one block.
+  RTF_ASSERT(sizes[1] == sizes[0] + block_size);
+  // Second write should double (add another block, total 2).
+  RTF_ASSERT(sizes[2] == sizes[0] + 2 * block_size);
+  // Third write should double again (total 4).
+  RTF_ASSERT(sizes[3] == sizes[0] + 4 * block_size);
+}
+
+// max_blocks cap: once we hit the cap, further writes throw (no auto_reclaim).
+void test_nanots::test_nanots_growable_max_cap() {
+  const char* nts = "nanots_growable_cap.nts";
+  const uint32_t block_size = 64 * 1024;
+  const uint32_t cap = 3;
+
+  nanots_writer::allocate_growable(nts, block_size, cap);
+
+  nanots_writer db(nts, false);
+  auto wctx = db.create_write_context("capped", "");
+
+  const size_t frame_size = block_size / 2;
+  std::vector<uint8_t> data(frame_size, 0x77);
+
+  int wrote = 0;
+  bool threw = false;
+  for (int i = 0; i < 20 && !threw; i++) {
+    try {
+      db.write(wctx, data.data(), frame_size, 1000 + i, 0);
+      wrote++;
+    } catch (const nanots_exception& e) {
+      RTF_ASSERT(e.get_ec() == NANOTS_EC_NO_FREE_BLOCKS);
+      threw = true;
+    }
+  }
+
+  printf("growable_max_cap: wrote %d frames before hitting cap of %u blocks\n",
+         wrote, cap);
+  RTF_ASSERT(threw);
+  // We wrote a frame per block (each frame is block_size/2 → next write
+  // forces grow), so we should have managed exactly `cap` writes.
+  RTF_ASSERT(wrote == (int)cap);
+
+  uint64_t final_size = file_size(nts);
+  RTF_ASSERT(final_size == 64 * 1024 + (uint64_t)cap * block_size);
 }

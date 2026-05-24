@@ -1176,26 +1176,41 @@ static std::optional<block> _db_reclaim_oldest_used_block(
   return block{block_id, std::stoll(row["idx"].value())};
 }
 
-static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
-                                          bool auto_reclaim) {
+static std::optional<block> _db_get_free_block(const nts_sqlite_conn& conn) {
   auto result =
       conn.exec("SELECT id, idx FROM blocks WHERE status = 'free' LIMIT 1;");
 
-  if (!result.empty()) {
-    auto row = result.front();
-    int64_t block_id = std::stoll(row["id"].value());
+  if (result.empty())
+    return std::nullopt;
 
-    auto stmt =
-        conn.prepare("UPDATE blocks SET status = 'reserved' WHERE id = ?");
-    stmt.bind(1, block_id).exec_no_result();
+  auto row = result.front();
+  int64_t block_id = std::stoll(row["id"].value());
 
-    return block{block_id, std::stoll(row["idx"].value())};
+  auto stmt =
+      conn.prepare("UPDATE blocks SET status = 'reserved' WHERE id = ?");
+  stmt.bind(1, block_id).exec_no_result();
+
+  return block{block_id, std::stoll(row["idx"].value())};
+}
+
+static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
+                                          bool auto_reclaim,
+                                          nanots_writer* writer_for_growth) {
+  // 1. Try to reuse a previously-freed block.
+  if (auto b = _db_get_free_block(conn)) return b;
+
+  // 2. In growable mode (and not yet at the cap), extend the file.
+  //    Growth is preferred over reclaim: the user opted into growable
+  //    because they'd rather use more disk than lose old data.
+  if (writer_for_growth && writer_for_growth->is_growable()) {
+    if (auto b = writer_for_growth->_grow_blocks(conn)) return b;
   }
 
+  // 3. Fall back to recycling the oldest finalized block.
   if (auto_reclaim)
     return _db_reclaim_oldest_used_block(conn);
-  else
-    throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
+
+  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
 }
 
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
@@ -1334,6 +1349,12 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       _file_header_p((uint8_t*)_file_header_mm.map()),
       _block_size(*(uint32_t*)_file_header_p),
       _n_blocks(*(uint32_t*)(_file_header_p + sizeof(uint32_t))),
+      // max_blocks lives at offset 8. For legacy preallocated files this byte
+      // range was zeroed by fallocate (Linux/macOS) or left at whatever
+      // SetEndOfFile produced (Windows). Only consulted in growable mode, and
+      // new allocate() always writes 0 here, so legacy preallocated files are
+      // unaffected.
+      _max_blocks(*(uint32_t*)(_file_header_p + 8)),
       _auto_reclaim(auto_reclaim) {
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
@@ -1342,6 +1363,57 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   nts_sqlite_conn db(db_name, true, true);
   _upgrade_db(db);
   _validate_blocks(_file_name);
+}
+
+std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {
+  // Current physical block count comes from sqlite (authoritative).
+  auto count_rows = conn.exec("SELECT COUNT(*) AS c FROM blocks;");
+  int64_t current_count = std::stoll(count_rows.front()["c"].value());
+
+  // Honor the cap.
+  if (_max_blocks > 0 && current_count >= _max_blocks)
+    return std::nullopt;
+
+  // BoltDB-style: double the current count, capped at 1 GiB per grow.
+  // First-ever grow allocates exactly 1 block.
+  const int64_t cap_bytes = 1024LL * 1024LL * 1024LL;
+  int64_t cap_blocks = std::max<int64_t>(1, cap_bytes / _block_size);
+
+  int64_t to_add = (current_count == 0)
+                       ? 1
+                       : std::min<int64_t>(current_count, cap_blocks);
+
+  // Don't exceed _max_blocks if one is set.
+  if (_max_blocks > 0)
+    to_add = std::min<int64_t>(to_add, int64_t(_max_blocks) - current_count);
+
+  if (to_add <= 0)
+    return std::nullopt;
+
+  // Extend the file. fallocate is idempotent on size — if a previous grow
+  // partially succeeded (file extended but sqlite rolled back), we just
+  // re-extend to the same or larger size, no harm done.
+  uint64_t new_size = FILE_HEADER_BLOCK_SIZE +
+                      static_cast<uint64_t>(current_count + to_add) * _block_size;
+
+  if (fallocate(_file, new_size) < 0)
+    throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE,
+                           "Unable to grow file.", __FILE__, __LINE__);
+
+  _file_size = new_size;
+
+  // Insert new block rows. First one is 'reserved' (the caller's slot);
+  // the rest are 'free' for future writes.
+  auto stmt = conn.prepare("INSERT INTO blocks (idx, status) VALUES (?, ?)");
+  int64_t first_new_idx = current_count;
+  for (int64_t i = 0; i < to_add; i++) {
+    int64_t idx = current_count + i;
+    stmt.reset();
+    stmt.bind(1, idx).bind(2, std::string(i == 0 ? "reserved" : "free")).exec_no_result();
+  }
+
+  int64_t first_new_id = std::stoll(conn.last_insert_id()) - (to_add - 1);
+  return block{first_new_id, first_new_idx};
 }
 
 write_context nanots_writer::create_write_context(const std::string& stream_tag,
@@ -1390,7 +1462,7 @@ void nanots_writer::write(write_context& wctx,
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
     nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      auto block = _db_get_block(conn, _auto_reclaim);
+      auto block = _db_get_block(conn, _auto_reclaim, this);
       if (!block)
         throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
 
@@ -1516,6 +1588,25 @@ void nanots_writer::free_blocks(const std::string& file_name,
   });
 }
 
+void nanots_writer::allocate_growable(const std::string& file_name,
+                                      uint32_t block_size,
+                                      uint32_t max_blocks) {
+  // Growable mode is signalled by n_blocks == 0 in the file header.
+  // The optional max_blocks cap is stored at offset 8.
+  allocate(file_name, block_size, 0);
+
+  if (max_blocks > 0) {
+    auto f = nts_file::open(file_name, "r+");
+    nts_memory_map mm(
+        filenum(f), 0, 4096,
+        nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
+        nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
+    uint8_t* p = (uint8_t*)mm.map();
+    *(uint32_t*)(p + 8) = max_blocks;
+    mm.flush(mm.map(), 12);
+  }
+}
+
 void nanots_writer::allocate(const std::string& file_name,
                              uint32_t block_size,
                              uint32_t n_blocks) {
@@ -1524,6 +1615,8 @@ void nanots_writer::allocate(const std::string& file_name,
   // multiple of 65536 then block start and end on 64k boundaries.
   block_size = _round_to_64k_boundary(block_size);
 
+  // n_blocks == 0 ⇒ growable mode: file starts at just the header and grows
+  // on demand. Otherwise pre-allocate the full file up front.
   uint64_t file_size = FILE_HEADER_BLOCK_SIZE + static_cast<uint64_t>(n_blocks) * block_size;
 
   {
@@ -1548,8 +1641,11 @@ void nanots_writer::allocate(const std::string& file_name,
     p += sizeof(uint32_t);
     *(uint32_t*)p = n_blocks;
     p += sizeof(uint32_t);
+    // offset 8: max_blocks cap for growable mode (0 = unbounded). Always
+    // zero here; allocate_growable() overwrites it if a cap was requested.
+    *(uint32_t*)p = 0;
 
-    mm.flush(mm.map(), 8);
+    mm.flush(mm.map(), 12);
   }
 
   auto db_name = _database_name(file_name);
@@ -2375,6 +2471,24 @@ nanots_ec_t nanots_writer_allocate_file(const char* file_name, uint32_t block_si
   }
   if(ec != NANOTS_EC_OK) {
     fprintf(stderr,"Error in nanots_writer_allocate_file: %d\n", ec);
+  }
+  return ec;
+}
+
+nanots_ec_t nanots_writer_allocate_growable_file(const char* file_name, uint32_t block_size, uint32_t max_blocks) {
+  nanots_ec_t ec = nanots_ec_t::NANOTS_EC_OK;
+  try {
+    nanots_writer::allocate_growable(std::string(file_name), block_size, max_blocks);
+  } catch (const nanots_exception& e) {
+    ec = e.get_ec();
+  } catch (const std::exception& e) {
+    fprintf(stderr,"Exception in nanots_writer_allocate_growable_file: %s\n", e.what());
+    ec = NANOTS_EC_UNKNOWN;
+  } catch (...) {
+    ec = NANOTS_EC_UNKNOWN;
+  }
+  if(ec != NANOTS_EC_OK) {
+    fprintf(stderr,"Error in nanots_writer_allocate_growable_file: %d\n", ec);
   }
   return ec;
 }

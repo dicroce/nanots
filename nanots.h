@@ -282,6 +282,31 @@ class NANOTS_API nanots_writer {
 
  private:
 
+  // EBR limbo: blocks the writer has retired (catalog ops done, but bytes
+  // not yet overwritten). _limbo entries that have cleared EBR safety get
+  // migrated to _ready, ready to be consumed by the next acquire.
+  struct LimboEntry {
+    int64_t  block_id;
+    int64_t  block_idx;
+    uint64_t retired_epoch;
+  };
+
+  // Cap on outstanding limbo entries. If a long-stalled reader prevents
+  // any limbo entry from clearing, retire calls throw rather than grow
+  // unboundedly.
+  static constexpr size_t LIMBO_MAX_ENTRIES = 1024;
+
+  // Top-level block acquisition under EBR. Tries (1) ready queue, (2) free
+  // block, (3) growable extension, (4) retire-into-limbo + ready queue with
+  // bounded retries. Returned block is always safe to pass through
+  // _recycle_block: either truly free (already zeroed), freshly grown, or
+  // an EBR-cleared retired block.
+  block _acquire_writable_block(const nts_sqlite_conn& conn);
+
+  // Move limbo entries that have cleared EBR safety into the ready queue.
+  // Caller must NOT hold _limbo_mu.
+  void _scan_limbo();
+
   std::string _file_name;
   uint64_t _file_size;
   nts_file _file;
@@ -292,6 +317,12 @@ class NANOTS_API nanots_writer {
   uint32_t _max_blocks;     // growable cap; 0 == unbounded; ignored if !growable
   bool _auto_reclaim;
   std::set<std::string> _active_stream_tags;
+
+  // EBR state. _epoch is shared with every iterator and writer on this file.
+  std::shared_ptr<nanots_epoch_registry> _epoch;
+  std::deque<LimboEntry>                 _limbo;
+  std::deque<LimboEntry>                 _ready;
+  std::mutex                             _limbo_mu;
 };
 
 struct contiguous_segment {

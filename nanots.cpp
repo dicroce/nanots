@@ -393,25 +393,9 @@ static std::optional<block> _db_get_free_block(const nts_sqlite_conn& conn) {
   return block{block_id, std::stoll(row["idx"].value())};
 }
 
-static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
-                                          bool auto_reclaim,
-                                          nanots_writer* writer_for_growth) {
-  // 1. Try to reuse a previously-freed block.
-  if (auto b = _db_get_free_block(conn)) return b;
-
-  // 2. In growable mode (and not yet at the cap), extend the file.
-  //    Growth is preferred over reclaim: the user opted into growable
-  //    because they'd rather use more disk than lose old data.
-  if (writer_for_growth && writer_for_growth->is_growable()) {
-    if (auto b = writer_for_growth->_grow_blocks(conn)) return b;
-  }
-
-  // 3. Fall back to recycling the oldest finalized block.
-  if (auto_reclaim)
-    return _db_reclaim_oldest_used_block(conn);
-
-  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
-}
+// (Block acquisition logic moved to nanots_writer::_acquire_writable_block,
+//  which composes _db_get_free_block / _grow_blocks / _db_reclaim_oldest_used_block
+//  with the EBR limbo/ready machinery.)
 
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
                                                  const std::string& stream_tag,
@@ -555,7 +539,8 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       // new allocate() always writes 0 here, so legacy preallocated files are
       // unaffected.
       _max_blocks(*(uint32_t*)(_file_header_p + 8)),
-      _auto_reclaim(auto_reclaim) {
+      _auto_reclaim(auto_reclaim),
+      _epoch(nanots_epoch_registry::get_or_create(file_name)) {
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
@@ -646,6 +631,94 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
   return wctx;
 }
 
+void nanots_writer::_scan_limbo() {
+  int64_t now = _now_us();
+  std::lock_guard<std::mutex> g(_limbo_mu);
+  // Front-of-deque ordering by retired_epoch is monotonic (every retire
+  // bumps global_epoch), so once the front is blocked, everything behind
+  // it is too.
+  while (!_limbo.empty()) {
+    const auto& front = _limbo.front();
+    if (!_epoch->can_recycle(front.retired_epoch, now)) break;
+    _ready.push_back(front);
+    _limbo.pop_front();
+  }
+}
+
+block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
+  // 1. Try the ready queue (limbo entries that have already cleared EBR).
+  {
+    std::lock_guard<std::mutex> g(_limbo_mu);
+    if (!_ready.empty()) {
+      auto e = _ready.front();
+      _ready.pop_front();
+      return block{e.block_id, e.block_idx};
+    }
+  }
+
+  // 2. Try a truly free block.
+  if (auto b = _db_get_free_block(conn)) {
+    return *b;
+  }
+
+  // 3. Growable: extend the file.
+  if (is_growable()) {
+    if (auto b = _grow_blocks(conn)) {
+      return *b;
+    }
+  }
+
+  // 4. Auto-reclaim: retire blocks into limbo and consume from ready.
+  if (_auto_reclaim) {
+    constexpr int MAX_RETRIES = 100;
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+      // Cap check before retiring.
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        if (_limbo.size() >= LIMBO_MAX_ENTRIES) {
+          throw nanots_exception(
+              NANOTS_EC_NO_FREE_BLOCKS,
+              "EBR limbo cap exceeded; pinned readers blocking reclaim.",
+              __FILE__, __LINE__);
+        }
+      }
+
+      // Retire one block (SQL: delete its segment_block, mark reserved).
+      auto victim = _db_reclaim_oldest_used_block(conn);
+      if (!victim) {
+        // Nothing finalized to retire (either no blocks at all, or every
+        // remaining block is still being actively written). Fall through
+        // to the throw below.
+        break;
+      }
+
+      uint64_t retired_epoch = _epoch->global_epoch_bump();
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        _limbo.push_back({victim->id, victim->idx, retired_epoch});
+      }
+
+      // Try to migrate cleared entries to ready and consume one.
+      _scan_limbo();
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        if (!_ready.empty()) {
+          auto e = _ready.front();
+          _ready.pop_front();
+          return block{e.block_id, e.block_idx};
+        }
+      }
+
+      // No ready block yet — readers haven't advanced their epochs. Yield
+      // briefly and retry.
+      std::this_thread::yield();
+    }
+  }
+
+  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.",
+                         __FILE__, __LINE__);
+}
+
 void nanots_writer::write(write_context& wctx,
                           const uint8_t* data,
                           size_t size,
@@ -661,17 +734,20 @@ void nanots_writer::write(write_context& wctx,
   if (!wctx.current_block) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      auto block = _db_get_block(conn, _auto_reclaim, this);
-      if (!block)
-        throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
+    // Acquire a physical block under EBR. The returned block is always safe
+    // to overwrite: it is either a freshly-free block, a newly-grown block,
+    // or a retired block that has cleared EBR safety. Block acquisition
+    // happens outside the transaction below because retiring may need
+    // multiple sub-transactions and yields while waiting on readers.
+    block phys = _acquire_writable_block(conn);
 
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
       uint8_t uuid[16];
       generate_entropy_id(uuid);
 
       wctx.current_block = _db_create_segment_block(
           conn, wctx.current_segment->id, wctx.current_segment->sequence,
-          block->id, block->idx, timestamp, 0, uuid);
+          phys.id, phys.idx, timestamp, 0, uuid);
 
       if (!wctx.current_block)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);

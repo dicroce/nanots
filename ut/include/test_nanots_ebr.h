@@ -13,6 +13,7 @@ class test_nanots_ebr : public test_fixture {
     TEST(test_nanots_ebr::test_dead_heartbeat_does_not_pin);
     TEST(test_nanots_ebr::test_iterator_op_advances_epoch);
     TEST(test_nanots_ebr::test_stress_concurrent_writer_readers);
+    TEST(test_nanots_ebr::test_ts_index_refresh_finds_new_blocks);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots_ebr() throw() {}
@@ -26,6 +27,7 @@ class test_nanots_ebr : public test_fixture {
   void test_dead_heartbeat_does_not_pin();
   void test_iterator_op_advances_epoch();
   void test_stress_concurrent_writer_readers();
+  void test_ts_index_refresh_finds_new_blocks();
 };
 
 #endif

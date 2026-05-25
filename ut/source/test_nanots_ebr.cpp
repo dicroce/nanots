@@ -322,3 +322,62 @@ void test_nanots_ebr::test_stress_concurrent_writer_readers() {
   // bytes a reader was dereferencing), this would be non-zero.
   RTF_ASSERT_EQUAL(integrity_failures.load(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// Test: ts_index refresh picks up new blocks written after construction.
+// ---------------------------------------------------------------------------
+//
+// An iterator builds its timestamp index lazily on the first navigation op.
+// After that snapshot, a writer may append more blocks to the stream. A
+// subsequent find() for a timestamp in the newly-written range must trigger
+// a tail refresh and locate the block.
+//
+void test_nanots_ebr::test_ts_index_refresh_finds_new_blocks() {
+  // Small payloads so two phases of writes fit comfortably in the 8-block
+  // pool without needing auto_reclaim.
+  std::vector<uint8_t> payload(512, 0x55);
+
+  // Phase 1: write enough frames to fill multiple blocks.
+  {
+    nanots_writer writer(EBR_FILE, /*auto_reclaim=*/false);
+    auto wctx = writer.create_write_context("stream_a", "meta");
+    for (int i = 0; i < 32; ++i) {
+      int64_t ts = 1000 + i * 100;
+      _fill_payload_with_ts(payload, ts);
+      writer.write(wctx, payload.data(), payload.size(), ts, 0);
+    }
+  }
+
+  // Open iterator; do a find() to force ts_index build.
+  nanots_iterator iter(EBR_FILE, "stream_a");
+  RTF_ASSERT(iter.find(1000));
+  RTF_ASSERT_EQUAL(iter->timestamp, (int64_t)1000);
+
+  // Phase 2: append more frames at later timestamps. The iterator's snapshot
+  // doesn't know about these.
+  {
+    nanots_writer writer(EBR_FILE, /*auto_reclaim=*/false);
+    auto wctx = writer.create_write_context("stream_a", "meta");
+    for (int i = 32; i < 64; ++i) {
+      int64_t ts = 1000 + i * 100;
+      _fill_payload_with_ts(payload, ts);
+      writer.write(wctx, payload.data(), payload.size(), ts, 0);
+    }
+  }
+
+  // find() for a NEW timestamp. Without refresh, this would return false;
+  // with refresh, the iterator detects the miss past the cached end, refreshes
+  // its ts_index, and locates the block.
+  int64_t new_ts = 1000 + 50 * 100;
+  RTF_ASSERT(iter.find(new_ts));
+  RTF_ASSERT_EQUAL(iter->timestamp, new_ts);
+
+  // operator++ across the boundary should also work via refresh.
+  RTF_ASSERT(iter.find(1000 + 30 * 100));  // last frame of original batch
+  ++iter;
+  RTF_ASSERT(iter.valid());
+  ++iter;
+  RTF_ASSERT(iter.valid());
+  // We should now be reading into the post-refresh region.
+  RTF_ASSERT(iter->timestamp > 1000 + 31 * 100);
+}

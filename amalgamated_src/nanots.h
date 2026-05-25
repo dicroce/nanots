@@ -787,12 +787,43 @@ class NANOTS_API nanots_iterator {
   const std::string& current_metadata() const;
 
  private:
+  // In-memory index of all blocks in this stream, sorted by start_ts
+  // (equivalently by (segment_id, sequence) since both are monotonic for a
+  // given stream). Built lazily on first navigation operation; refreshed when
+  // a stale entry is detected or when navigation runs off the cached end.
+  // Replaces per-op SQL queries in _find_block_for_timestamp /
+  // _get_first/last/next/prev_block with in-memory binary search.
+  struct BlockRange {
+    int64_t start_ts;
+    int64_t end_ts;       // 0 = open block (currently being written)
+    int64_t segment_id;
+    int64_t sequence;
+  };
+
   block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
   block_info* _get_first_block();
   block_info* _get_last_block();
   block_info* _get_next_block();
   block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
+
+  // Build (or rebuild) the timestamp index from SQL. _ensure_ts_index is the
+  // lazy entry point used by navigation methods.
+  void   _ensure_ts_index();
+  void   _refresh_ts_index();
+
+  // Returns the position in _ts_index of the block matching ts, or
+  // _ts_index.size() if none. Matches the old SQL semantics: first prefers a
+  // block that covers ts (start_ts <= ts <= end_ts, or end_ts == 0); otherwise
+  // returns the first block with start_ts >= ts.
+  size_t _ts_index_find(int64_t ts) const;
+
+  // True if _ts_index_pos matches (current_segment_id, current_block_sequence).
+  bool   _ts_index_pos_is_valid() const;
+
+  // Linear search _ts_index for (current_segment_id, current_block_sequence)
+  // and update _ts_index_pos. Returns true on success.
+  bool   _ts_index_relocate();
 
   bool _load_block_data(block_info& block);
   bool _load_current_frame();
@@ -812,6 +843,13 @@ class NANOTS_API nanots_iterator {
   // Cache of visited blocks (segment_id:sequence -> block_info)
   // Using string key for simplicity: "segment_id:sequence"
   std::unordered_map<std::string, block_info> _block_cache;
+
+  // Timestamp index. See BlockRange above. _ts_index_pos tracks the position
+  // in _ts_index corresponding to (_current_segment_id, _current_block_sequence)
+  // so operator++/-- can advance via array indexing instead of SQL.
+  std::vector<BlockRange> _ts_index;
+  bool                    _ts_index_filled{false};
+  size_t                  _ts_index_pos{0};
 
   // Cached current frame
   frame_info _current_frame;

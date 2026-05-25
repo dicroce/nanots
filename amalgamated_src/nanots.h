@@ -47,6 +47,8 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <algorithm>
@@ -458,6 +460,131 @@ struct segment_block {
   uint8_t uuid[16];
 };
 
+// ---------------------------------------------------------------------------
+// Epoch-Based Reclamation (EBR) registry.
+// ---------------------------------------------------------------------------
+//
+// One registry per file (in-process, path-keyed singleton). Shared by every
+// nanots_writer and nanots_iterator opened on that file. EBR lets the writer
+// recycle physical blocks safely even when readers are concurrently iterating:
+// the writer defers byte-overwriting reclaim of a block until no reader's slot
+// can still be holding pointers into that block's bytes.
+//
+// Hot-path cost: one atomic load + one atomic store per iterator operation;
+// one atomic increment per writer retire.
+//
+// Within a single process only. Cross-process readers are not protected.
+//
+class NANOTS_API nanots_epoch_registry {
+ public:
+  static constexpr uint64_t INACTIVE = UINT64_MAX;
+
+  struct Slot {
+    std::atomic<uint64_t> epoch{INACTIVE};
+    std::atomic<int64_t>  heartbeat_us{0};
+  };
+
+  // Hot-path operations.
+  uint64_t global_epoch_load() const {
+    return _global_epoch.load(std::memory_order_acquire);
+  }
+  uint64_t global_epoch_bump() {
+    return _global_epoch.fetch_add(1, std::memory_order_release);
+  }
+
+  // Returns true if no active slot's epoch is <= retired_epoch. Slots whose
+  // heartbeat is older than NANOTS_HEARTBEAT_TIMEOUT_US are treated as dead
+  // and ignored.
+  bool can_recycle(uint64_t retired_epoch, int64_t now_us) const;
+
+  // Accessor for slot_guard.
+  Slot& slot(uint32_t id);
+
+  // Acquire/release; called by nanots_slot_guard.
+  uint32_t acquire_slot();
+  void     release_slot(uint32_t id);
+
+  // Path-keyed singleton accessor. Same path string returns the same registry
+  // for the lifetime of any caller holding the shared_ptr.
+  static std::shared_ptr<nanots_epoch_registry> get_or_create(
+      const std::string& file_path);
+
+ private:
+  std::atomic<uint64_t>               _global_epoch{1};
+  mutable std::mutex                  _slots_mu;
+  std::vector<std::unique_ptr<Slot>>  _slots;
+};
+
+// Heartbeat timeout: a slot whose last heartbeat is older than this is
+// treated as dead by can_recycle().
+constexpr int64_t NANOTS_HEARTBEAT_TIMEOUT_US = 60LL * 1000 * 1000;  // 60s
+
+// ---------------------------------------------------------------------------
+// RAII wrapper for slot acquisition + publishing.
+// ---------------------------------------------------------------------------
+//
+// On construction: acquires a slot from the registry and publishes the current
+// global_epoch + heartbeat. On destruction: sets the slot to INACTIVE and
+// releases it. Pairing the acquire and the release in one object means an
+// exception thrown anywhere in iterator construction or operation still leaves
+// the slot in a clean state.
+//
+// Move-only.
+//
+class NANOTS_API nanots_slot_guard {
+ public:
+  nanots_slot_guard() = default;
+  explicit nanots_slot_guard(std::shared_ptr<nanots_epoch_registry> registry);
+  ~nanots_slot_guard();
+
+  nanots_slot_guard(const nanots_slot_guard&)            = delete;
+  nanots_slot_guard& operator=(const nanots_slot_guard&) = delete;
+  nanots_slot_guard(nanots_slot_guard&& other) noexcept;
+  nanots_slot_guard& operator=(nanots_slot_guard&& other) noexcept;
+
+  // Publishes the latest global_epoch to our slot and updates the heartbeat.
+  // Call at the start of every iterator operation. No-op if !active().
+  void op_begin();
+
+  // True if this guard owns a slot.
+  bool active() const { return _slot_id != UINT32_MAX; }
+
+ private:
+  void _release() noexcept;
+
+  std::shared_ptr<nanots_epoch_registry> _registry;
+  uint32_t                                _slot_id{UINT32_MAX};
+};
+
+// ---------------------------------------------------------------------------
+// Scoped op marker.
+// ---------------------------------------------------------------------------
+//
+// Stack-only RAII wrapper that marks the start of one iterator operation.
+// Construction publishes the current global_epoch + heartbeat to the slot;
+// destruction is intentionally a no-op (the slot retains the published epoch
+// until the next op or the iterator is destroyed — that's what protects the
+// Frame::data validity contract). The point of this type is to make "this
+// scope is one iterator op" syntactically explicit at every call site, and to
+// reserve a hook for any future op-exit work (latency counters, debug
+// assertions, etc.) without churning all the call sites again.
+//
+class NANOTS_API nanots_op_scope {
+ public:
+  explicit nanots_op_scope(nanots_slot_guard& guard) : _guard(guard) {
+    _guard.op_begin();
+  }
+  ~nanots_op_scope() = default;
+
+  nanots_op_scope(const nanots_op_scope&)            = delete;
+  nanots_op_scope& operator=(const nanots_op_scope&) = delete;
+  nanots_op_scope(nanots_op_scope&&)                 = delete;
+  nanots_op_scope& operator=(nanots_op_scope&&)      = delete;
+
+ private:
+  nanots_slot_guard& _guard;
+};
+
 struct NANOTS_API write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;
@@ -525,6 +652,31 @@ class NANOTS_API nanots_writer {
 
  private:
 
+  // EBR limbo: blocks the writer has retired (catalog ops done, but bytes
+  // not yet overwritten). _limbo entries that have cleared EBR safety get
+  // migrated to _ready, ready to be consumed by the next acquire.
+  struct LimboEntry {
+    int64_t  block_id;
+    int64_t  block_idx;
+    uint64_t retired_epoch;
+  };
+
+  // Cap on outstanding limbo entries. If a long-stalled reader prevents
+  // any limbo entry from clearing, retire calls throw rather than grow
+  // unboundedly.
+  static constexpr size_t LIMBO_MAX_ENTRIES = 1024;
+
+  // Top-level block acquisition under EBR. Tries (1) ready queue, (2) free
+  // block, (3) growable extension, (4) retire-into-limbo + ready queue with
+  // bounded retries. Returned block is always safe to pass through
+  // _recycle_block: either truly free (already zeroed), freshly grown, or
+  // an EBR-cleared retired block.
+  block _acquire_writable_block(const nts_sqlite_conn& conn);
+
+  // Move limbo entries that have cleared EBR safety into the ready queue.
+  // Caller must NOT hold _limbo_mu.
+  void _scan_limbo();
+
   std::string _file_name;
   uint64_t _file_size;
   nts_file _file;
@@ -535,6 +687,12 @@ class NANOTS_API nanots_writer {
   uint32_t _max_blocks;     // growable cap; 0 == unbounded; ignored if !growable
   bool _auto_reclaim;
   std::set<std::string> _active_stream_tags;
+
+  // EBR state. _epoch is shared with every iterator and writer on this file.
+  std::shared_ptr<nanots_epoch_registry> _epoch;
+  std::deque<LimboEntry>                 _limbo;
+  std::deque<LimboEntry>                 _ready;
+  std::mutex                             _limbo_mu;
 };
 
 struct contiguous_segment {
@@ -571,6 +729,11 @@ class NANOTS_API nanots_reader {
   nts_file _file;
   uint32_t _block_size;
   uint32_t _n_blocks;
+
+  // EBR slot. Acquired on construction, released on destruction. read() opens
+  // a critical section for its duration so the writer cannot overwrite block
+  // bytes while the callback is dereferencing them.
+  nanots_slot_guard _slot_guard;
 };
 
 struct frame_info {
@@ -624,12 +787,43 @@ class NANOTS_API nanots_iterator {
   const std::string& current_metadata() const;
 
  private:
+  // In-memory index of all blocks in this stream, sorted by start_ts
+  // (equivalently by (segment_id, sequence) since both are monotonic for a
+  // given stream). Built lazily on first navigation operation; refreshed when
+  // a stale entry is detected or when navigation runs off the cached end.
+  // Replaces per-op SQL queries in _find_block_for_timestamp /
+  // _get_first/last/next/prev_block with in-memory binary search.
+  struct BlockRange {
+    int64_t start_ts;
+    int64_t end_ts;       // 0 = open block (currently being written)
+    int64_t segment_id;
+    int64_t sequence;
+  };
+
   block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
   block_info* _get_first_block();
   block_info* _get_last_block();
   block_info* _get_next_block();
   block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
+
+  // Build (or rebuild) the timestamp index from SQL. _ensure_ts_index is the
+  // lazy entry point used by navigation methods.
+  void   _ensure_ts_index();
+  void   _refresh_ts_index();
+
+  // Returns the position in _ts_index of the block matching ts, or
+  // _ts_index.size() if none. Matches the old SQL semantics: first prefers a
+  // block that covers ts (start_ts <= ts <= end_ts, or end_ts == 0); otherwise
+  // returns the first block with start_ts >= ts.
+  size_t _ts_index_find(int64_t ts) const;
+
+  // True if _ts_index_pos matches (current_segment_id, current_block_sequence).
+  bool   _ts_index_pos_is_valid() const;
+
+  // Linear search _ts_index for (current_segment_id, current_block_sequence)
+  // and update _ts_index_pos. Returns true on success.
+  bool   _ts_index_relocate();
 
   bool _load_block_data(block_info& block);
   bool _load_current_frame();
@@ -650,6 +844,13 @@ class NANOTS_API nanots_iterator {
   // Using string key for simplicity: "segment_id:sequence"
   std::unordered_map<std::string, block_info> _block_cache;
 
+  // Timestamp index. See BlockRange above. _ts_index_pos tracks the position
+  // in _ts_index corresponding to (_current_segment_id, _current_block_sequence)
+  // so operator++/-- can advance via array indexing instead of SQL.
+  std::vector<BlockRange> _ts_index;
+  bool                    _ts_index_filled{false};
+  size_t                  _ts_index_pos{0};
+
   // Cached current frame
   frame_info _current_frame;
   bool _valid;
@@ -669,6 +870,12 @@ class NANOTS_API nanots_iterator {
   std::optional<nts_sqlite_stmt> _stmt_prev_cross_segment;
   std::optional<nts_sqlite_stmt> _stmt_find_block_containing;
   std::optional<nts_sqlite_stmt> _stmt_find_block_ge;
+
+  // EBR slot. Acquired on construction, released on destruction. Each
+  // navigation operation (find, ++, --, reset, seek_end) calls op_begin()
+  // to publish the current global epoch + heartbeat. This is what permits
+  // the writer to know it's safe to physically recycle a block.
+  nanots_slot_guard _slot_guard;
 };
 
 #ifdef __cplusplus

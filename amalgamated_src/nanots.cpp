@@ -941,6 +941,141 @@ void s_to_entropy_id(const std::string& idS, uint8_t* id) {
 std::mutex current_stream_tags_lok;
 std::set<std::string> current_stream_tags;
 
+// ---------------------------------------------------------------------------
+// Epoch-Based Reclamation registry implementation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int64_t _now_us() {
+  using namespace std::chrono;
+  return duration_cast<microseconds>(
+             steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Path-keyed table of registries. Both writers and iterators look up here
+// at construction time. weak_ptr means entries naturally evaporate when the
+// last writer and iterator on a file are destroyed.
+std::mutex                                                    g_registry_table_mu;
+std::map<std::string, std::weak_ptr<nanots_epoch_registry>>   g_registry_table;
+
+}  // namespace
+
+nanots_epoch_registry::Slot& nanots_epoch_registry::slot(uint32_t id) {
+  // The slot's address is stable once allocated (unique_ptr in a vector).
+  // We still take the lock so concurrent grows are safe.
+  std::lock_guard<std::mutex> g(_slots_mu);
+  return *_slots[id];
+}
+
+uint32_t nanots_epoch_registry::acquire_slot() {
+  std::lock_guard<std::mutex> g(_slots_mu);
+
+  // First try to reuse an INACTIVE slot.
+  for (size_t i = 0; i < _slots.size(); ++i) {
+    if (_slots[i]->epoch.load(std::memory_order_relaxed) == INACTIVE) {
+      // Mark acquired with a temporary 0 epoch; caller will overwrite via
+      // op_begin().
+      _slots[i]->epoch.store(0, std::memory_order_relaxed);
+      return static_cast<uint32_t>(i);
+    }
+  }
+
+  // No free slot; grow.
+  _slots.emplace_back(std::make_unique<Slot>());
+  _slots.back()->epoch.store(0, std::memory_order_relaxed);
+  return static_cast<uint32_t>(_slots.size() - 1);
+}
+
+void nanots_epoch_registry::release_slot(uint32_t id) {
+  std::lock_guard<std::mutex> g(_slots_mu);
+  if (id < _slots.size()) {
+    _slots[id]->epoch.store(INACTIVE, std::memory_order_release);
+  }
+}
+
+bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
+                                        int64_t  now_us) const {
+  std::lock_guard<std::mutex> g(_slots_mu);
+  for (const auto& slot_ptr : _slots) {
+    uint64_t e = slot_ptr->epoch.load(std::memory_order_acquire);
+    if (e == INACTIVE) continue;
+    if (e > retired_epoch) continue;
+
+    // Slot is at-or-before the retire. Check liveness via heartbeat.
+    int64_t hb = slot_ptr->heartbeat_us.load(std::memory_order_relaxed);
+    if (now_us - hb > NANOTS_HEARTBEAT_TIMEOUT_US) continue;  // dead, ignore
+
+    return false;  // active reader still pinning this retire
+  }
+  return true;
+}
+
+std::shared_ptr<nanots_epoch_registry>
+nanots_epoch_registry::get_or_create(const std::string& file_path) {
+  std::lock_guard<std::mutex> g(g_registry_table_mu);
+
+  auto it = g_registry_table.find(file_path);
+  if (it != g_registry_table.end()) {
+    if (auto sp = it->second.lock()) return sp;
+    // weak_ptr expired; fall through and create a new one.
+  }
+
+  auto sp = std::make_shared<nanots_epoch_registry>();
+  g_registry_table[file_path] = sp;
+  return sp;
+}
+
+// ---------------------------------------------------------------------------
+// nanots_slot_guard
+// ---------------------------------------------------------------------------
+
+nanots_slot_guard::nanots_slot_guard(
+    std::shared_ptr<nanots_epoch_registry> registry)
+    : _registry(std::move(registry)) {
+  if (_registry) {
+    _slot_id = _registry->acquire_slot();
+    op_begin();  // publish initial epoch + heartbeat
+  }
+}
+
+nanots_slot_guard::~nanots_slot_guard() { _release(); }
+
+nanots_slot_guard::nanots_slot_guard(nanots_slot_guard&& other) noexcept
+    : _registry(std::move(other._registry)), _slot_id(other._slot_id) {
+  other._slot_id = UINT32_MAX;
+}
+
+nanots_slot_guard& nanots_slot_guard::operator=(
+    nanots_slot_guard&& other) noexcept {
+  if (this != &other) {
+    _release();
+    _registry      = std::move(other._registry);
+    _slot_id       = other._slot_id;
+    other._slot_id = UINT32_MAX;
+  }
+  return *this;
+}
+
+void nanots_slot_guard::op_begin() {
+  if (_slot_id == UINT32_MAX) return;
+  auto& s = _registry->slot(_slot_id);
+  uint64_t e = _registry->global_epoch_load();
+  s.epoch.store(e, std::memory_order_release);
+  s.heartbeat_us.store(_now_us(), std::memory_order_relaxed);
+}
+
+void nanots_slot_guard::_release() noexcept {
+  if (_slot_id != UINT32_MAX && _registry) {
+    _registry->release_slot(_slot_id);
+    _slot_id = UINT32_MAX;
+  }
+  _registry.reset();
+}
+
+// ---------------------------------------------------------------------------
+
 static uint32_t _round_to_64k_boundary(uint32_t requested_size) {
   const uint32_t BOUNDARY = 65536;  // 64KB
 
@@ -1193,25 +1328,9 @@ static std::optional<block> _db_get_free_block(const nts_sqlite_conn& conn) {
   return block{block_id, std::stoll(row["idx"].value())};
 }
 
-static std::optional<block> _db_get_block(const nts_sqlite_conn& conn,
-                                          bool auto_reclaim,
-                                          nanots_writer* writer_for_growth) {
-  // 1. Try to reuse a previously-freed block.
-  if (auto b = _db_get_free_block(conn)) return b;
-
-  // 2. In growable mode (and not yet at the cap), extend the file.
-  //    Growth is preferred over reclaim: the user opted into growable
-  //    because they'd rather use more disk than lose old data.
-  if (writer_for_growth && writer_for_growth->is_growable()) {
-    if (auto b = writer_for_growth->_grow_blocks(conn)) return b;
-  }
-
-  // 3. Fall back to recycling the oldest finalized block.
-  if (auto_reclaim)
-    return _db_reclaim_oldest_used_block(conn);
-
-  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
-}
+// (Block acquisition logic moved to nanots_writer::_acquire_writable_block,
+//  which composes _db_get_free_block / _grow_blocks / _db_reclaim_oldest_used_block
+//  with the EBR limbo/ready machinery.)
 
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
                                                  const std::string& stream_tag,
@@ -1355,7 +1474,8 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       // new allocate() always writes 0 here, so legacy preallocated files are
       // unaffected.
       _max_blocks(*(uint32_t*)(_file_header_p + 8)),
-      _auto_reclaim(auto_reclaim) {
+      _auto_reclaim(auto_reclaim),
+      _epoch(nanots_epoch_registry::get_or_create(file_name)) {
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
@@ -1446,6 +1566,94 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
   return wctx;
 }
 
+void nanots_writer::_scan_limbo() {
+  int64_t now = _now_us();
+  std::lock_guard<std::mutex> g(_limbo_mu);
+  // Front-of-deque ordering by retired_epoch is monotonic (every retire
+  // bumps global_epoch), so once the front is blocked, everything behind
+  // it is too.
+  while (!_limbo.empty()) {
+    const auto& front = _limbo.front();
+    if (!_epoch->can_recycle(front.retired_epoch, now)) break;
+    _ready.push_back(front);
+    _limbo.pop_front();
+  }
+}
+
+block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
+  // 1. Try the ready queue (limbo entries that have already cleared EBR).
+  {
+    std::lock_guard<std::mutex> g(_limbo_mu);
+    if (!_ready.empty()) {
+      auto e = _ready.front();
+      _ready.pop_front();
+      return block{e.block_id, e.block_idx};
+    }
+  }
+
+  // 2. Try a truly free block.
+  if (auto b = _db_get_free_block(conn)) {
+    return *b;
+  }
+
+  // 3. Growable: extend the file.
+  if (is_growable()) {
+    if (auto b = _grow_blocks(conn)) {
+      return *b;
+    }
+  }
+
+  // 4. Auto-reclaim: retire blocks into limbo and consume from ready.
+  if (_auto_reclaim) {
+    constexpr int MAX_RETRIES = 100;
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+      // Cap check before retiring.
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        if (_limbo.size() >= LIMBO_MAX_ENTRIES) {
+          throw nanots_exception(
+              NANOTS_EC_NO_FREE_BLOCKS,
+              "EBR limbo cap exceeded; pinned readers blocking reclaim.",
+              __FILE__, __LINE__);
+        }
+      }
+
+      // Retire one block (SQL: delete its segment_block, mark reserved).
+      auto victim = _db_reclaim_oldest_used_block(conn);
+      if (!victim) {
+        // Nothing finalized to retire (either no blocks at all, or every
+        // remaining block is still being actively written). Fall through
+        // to the throw below.
+        break;
+      }
+
+      uint64_t retired_epoch = _epoch->global_epoch_bump();
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        _limbo.push_back({victim->id, victim->idx, retired_epoch});
+      }
+
+      // Try to migrate cleared entries to ready and consume one.
+      _scan_limbo();
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        if (!_ready.empty()) {
+          auto e = _ready.front();
+          _ready.pop_front();
+          return block{e.block_id, e.block_idx};
+        }
+      }
+
+      // No ready block yet — readers haven't advanced their epochs. Yield
+      // briefly and retry.
+      std::this_thread::yield();
+    }
+  }
+
+  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.",
+                         __FILE__, __LINE__);
+}
+
 void nanots_writer::write(write_context& wctx,
                           const uint8_t* data,
                           size_t size,
@@ -1461,17 +1669,20 @@ void nanots_writer::write(write_context& wctx,
   if (!wctx.current_block) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      auto block = _db_get_block(conn, _auto_reclaim, this);
-      if (!block)
-        throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.", __FILE__, __LINE__);
+    // Acquire a physical block under EBR. The returned block is always safe
+    // to overwrite: it is either a freshly-free block, a newly-grown block,
+    // or a retired block that has cleared EBR safety. Block acquisition
+    // happens outside the transaction below because retiring may need
+    // multiple sub-transactions and yields while waiting on readers.
+    block phys = _acquire_writable_block(conn);
 
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
       uint8_t uuid[16];
       generate_entropy_id(uuid);
 
       wctx.current_block = _db_create_segment_block(
           conn, wctx.current_segment->id, wctx.current_segment->sequence,
-          block->id, block->idx, timestamp, 0, uuid);
+          phys.id, phys.idx, timestamp, 0, uuid);
 
       if (!wctx.current_block)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
@@ -1730,7 +1941,8 @@ nanots_reader::nanots_reader(const std::string& file_name)
     : _file_name(file_name),
       _file(nts_file::open(file_name, "r")),
       _block_size(),
-      _n_blocks() {
+      _n_blocks(),
+      _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
   auto mm = nts_memory_map(
       filenum(_file), 0, FILE_HEADER_BLOCK_SIZE, nts_memory_map::NMM_PROT_READ,
       nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
@@ -1760,6 +1972,10 @@ void nanots_reader::read(
     int64_t end_timestamp,
     const std::function<
         void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback) {
+  // EBR critical section spans the entire read(): the writer must not
+  // overwrite any block whose bytes the callback might dereference.
+  nanots_op_scope _op(_slot_guard);
+
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   auto stmt = db.prepare(
@@ -1938,7 +2154,8 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _current_block_start_ts(0),
       _current_block_end_ts(0),
       _valid(false),
-      _initialized(false) {
+      _initialized(false),
+      _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
   // Read block size from file header
   auto header_mm = nts_memory_map(
       filenum(_file), 0, FILE_HEADER_BLOCK_SIZE, nts_memory_map::NMM_PROT_READ,
@@ -2003,182 +2220,175 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   return &result.first->second;
 }
 
-block_info* nanots_iterator::_get_first_block() {
-  if (!_stmt_get_first_block.has_value())
-    _stmt_get_first_block.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "ORDER BY s.id ASC, sb.sequence ASC "
-        "LIMIT 1"));
+// ---------------------------------------------------------------------------
+// Timestamp index helpers
+// ---------------------------------------------------------------------------
 
-  auto& stmt = *_stmt_get_first_block;
-  stmt.reset();
+void nanots_iterator::_ensure_ts_index() {
+  if (!_ts_index_filled) _refresh_ts_index();
+}
+
+void nanots_iterator::_refresh_ts_index() {
+  auto& db = _ensure_db_connection();
+  // Single query for the entire stream's block list. Blocks within a stream
+  // have strictly monotonic start_ts (writer enforces non-decreasing
+  // timestamps via NANOTS_EC_NON_MONOTONIC_TIMESTAMP), so the result is
+  // already in start_ts order — no sort needed.
+  auto stmt = db.prepare(
+      "SELECT sb.segment_id, sb.sequence, "
+      "       sb.start_timestamp, sb.end_timestamp "
+      "FROM segments s "
+      "JOIN segment_blocks sb ON sb.segment_id = s.id "
+      "WHERE s.stream_tag = ? "
+      "ORDER BY s.id ASC, sb.sequence ASC");
   auto results = stmt.bind(1, _stream_tag).exec();
 
-  if (results.empty())
-    return nullptr;
+  _ts_index.clear();
+  _ts_index.reserve(results.size());
+  for (auto& row : results) {
+    BlockRange br;
+    br.segment_id = std::stoll(row["segment_id"].value());
+    br.sequence   = std::stoll(row["sequence"].value());
+    br.start_ts   = std::stoll(row["start_timestamp"].value());
+    br.end_ts     = std::stoll(row["end_timestamp"].value());
+    _ts_index.push_back(br);
+  }
+  _ts_index_filled = true;
+}
 
-  int64_t segment_id = std::stoll(results[0]["segment_id"].value());
-  int64_t sequence = std::stoll(results[0]["sequence"].value());
-  return _get_block_by_segment_and_sequence(segment_id, sequence);
+size_t nanots_iterator::_ts_index_find(int64_t ts) const {
+  // Prefer a block that covers ts.
+  auto it = std::upper_bound(_ts_index.begin(), _ts_index.end(), ts,
+      [](int64_t t, const BlockRange& br) { return t < br.start_ts; });
+  if (it != _ts_index.begin()) {
+    auto prev = std::prev(it);
+    if (ts >= prev->start_ts &&
+        (prev->end_ts == 0 || ts <= prev->end_ts)) {
+      return static_cast<size_t>(std::distance(_ts_index.begin(), prev));
+    }
+  }
+  // Fallback: first block with start_ts >= ts (matches old SQL semantics).
+  if (it != _ts_index.end()) {
+    return static_cast<size_t>(std::distance(_ts_index.begin(), it));
+  }
+  return _ts_index.size();
+}
+
+bool nanots_iterator::_ts_index_pos_is_valid() const {
+  return _ts_index_pos < _ts_index.size() &&
+         _ts_index[_ts_index_pos].segment_id == _current_segment_id &&
+         _ts_index[_ts_index_pos].sequence   == _current_block_sequence;
+}
+
+bool nanots_iterator::_ts_index_relocate() {
+  for (size_t i = 0; i < _ts_index.size(); ++i) {
+    if (_ts_index[i].segment_id == _current_segment_id &&
+        _ts_index[i].sequence   == _current_block_sequence) {
+      _ts_index_pos = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Block navigation (uses _ts_index for in-memory lookup, falls back to
+// SQL refresh on miss).
+// ---------------------------------------------------------------------------
+
+block_info* nanots_iterator::_get_first_block() {
+  _ensure_ts_index();
+  if (_ts_index.empty()) {
+    _refresh_ts_index();
+    if (_ts_index.empty()) return nullptr;
+  }
+  const auto& br = _ts_index.front();
+  auto* block = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+  if (block) _ts_index_pos = 0;
+  return block;
 }
 
 block_info* nanots_iterator::_get_last_block() {
-  if (!_stmt_get_last_block.has_value())
-    _stmt_get_last_block.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "ORDER BY s.id DESC, sb.sequence DESC "
-        "LIMIT 1"));
-
-  auto& stmt = *_stmt_get_last_block;
-  stmt.reset();
-  auto results = stmt.bind(1, _stream_tag).exec();
-
-  if (results.empty())
-    return nullptr;
-
-  int64_t segment_id = std::stoll(results[0]["segment_id"].value());
-  int64_t sequence = std::stoll(results[0]["sequence"].value());
-  return _get_block_by_segment_and_sequence(segment_id, sequence);
+  _ensure_ts_index();
+  if (_ts_index.empty()) {
+    _refresh_ts_index();
+    if (_ts_index.empty()) return nullptr;
+  }
+  size_t pos = _ts_index.size() - 1;
+  const auto& br = _ts_index[pos];
+  auto* block = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+  if (block) _ts_index_pos = pos;
+  return block;
 }
 
 block_info* nanots_iterator::_get_next_block() {
-  if (!_stmt_next_in_segment.has_value())
-    _stmt_next_in_segment.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.id, sb.sequence "
-        "FROM segment_blocks sb "
-        "WHERE sb.segment_id = ? AND sb.sequence > ? "
-        "ORDER BY sb.sequence ASC "
-        "LIMIT 1"));
+  _ensure_ts_index();
 
-  // First try to find next block within the same segment
-  auto& stmt_seg = *_stmt_next_in_segment;
-  stmt_seg.reset();
-  auto results = stmt_seg.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
-
-  if (!results.empty()) {
-    // Found next block in same segment
-    int64_t next_sequence = std::stoll(results[0]["sequence"].value());
-    return _get_block_by_segment_and_sequence(_current_segment_id, next_sequence);
+  // Verify our cached position; relocate if stale (e.g. after refresh).
+  if (!_ts_index_pos_is_valid() && !_ts_index_relocate()) {
+    _refresh_ts_index();
+    if (!_ts_index_relocate()) return nullptr;
   }
 
-  if (!_stmt_next_cross_segment.has_value())
-    _stmt_next_cross_segment.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "AND s.id > ? "
-        "ORDER BY s.id ASC, sb.sequence ASC "
-        "LIMIT 1"));
+  // Try advancing within the current snapshot.
+  if (_ts_index_pos + 1 < _ts_index.size()) {
+    const auto& br = _ts_index[_ts_index_pos + 1];
+    auto* block = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+    if (block) {
+      _ts_index_pos++;
+      return block;
+    }
+  }
 
-  // No more blocks in current segment, look for first block in next segment
-  auto& stmt_cross = *_stmt_next_cross_segment;
-  stmt_cross.reset();
-  results = stmt_cross.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
-
-  if (results.empty())
-    return nullptr;
-
-  int64_t next_segment_id = std::stoll(results[0]["segment_id"].value());
-  int64_t next_sequence = std::stoll(results[0]["sequence"].value());
-  return _get_block_by_segment_and_sequence(next_segment_id, next_sequence);
+  // Past the cached end OR cache-stale at the tail: refresh and retry once.
+  _refresh_ts_index();
+  if (!_ts_index_relocate()) return nullptr;
+  if (_ts_index_pos + 1 >= _ts_index.size()) return nullptr;
+  const auto& br = _ts_index[_ts_index_pos + 1];
+  auto* block = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+  if (block) _ts_index_pos++;
+  return block;
 }
 
 block_info* nanots_iterator::_get_prev_block() {
-  if (!_stmt_prev_in_segment.has_value())
-    _stmt_prev_in_segment.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.id, sb.sequence "
-        "FROM segment_blocks sb "
-        "WHERE sb.segment_id = ? AND sb.sequence < ? "
-        "ORDER BY sb.sequence DESC "
-        "LIMIT 1"));
+  _ensure_ts_index();
 
-  // First try to find previous block within the same segment
-  auto& stmt_seg = *_stmt_prev_in_segment;
-  stmt_seg.reset();
-  auto results = stmt_seg.bind(1, _current_segment_id).bind(2, _current_block_sequence).exec();
-
-  if (!results.empty()) {
-    // Found previous block in same segment
-    int64_t prev_sequence = std::stoll(results[0]["sequence"].value());
-    return _get_block_by_segment_and_sequence(_current_segment_id, prev_sequence);
+  if (!_ts_index_pos_is_valid() && !_ts_index_relocate()) {
+    _refresh_ts_index();
+    if (!_ts_index_relocate()) return nullptr;
   }
 
-  if (!_stmt_prev_cross_segment.has_value())
-    _stmt_prev_cross_segment.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "AND s.id < ? "
-        "ORDER BY s.id DESC, sb.sequence DESC "
-        "LIMIT 1"));
-
-  // No previous blocks in current segment, look for last block in previous segment
-  auto& stmt_cross = *_stmt_prev_cross_segment;
-  stmt_cross.reset();
-  results = stmt_cross.bind(1, _stream_tag).bind(2, _current_segment_id).exec();
-
-  if (results.empty())
-    return nullptr;
-
-  int64_t prev_segment_id = std::stoll(results[0]["segment_id"].value());
-  int64_t prev_sequence = std::stoll(results[0]["sequence"].value());
-  return _get_block_by_segment_and_sequence(prev_segment_id, prev_sequence);
+  if (_ts_index_pos == 0) return nullptr;
+  const auto& br = _ts_index[_ts_index_pos - 1];
+  auto* block = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+  if (block) _ts_index_pos--;
+  return block;
 }
 
 block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
-  if (!_stmt_find_block_containing.has_value())
-    _stmt_find_block_containing.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "AND sb.start_timestamp <= ? "
-        "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
-        "ORDER BY s.id ASC, sb.sequence ASC "
-        "LIMIT 1"));
+  _ensure_ts_index();
 
-  // First try to find block that contains the timestamp
-  auto& stmt_containing = *_stmt_find_block_containing;
-  stmt_containing.reset();
-  auto results =
-      stmt_containing.bind(1, _stream_tag).bind(2, timestamp).bind(3, timestamp).exec();
+  // Helper: given a position in _ts_index, look up its block_info. Returns
+  // nullptr if the block was reclaimed (catalog row gone) since we snapshotted.
+  auto try_at = [&](size_t pos) -> block_info* {
+    if (pos >= _ts_index.size()) return nullptr;
+    const auto& br = _ts_index[pos];
+    auto* b = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+    if (b) _ts_index_pos = pos;
+    return b;
+  };
 
-  if (!results.empty()) {
-    int64_t segment_id = std::stoll(results[0]["segment_id"].value());
-    int64_t sequence = std::stoll(results[0]["sequence"].value());
-    return _get_block_by_segment_and_sequence(segment_id, sequence);
-  }
+  // First attempt: snapshot we already have.
+  size_t pos = _ts_index_find(timestamp);
+  if (auto* b = try_at(pos)) return b;
 
-  if (!_stmt_find_block_ge.has_value())
-    _stmt_find_block_ge.emplace(_ensure_db_connection().prepare(
-        "SELECT sb.segment_id, sb.sequence "
-        "FROM segments s "
-        "JOIN segment_blocks sb ON sb.segment_id = s.id "
-        "WHERE s.stream_tag = ? "
-        "AND sb.start_timestamp >= ? "
-        "ORDER BY s.id ASC, sb.sequence ASC "
-        "LIMIT 1"));
-
-  // If no block contains the timestamp, find the first block with start_timestamp >=
-  // timestamp. This explicitly allows a find() before the first timsestamp to still find the first block.
-  auto& stmt_ge = *_stmt_find_block_ge;
-  stmt_ge.reset();
-  auto results2 = stmt_ge.bind(1, _stream_tag).bind(2, timestamp).exec();
-
-  if (results2.empty())
-    return nullptr;  // No blocks at all, or timestamp is after everything
-
-  int64_t segment_id = std::stoll(results2[0]["segment_id"].value());
-  int64_t sequence = std::stoll(results2[0]["sequence"].value());
-  return _get_block_by_segment_and_sequence(segment_id, sequence);
+  // Miss or stale: refresh and try once more. This catches:
+  //   (a) writer added blocks past the cached end
+  //   (b) writer reclaimed the block we matched and the new (segment, sequence)
+  //       at that idx isn't in our cache
+  _refresh_ts_index();
+  pos = _ts_index_find(timestamp);
+  return try_at(pos);
 }
 
 bool nanots_iterator::_load_block_data(block_info& block) {
@@ -2253,6 +2463,7 @@ bool nanots_iterator::_load_current_frame() {
 }
 
 nanots_iterator& nanots_iterator::operator++() {
+  nanots_op_scope _op(_slot_guard);
   if (!_valid)
     return *this;
 
@@ -2282,6 +2493,7 @@ nanots_iterator& nanots_iterator::operator++() {
 }
 
 nanots_iterator& nanots_iterator::operator--() {
+  nanots_op_scope _op(_slot_guard);
   if (!_valid)
     return *this;
 
@@ -2310,6 +2522,7 @@ nanots_iterator& nanots_iterator::operator--() {
 }
 
 bool nanots_iterator::find(int64_t timestamp) {
+  nanots_op_scope _op(_slot_guard);
   block_info* block = nullptr;
 
   // Fast path: if the target is within the already-loaded block's range, skip
@@ -2389,6 +2602,7 @@ bool nanots_iterator::find(int64_t timestamp) {
 }
 
 void nanots_iterator::reset() {
+  nanots_op_scope _op(_slot_guard);
   auto* first_block = _get_first_block();
   if (!first_block) {
     _valid = false;
@@ -2402,6 +2616,7 @@ void nanots_iterator::reset() {
 }
 
 bool nanots_iterator::seek_end() {
+  nanots_op_scope _op(_slot_guard);
   auto* block = _get_last_block();
   if (!block) {
     _valid = false;

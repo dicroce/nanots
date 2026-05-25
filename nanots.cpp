@@ -1138,7 +1138,8 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _current_block_start_ts(0),
       _current_block_end_ts(0),
       _valid(false),
-      _initialized(false) {
+      _initialized(false),
+      _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
   // Read block size from file header
   auto header_mm = nts_memory_map(
       filenum(_file), 0, FILE_HEADER_BLOCK_SIZE, nts_memory_map::NMM_PROT_READ,
@@ -1453,6 +1454,7 @@ bool nanots_iterator::_load_current_frame() {
 }
 
 nanots_iterator& nanots_iterator::operator++() {
+  nanots_op_scope _op(_slot_guard);
   if (!_valid)
     return *this;
 
@@ -1482,6 +1484,7 @@ nanots_iterator& nanots_iterator::operator++() {
 }
 
 nanots_iterator& nanots_iterator::operator--() {
+  nanots_op_scope _op(_slot_guard);
   if (!_valid)
     return *this;
 
@@ -1510,6 +1513,7 @@ nanots_iterator& nanots_iterator::operator--() {
 }
 
 bool nanots_iterator::find(int64_t timestamp) {
+  nanots_op_scope _op(_slot_guard);
   block_info* block = nullptr;
 
   // Fast path: if the target is within the already-loaded block's range, skip
@@ -1589,6 +1593,7 @@ bool nanots_iterator::find(int64_t timestamp) {
 }
 
 void nanots_iterator::reset() {
+  nanots_op_scope _op(_slot_guard);
   auto* first_block = _get_first_block();
   if (!first_block) {
     _valid = false;
@@ -1602,6 +1607,7 @@ void nanots_iterator::reset() {
 }
 
 bool nanots_iterator::seek_end() {
+  nanots_op_scope _op(_slot_guard);
   auto* block = _get_last_block();
   if (!block) {
     _valid = false;

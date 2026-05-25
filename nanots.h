@@ -186,6 +186,35 @@ class NANOTS_API nanots_slot_guard {
   uint32_t                                _slot_id{UINT32_MAX};
 };
 
+// ---------------------------------------------------------------------------
+// Scoped op marker.
+// ---------------------------------------------------------------------------
+//
+// Stack-only RAII wrapper that marks the start of one iterator operation.
+// Construction publishes the current global_epoch + heartbeat to the slot;
+// destruction is intentionally a no-op (the slot retains the published epoch
+// until the next op or the iterator is destroyed — that's what protects the
+// Frame::data validity contract). The point of this type is to make "this
+// scope is one iterator op" syntactically explicit at every call site, and to
+// reserve a hook for any future op-exit work (latency counters, debug
+// assertions, etc.) without churning all the call sites again.
+//
+class NANOTS_API nanots_op_scope {
+ public:
+  explicit nanots_op_scope(nanots_slot_guard& guard) : _guard(guard) {
+    _guard.op_begin();
+  }
+  ~nanots_op_scope() = default;
+
+  nanots_op_scope(const nanots_op_scope&)            = delete;
+  nanots_op_scope& operator=(const nanots_op_scope&) = delete;
+  nanots_op_scope(nanots_op_scope&&)                 = delete;
+  nanots_op_scope& operator=(nanots_op_scope&&)      = delete;
+
+ private:
+  nanots_slot_guard& _guard;
+};
+
 struct NANOTS_API write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;
@@ -397,6 +426,12 @@ class NANOTS_API nanots_iterator {
   std::optional<nts_sqlite_stmt> _stmt_prev_cross_segment;
   std::optional<nts_sqlite_stmt> _stmt_find_block_containing;
   std::optional<nts_sqlite_stmt> _stmt_find_block_ge;
+
+  // EBR slot. Acquired on construction, released on destruction. Each
+  // navigation operation (find, ++, --, reset, seek_end) calls op_begin()
+  // to publish the current global epoch + heartbeat. This is what permits
+  // the writer to know it's safe to physically recycle a block.
+  nanots_slot_guard _slot_guard;
 };
 
 #ifdef __cplusplus

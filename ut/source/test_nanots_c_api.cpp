@@ -45,15 +45,18 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
   const char* data3 = "Third frame with more data";
 
   nanots_ec_t result = nanots_writer_write(
-      writer, context, (const uint8_t*)data1, strlen(data1), 1000, 0x01);
+      writer, context, (const uint8_t*)data1, strlen(data1), 0x01, 1000,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   result = nanots_writer_write(writer, context, (const uint8_t*)data2,
-                               strlen(data2), 2000, 0x02);
+                               strlen(data2), 0x02, 2000,
+                               NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   result = nanots_writer_write(writer, context, (const uint8_t*)data3,
-                               strlen(data3), 3000, 0x03);
+                               strlen(data3), 0x03, 3000,
+                               NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   // Clean up writer resources
@@ -65,15 +68,16 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
   // Callback data collection
   struct callback_data {
     vector<string> frames;
-    vector<uint8_t> flags;
+    vector<uint32_t> flags;
     vector<int64_t> timestamps;
     vector<int64_t> block_sequences;
     vector<string> metadata_list;
   } cb_data;
 
   // Define callback function
-  auto callback = [](const uint8_t* data, size_t size, uint8_t flags,
-                     int64_t timestamp, int64_t block_sequence, const char* metadata,
+  auto callback = [](const uint8_t* data, size_t size, uint32_t flags,
+                     int64_t timestamp, int64_t /*secondary_key*/,
+                     int64_t block_sequence, const char* metadata,
                      void* user_data) {
     callback_data* cb = static_cast<callback_data*>(user_data);
     cb->frames.emplace_back(reinterpret_cast<const char*>(data), size);
@@ -122,7 +126,8 @@ void test_nanots_c_api::test_c_api_iterator_functionality() {
     string data = "Frame " + to_string(i);
     nanots_ec_t result =
         nanots_writer_write(writer, context, (const uint8_t*)data.c_str(),
-                            data.size(), 1000 + i * 100, (uint8_t)i);
+                            data.size(), (uint32_t)i, 1000 + i * 100,
+                            NANOTS_SEC_KEY_UNSET);
     RTF_ASSERT(result == NANOTS_EC_OK);
   }
 
@@ -226,7 +231,8 @@ void test_nanots_c_api::test_c_api_contiguous_segments() {
     string data = "Segment data " + to_string(i);
     nanots_ec_t result =
         nanots_writer_write(writer, context, (const uint8_t*)data.c_str(),
-                            data.size(), 1000 + i * 100, 0);
+                            data.size(), 0, 1000 + i * 100,
+                            NANOTS_SEC_KEY_UNSET);
     RTF_ASSERT(result == NANOTS_EC_OK);
   }
 
@@ -286,12 +292,14 @@ void test_nanots_c_api::test_c_api_error_handling() {
 
   // Write first frame
   nanots_ec_t result = nanots_writer_write(
-      writer, context, (const uint8_t*)data, strlen(data), 2000, 0);
+      writer, context, (const uint8_t*)data, strlen(data), 0, 2000,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   // Try to write frame with earlier timestamp (should fail)
   result = nanots_writer_write(writer, context, (const uint8_t*)data,
-                               strlen(data), 1000, 0);
+                               strlen(data), 0, 1000,
+                               NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_NON_MONOTONIC_TIMESTAMP);
 
   nanots_write_context_destroy(context);
@@ -315,11 +323,13 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
   const char* data2 = "Stream 2 data";
 
   nanots_ec_t result = nanots_writer_write(
-      writer, context1, (const uint8_t*)data1, strlen(data1), 1000, 1);
+      writer, context1, (const uint8_t*)data1, strlen(data1), 1, 1000,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   result = nanots_writer_write(writer, context2, (const uint8_t*)data2,
-                               strlen(data2), 1100, 2);
+                               strlen(data2), 2, 1100,
+                               NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   nanots_write_context_destroy(context1);
@@ -332,8 +342,9 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
 
   // Test stream1
   vector<string> stream1_data;
-  auto callback1 = [](const uint8_t* data, size_t size, uint8_t flags,
-                      int64_t timestamp, int64_t block_sequence, const char* metadata,
+  auto callback1 = [](const uint8_t* data, size_t size, uint32_t flags,
+                      int64_t timestamp, int64_t /*secondary_key*/,
+                      int64_t block_sequence, const char* metadata,
                       void* user_data) {
     vector<string>* frames = static_cast<vector<string>*>(user_data);
     frames->emplace_back(reinterpret_cast<const char*>(data), size);
@@ -377,26 +388,32 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
   
   // stream_alpha: 1000-1200
   nanots_ec_t result = nanots_writer_write(
-      writer, context1, (const uint8_t*)data, strlen(data), 1000, 0);
+      writer, context1, (const uint8_t*)data, strlen(data), 0, 1000,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
   result = nanots_writer_write(
-      writer, context1, (const uint8_t*)data, strlen(data), 1200, 0);
+      writer, context1, (const uint8_t*)data, strlen(data), 0, 1200,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   // stream_beta: 1500-1700
   result = nanots_writer_write(
-      writer, context2, (const uint8_t*)data, strlen(data), 1500, 0);
+      writer, context2, (const uint8_t*)data, strlen(data), 0, 1500,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
   result = nanots_writer_write(
-      writer, context2, (const uint8_t*)data, strlen(data), 1700, 0);
+      writer, context2, (const uint8_t*)data, strlen(data), 0, 1700,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   // stream_gamma: 2000-2200
   result = nanots_writer_write(
-      writer, context3, (const uint8_t*)data, strlen(data), 2000, 0);
+      writer, context3, (const uint8_t*)data, strlen(data), 0, 2000,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
   result = nanots_writer_write(
-      writer, context3, (const uint8_t*)data, strlen(data), 2200, 0);
+      writer, context3, (const uint8_t*)data, strlen(data), 0, 2200,
+      NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   nanots_write_context_destroy(context1);

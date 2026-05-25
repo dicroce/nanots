@@ -58,12 +58,12 @@ void test_nanots::test_nanots_basic() {
   {
     auto wctx = db.create_write_context("test_stream", "test metadata");
 
-    db.write(wctx, (uint8_t*)frame1_data.c_str(), (uint32_t)frame1_data.size(),
-             1000, 0x01);
-    db.write(wctx, (uint8_t*)frame2_data.c_str(), (uint32_t)frame2_data.size(),
-             2000, 0x02);
-    db.write(wctx, (uint8_t*)frame3_data.c_str(), (uint32_t)frame3_data.size(),
-             3000, 0x03);
+    db.write(wctx, (uint8_t*)frame1_data.c_str(), (uint32_t)frame1_data.size(), 0x01,
+             1000);
+    db.write(wctx, (uint8_t*)frame2_data.c_str(), (uint32_t)frame2_data.size(), 0x02,
+             2000);
+    db.write(wctx, (uint8_t*)frame3_data.c_str(), (uint32_t)frame3_data.size(), 0x03,
+             3000);
   }
 
   // Read back using iterator
@@ -112,8 +112,8 @@ void test_nanots::test_nanots_iterator_find() {
     for (int i = 0; i < 10; i++) {
       std::string data = "frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 500);  // 1000, 1500, 2000, 2500, ...
-      db.write(wctx, (uint8_t*)data.c_str(), (uint32_t)data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), (uint32_t)data.size(),
+               (uint8_t)i, timestamp);
     }
 
     auto after = std::chrono::steady_clock::now();
@@ -163,11 +163,11 @@ void test_nanots::test_nanots_multiple_streams() {
       std::string meta_data = "sensor_" + std::to_string(i);
 
       db.write(video_ctx, (uint8_t*)video_data.c_str(),
-               (uint32_t)video_data.size(), base_timestamp, 0x01);
+               (uint32_t)video_data.size(), 0x01, base_timestamp);
       db.write(audio_ctx, (uint8_t*)audio_data.c_str(),
-               (uint32_t)audio_data.size(), base_timestamp + 10, 0x02);
+               (uint32_t)audio_data.size(), 0x02, base_timestamp + 10);
       db.write(metadata_ctx, (uint8_t*)meta_data.c_str(),
-               (uint32_t)meta_data.size(), base_timestamp + 20, 0x03);
+               (uint32_t)meta_data.size(), 0x03, base_timestamp + 20);
     }
   }
 
@@ -229,8 +229,8 @@ void test_nanots::test_nanots_reader_time_range() {
     for (int i = 0; i < 20; i++) {
       std::string data = "frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 100);  // 1000 to 2900
-      db.write(wctx, (uint8_t*)data.c_str(), (uint32_t)data.size(), timestamp,
-               (uint8_t)(i % 256));
+      db.write(wctx, (uint8_t*)data.c_str(), (uint32_t)data.size(),
+               (uint8_t)(i % 256), timestamp);
     }
   }
 
@@ -241,8 +241,9 @@ void test_nanots::test_nanots_reader_time_range() {
 
   // Read middle portion (1500 to 2200)
   reader.read("test_stream", 1500, 2200,
-              [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t timestamp, int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) {
                 std::string frame_data((char*)data, size);
                 frames_read.push_back({timestamp, frame_data});
               });
@@ -257,8 +258,9 @@ void test_nanots::test_nanots_reader_time_range() {
   // Test reading from beginning
   frames_read.clear();
   reader.read("test_stream", 0, 1200,
-              [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t timestamp, int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) {
                 std::string frame_data((char*)data, size);
                 frames_read.push_back({timestamp, frame_data});
               });
@@ -277,8 +279,8 @@ void test_nanots::test_nanots_iterator_bidirectional() {
     for (int i = 0; i < 10; i++) {
       std::string data = "data_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
   }
 
@@ -327,7 +329,7 @@ void test_nanots::test_nanots_large_frames() {
       }
 
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, large_data.data(), frame_size, timestamp, (uint8_t)i);
+      db.write(wctx, large_data.data(), frame_size, (uint8_t)i, timestamp);
     }
   }
 
@@ -367,7 +369,7 @@ void test_nanots::test_nanots_edge_cases() {
   {
     auto wctx = db.create_write_context("single_stream", "single frame test");
     std::string data = "single_frame";
-    db.write(wctx, (uint8_t*)data.c_str(), data.size(), 1000, 0x01);
+    db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x01, 1000);
   }
 
   {
@@ -381,7 +383,7 @@ void test_nanots::test_nanots_edge_cases() {
   // Test zero-sized frame (if allowed)
   {
     auto wctx = db.create_write_context("zero_stream", "zero size test");
-    db.write(wctx, nullptr, 0, 2000, 0x00);
+    db.write(wctx, nullptr, 0, 0x00, 2000);
   }
 
   {
@@ -402,7 +404,7 @@ void test_nanots::test_nanots_cross_segment_iteration() {
     for (int i = 0; i < 5; i++) {
       std::string data = "seg1_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 100);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x01);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x01, timestamp);
     }
   }
 
@@ -412,7 +414,7 @@ void test_nanots::test_nanots_cross_segment_iteration() {
     for (int i = 0; i < 5; i++) {
       std::string data = "seg2_frame_" + std::to_string(i);
       uint64_t timestamp = 2000 + (i * 100);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x02);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x02, timestamp);
     }
   }
 
@@ -422,7 +424,7 @@ void test_nanots::test_nanots_cross_segment_iteration() {
     for (int i = 0; i < 5; i++) {
       std::string data = "seg3_frame_" + std::to_string(i);
       uint64_t timestamp = 3000 + (i * 100);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x03);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x03, timestamp);
     }
   }
 
@@ -537,15 +539,15 @@ void test_nanots::test_nanots_monotonic_timestamp_validation() {
   std::string data3 = "frame3";
 
   // Write first frame
-  db.write(wctx, (uint8_t*)data1.c_str(), data1.size(), 1000, 0x01);
+  db.write(wctx, (uint8_t*)data1.c_str(), data1.size(), 0x01, 1000);
 
   // Write second frame with higher timestamp (should succeed)
-  db.write(wctx, (uint8_t*)data2.c_str(), data2.size(), 2000, 0x02);
+  db.write(wctx, (uint8_t*)data2.c_str(), data2.size(), 0x02, 2000);
 
   // Try to write with equal timestamp (should throw)
   bool caught_exception = false;
   try {
-    db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 2000, 0x03);
+    db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 0x03, 2000);
   } catch (const std::exception&) {
     caught_exception = true;
   }
@@ -554,14 +556,14 @@ void test_nanots::test_nanots_monotonic_timestamp_validation() {
   // Try to write with lower timestamp (should throw)
   caught_exception = false;
   try {
-    db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 1500, 0x03);
+    db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 0x03, 1500);
   } catch (const std::exception&) {
     caught_exception = true;
   }
   RTF_ASSERT(caught_exception);
 
   // Write with higher timestamp (should succeed)
-  db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 3000, 0x03);
+  db.write(wctx, (uint8_t*)data3.c_str(), data3.size(), 0x03, 3000);
 
   // Verify only valid frames are present
   nanots_iterator iter("nanots_test_4mb.nts", "test_stream");
@@ -591,8 +593,8 @@ void test_nanots::test_nanots_performance_baseline() {
 
     for (int i = 0; i < num_frames; i++) {
       uint64_t timestamp = 1000 + i;
-      db.write(wctx, test_data.data(), frame_size, timestamp,
-               (uint8_t)(i % 256));
+      db.write(wctx, test_data.data(), frame_size,
+               (uint8_t)(i % 256), timestamp);
     }
   }
 
@@ -643,8 +645,8 @@ void test_nanots::test_nanots_concurrent_readers() {
     for (int i = 0; i < 100; i++) {
       std::string data = "concurrent_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 100);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)(i % 256));
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)(i % 256), timestamp);
     }
   }
 
@@ -686,8 +688,8 @@ void test_nanots::test_nanots_metadata_integrity() {
     auto video_ctx = db.create_write_context("video", video_metadata);
     auto audio_ctx = db.create_write_context("audio", audio_metadata);
 
-    db.write(video_ctx, (uint8_t*)"video1", 6, 1000, 0x01);
-    db.write(audio_ctx, (uint8_t*)"audio1", 6, 1010, 0x02);
+    db.write(video_ctx, (uint8_t*)"video1", 6, 0x01, 1000);
+    db.write(audio_ctx, (uint8_t*)"audio1", 6, 0x02, 1010);
   }
 
   // Verify metadata is preserved during reads
@@ -701,8 +703,9 @@ void test_nanots::test_nanots_metadata_integrity() {
   // You may need to modify based on your actual metadata access API
 
   reader.read("video", 0, 2000,
-              [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t timestamp, int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) {
                 // Now we can actually verify the metadata
                 if (metadata == "codec=h264,resolution=1920x1080,fps=30") {
                   video_metadata_correct = true;
@@ -711,8 +714,9 @@ void test_nanots::test_nanots_metadata_integrity() {
 
   reader.read(
       "audio", 0, 2000,
-      [&](const uint8_t* data, size_t size, uint8_t flags, uint64_t timestamp,
-          uint64_t block_sequence, const std::string& metadata) { 
+      [&](const uint8_t* data, size_t size, uint32_t flags, int64_t timestamp,
+          int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) { 
             if (metadata == "codec=aac,samplerate=44100,channels=2") {
               audio_metadata_correct = true;
             }
@@ -741,8 +745,8 @@ void test_nanots::test_nanots_block_exhaustion() {
     for (int i = 0; i < 100 && !write_failed; i++) {
       try {
         uint64_t timestamp = 1000 + (i * 1000);
-        db.write(wctx, large_data.data(), large_frame_size, timestamp,
-                 (uint8_t)i);
+        db.write(wctx, large_data.data(), large_frame_size,
+                 (uint8_t)i, timestamp);
         successful_writes++;
       } catch (const std::exception&) {
         printf("Write failed after %d frames.\n", successful_writes);
@@ -793,8 +797,8 @@ void test_nanots::test_nanots_block_filling_and_transition() {
     // Write enough to trigger at least one block transition
     for (int i = 0; i < 20; i++) {  // Reduced count to avoid exhausting blocks
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, large_data.data(), large_frame_size, timestamp,
-               (uint8_t)(i % 256));
+      db.write(wctx, large_data.data(), large_frame_size,
+               (uint8_t)(i % 256), timestamp);
       frames_written++;
     }
 
@@ -852,8 +856,8 @@ void test_nanots::test_nanots_sparse_timestamp_seeking() {
 
     for (size_t i = 0; i < timestamps.size(); i++) {
       std::string data = "sparse_frame_" + std::to_string(i);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamps[i],
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamps[i]);
     }
   }
 
@@ -906,8 +910,8 @@ void test_nanots::test_nanots_write_context_lifecycle() {
       std::string data = "batch1_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
 
     // Write second batch (continuing same context - proper way)
@@ -915,8 +919,8 @@ void test_nanots::test_nanots_write_context_lifecycle() {
       std::string data = "batch2_frame_" + std::to_string(i);
       uint64_t timestamp = 10000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
 
     // Write third batch (continuing same context)
@@ -924,8 +928,8 @@ void test_nanots::test_nanots_write_context_lifecycle() {
       std::string data = "batch3_frame_" + std::to_string(i);
       uint64_t timestamp = 20000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
     // wctx destructor will finalize the final block
   }
@@ -975,12 +979,12 @@ void test_nanots::test_nanots_multiple_streams_separate_writers() {
       std::string audio_data = "audio_" + std::to_string(i);
       std::string sensor_data = "sensor_" + std::to_string(i);
 
-      db.write(video_ctx, (uint8_t*)video_data.c_str(), video_data.size(),
-               base_timestamp, 0x01);
-      db.write(audio_ctx, (uint8_t*)audio_data.c_str(), audio_data.size(),
-               base_timestamp + 10, 0x02);
-      db.write(data_ctx, (uint8_t*)sensor_data.c_str(), sensor_data.size(),
-               base_timestamp + 20, 0x03);
+      db.write(video_ctx, (uint8_t*)video_data.c_str(), video_data.size(), 0x01,
+               base_timestamp);
+      db.write(audio_ctx, (uint8_t*)audio_data.c_str(), audio_data.size(), 0x02,
+               base_timestamp + 10);
+      db.write(data_ctx, (uint8_t*)sensor_data.c_str(), sensor_data.size(), 0x03,
+               base_timestamp + 20);
     }
   }
 
@@ -1012,7 +1016,7 @@ void test_nanots::test_nanots_invalid_multiple_writers_same_stream() {
   nanots_writer db("nanots_test_4mb.nts", false);
   
   auto ctx1 = db.create_write_context("shared_stream", "first writer");
-  db.write(ctx1, (uint8_t*)"frame1", 6, 1000, 0x01);
+  db.write(ctx1, (uint8_t*)"frame1", 6, 0x01, 1000);
 
   bool second_writer_threw = false;
   nanots_ec_t ec = NANOTS_EC_OK;
@@ -1045,8 +1049,8 @@ void test_nanots::test_nanots_multiple_segments_same_stream() {
       std::string data = "reuse_data_batch1_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
 
     // Write second batch (continuing same context)
@@ -1054,8 +1058,8 @@ void test_nanots::test_nanots_multiple_segments_same_stream() {
       std::string data = "reuse_data_batch2_" + std::to_string(i);
       uint64_t timestamp = 10000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
 
     // Write third batch (continuing same context)
@@ -1063,8 +1067,8 @@ void test_nanots::test_nanots_multiple_segments_same_stream() {
       std::string data = "reuse_data_batch3_" + std::to_string(i);
       uint64_t timestamp = 20000 + (i * 1000);
       printf("Writing frame %s\n", data.c_str());
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
     // wctx destructor will finalize the final block
   }
@@ -1102,8 +1106,8 @@ void test_nanots::test_nanots_iterator_edge_navigation() {
     for (int i = 0; i < 10; i++) {
       std::string data = "edge_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
   }
 
@@ -1173,7 +1177,7 @@ void test_nanots::test_nanots_mixed_frame_sizes() {
       }
 
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, data.data(), size, timestamp, (uint8_t)i);
+      db.write(wctx, data.data(), size, (uint8_t)i, timestamp);
     }
   }
 
@@ -1213,8 +1217,8 @@ void test_nanots::test_nanots_reader_callback_exceptions() {
     for (int i = 0; i < 10; i++) {
       std::string data = "exception_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), timestamp,
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, timestamp);
     }
   }
 
@@ -1226,8 +1230,9 @@ void test_nanots::test_nanots_reader_callback_exceptions() {
 
   try {
     reader.read("exception_stream", 0, 20000,
-                [&](const uint8_t* data, size_t size, uint8_t flags,
-                    uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+                [&](const uint8_t* data, size_t size, uint32_t flags,
+                    int64_t timestamp, int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) {
                   frames_processed++;
 
                   if (frames_processed == 5) {
@@ -1273,8 +1278,8 @@ void test_nanots::test_nanots_high_frequency_writes() {
     for (int i = 0; i < num_frames; i++) {
       // Microsecond precision timestamps
       uint64_t timestamp = 1000000 + i;  // 1 microsecond apart
-      db.write(wctx, test_data.data(), frame_size, timestamp,
-               (uint8_t)(i % 256));
+      db.write(wctx, test_data.data(), frame_size,
+               (uint8_t)(i % 256), timestamp);
     }
   }
 
@@ -1339,8 +1344,8 @@ void test_nanots::test_nanots_timestamp_precision() {
 
     for (size_t i = 0; i < precise_timestamps.size(); i++) {
       std::string data = "precise_" + std::to_string(i);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), precise_timestamps[i],
-               (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(),
+               (uint8_t)i, precise_timestamps[i]);
     }
   }
 
@@ -1401,7 +1406,7 @@ void test_nanots::test_nanots_free_blocks() {
     std::vector<uint8_t> one_k_row(1024);
 
     for (int i = 1; i < 1024; i++) {
-      db.write(wctx, one_k_row.data(), one_k_row.size(), i, (uint8_t)i);
+      db.write(wctx, one_k_row.data(), one_k_row.size(), (uint8_t)i, i);
     }
   }
 
@@ -1457,8 +1462,9 @@ void test_nanots::test_nanots_free_blocks() {
   std::vector<uint64_t> remaining_timestamps;
 
   reader.read("delete_stream", 1, 1024,
-              [&](const uint8_t* data, size_t size, uint8_t flags,
-                  uint64_t timestamp, uint64_t block_sequence, const std::string& metadata) {
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t timestamp, int64_t /*secondary_key*/,
+                  int64_t block_sequence, const std::string& metadata) {
                 remaining_timestamps.push_back(timestamp);
               });
 
@@ -1493,7 +1499,7 @@ void test_nanots::test_nanots_query_contiguous_segments() {
     auto wctx = db.create_write_context("test_stream", "meta");
     std::vector<uint8_t> one_k_row(1024);
     for (int i = 1; i < 1024; i++) {
-      db.write(wctx, one_k_row.data(), one_k_row.size(), i, (uint8_t)i);
+      db.write(wctx, one_k_row.data(), one_k_row.size(), (uint8_t)i, i);
     }
   }
 
@@ -1520,21 +1526,21 @@ void test_nanots::test_nanots_query_stream_tags() {
     for (int i = 0; i < 5; i++) {
       std::string data = "video_frame_" + std::to_string(i);
       uint64_t timestamp = 1000 + (i * 1000);
-      db.write(video_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x01);
+      db.write(video_ctx, (uint8_t*)data.c_str(), data.size(), 0x01, timestamp);
     }
 
     // Write audio samples: 2000-6000 (overlaps with video)
     for (int i = 0; i < 5; i++) {
       std::string data = "audio_sample_" + std::to_string(i);
       uint64_t timestamp = 2000 + (i * 1000);
-      db.write(audio_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x02);
+      db.write(audio_ctx, (uint8_t*)data.c_str(), data.size(), 0x02, timestamp);
     }
 
     // Write metadata: 8000-12000 (non-overlapping)
     for (int i = 0; i < 5; i++) {
       std::string data = "sensor_" + std::to_string(i);
       uint64_t timestamp = 8000 + (i * 1000);
-      db.write(metadata_ctx, (uint8_t*)data.c_str(), data.size(), timestamp, 0x03);
+      db.write(metadata_ctx, (uint8_t*)data.c_str(), data.size(), 0x03, timestamp);
     }
   }
 
@@ -1603,7 +1609,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
     // Write frames with sequential timestamps starting at 10000
     for (int i = 0; i < total_frames; i++) {
       uint64_t timestamp = start_timestamp + i * 10;  // Space timestamps by 10
-      db.write(wctx, frame_data.data(), frame_size, timestamp, (uint8_t)(i % 256));
+      db.write(wctx, frame_data.data(), frame_size, (uint8_t)(i % 256), timestamp);
     }
   }
   
@@ -1745,14 +1751,14 @@ void test_nanots::test_nanots_iterator_block_transition_flag_search() {
       
       // Every 20th row has flags = 1, others have flags = 0
       // But skip the flagged frame at the block boundary to force cross-block search
-      uint8_t flags = (i % 20 == 0 && i != 120) ? 1 : 0;
+      uint32_t flags = (i % 20 == 0 && i != 120) ? 1 : 0;
       
       // Fill frame with unique pattern to verify integrity
       for (size_t j = 0; j < frame_size; j++) {
         frame_data[j] = (uint8_t)((i + j) % 256);
       }
       
-      db.write(wctx, frame_data.data(), frame_size, timestamp, flags);
+      db.write(wctx, frame_data.data(), frame_size, flags, timestamp);
       
       if (flags == 1) {
         printf("  Wrote flagged frame %d at timestamp %" PRIu64 "\n", i, timestamp);
@@ -1826,7 +1832,7 @@ void test_nanots::test_nanots_iterator_block_transition_flag_search() {
          iter->timestamp);
   
   while (iter.valid()) {
-    printf("  Step %d: timestamp=%" PRId64 ", flags=%d, block_sequence=%" PRId64 "\n", 
+    printf("  Step %d: timestamp=%" PRId64 ", flags=%u, block_sequence=%" PRId64 "\n",
            steps_backward, iter->timestamp, iter->flags, iter->block_sequence);
     
     if (iter->flags == 1) {
@@ -1882,14 +1888,14 @@ void test_nanots::test_nanots_iterator_performance_benchmark() {
     
     for (int i = 0; i < num_rows; i++) {
       uint64_t timestamp = start_timestamp + i;
-      uint8_t flags = (i % 30 == 0) ? 1 : 0;
+      uint32_t flags = (i % 30 == 0) ? 1 : 0;
       
       // Fill row with pattern for verification
       for (size_t j = 0; j < row_size; j++) {
         row_data[j] = (uint8_t)((i + j) % 256);
       }
       
-      db.write(wctx, row_data.data(), row_size, timestamp, flags);
+      db.write(wctx, row_data.data(), row_size, flags, timestamp);
     }
   }
   
@@ -1968,7 +1974,7 @@ void test_nanots::test_nanots_iterator_seek_end() {
     auto wctx = db.create_write_context("seek_end_stream", "seek_end test");
     for (int i = 0; i < 10; i++) {
       std::string data = "frame_" + std::to_string(i);
-      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 1000 + i * 100, (uint8_t)i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), (uint8_t)i, 1000 + i * 100);
     }
   }
 
@@ -2002,7 +2008,7 @@ void test_nanots::test_nanots_iterator_seek_end() {
       auto wctx = db.create_write_context("seek_end_multi", "segment 1");
       for (int i = 0; i < 5; i++) {
         std::string data = "seg1_" + std::to_string(i);
-        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 1000 + i * 100, 0x01);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x01, 1000 + i * 100);
       }
     }
 
@@ -2010,7 +2016,7 @@ void test_nanots::test_nanots_iterator_seek_end() {
       auto wctx = db.create_write_context("seek_end_multi", "segment 2");
       for (int i = 0; i < 5; i++) {
         std::string data = "seg2_" + std::to_string(i);
-        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 2000 + i * 100, 0x02);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x02, 2000 + i * 100);
       }
     }
 
@@ -2018,7 +2024,7 @@ void test_nanots::test_nanots_iterator_seek_end() {
       auto wctx = db.create_write_context("seek_end_multi", "segment 3");
       for (int i = 0; i < 5; i++) {
         std::string data = "seg3_" + std::to_string(i);
-        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 3000 + i * 100, 0x03);
+        db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x03, 3000 + i * 100);
       }
     }
   }
@@ -2067,7 +2073,7 @@ void test_nanots::test_nanots_growable_basic() {
     std::vector<uint8_t> data(frame_size, 0x5A);
 
     for (int i = 0; i < 200; i++) {
-      db.write(wctx, data.data(), frame_size, 1000 + i * 100, (uint8_t)(i & 0xff));
+      db.write(wctx, data.data(), frame_size, (uint8_t)(i & 0xff), 1000 + i * 100);
     }
   }
 
@@ -2114,7 +2120,7 @@ void test_nanots::test_nanots_growable_doubling() {
   std::vector<uint64_t> sizes;
   sizes.push_back(file_size(nts));
   for (int i = 0; i < 8; i++) {
-    db.write(wctx, data.data(), frame_size, 1000 + i, 0);
+    db.write(wctx, data.data(), frame_size, 0, 1000 + i);
     sizes.push_back(file_size(nts));
   }
 
@@ -2154,7 +2160,7 @@ void test_nanots::test_nanots_growable_max_cap() {
   bool threw = false;
   for (int i = 0; i < 20 && !threw; i++) {
     try {
-      db.write(wctx, data.data(), frame_size, 1000 + i, 0);
+      db.write(wctx, data.data(), frame_size, 0, 1000 + i);
       wrote++;
     } catch (const nanots_exception& e) {
       RTF_ASSERT(e.get_ec() == NANOTS_EC_NO_FREE_BLOCKS);
@@ -2171,4 +2177,592 @@ void test_nanots::test_nanots_growable_max_cap() {
 
   uint64_t final_size = file_size(nts);
   RTF_ASSERT(final_size == 64 * 1024 + (uint64_t)cap * block_size);
+}
+
+// --- Secondary key tests --------------------------------------------------
+
+// Basic: write frames with a secondary key, read them back, verify the key
+// round-trips through both the iterator and the reader.
+void test_nanots::test_nanots_secondary_key_basic() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  {
+    auto wctx = db.create_write_context("sk_stream", "secondary key test");
+    for (int i = 0; i < 10; i++) {
+      std::string data = "frame_" + std::to_string(i);
+      // sec_key advances by 7 each frame, distinct from timestamp pattern.
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0x01,
+               1000 + i * 100, /*sec_key=*/100 + i * 7);
+    }
+  }
+
+  // Iterator round-trip.
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_stream");
+  RTF_ASSERT(iter.has_secondary_key());
+  int i = 0;
+  while (iter.valid()) {
+    RTF_ASSERT(iter->timestamp == 1000 + i * 100);
+    RTF_ASSERT(iter->secondary_key == 100 + i * 7);
+    ++iter;
+    i++;
+  }
+  RTF_ASSERT(i == 10);
+
+  // Reader callback round-trip.
+  nanots_reader reader("nanots_test_4mb.nts");
+  int j = 0;
+  reader.read("sk_stream", 0, 100000,
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t timestamp, int64_t sec_key,
+                  int64_t block_seq, const std::string& meta) {
+                RTF_ASSERT(timestamp == 1000 + j * 100);
+                RTF_ASSERT(sec_key == 100 + j * 7);
+                j++;
+              });
+  RTF_ASSERT(j == 10);
+}
+
+// Verify find_by_secondary_key works the same way find(timestamp) does:
+// exact match, between-keys lands on next-higher, before-first lands on
+// first, after-last invalidates.
+void test_nanots::test_nanots_secondary_key_find() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  {
+    auto wctx = db.create_write_context("sk_find", "");
+    for (int i = 0; i < 10; i++) {
+      std::string data = "sk_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0,
+               1000 + i * 100, /*sec_key=*/1000 + i * 500);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_find");
+  RTF_ASSERT(iter.has_secondary_key());
+
+  // Exact match.
+  RTF_ASSERT(iter.find_by_secondary_key(2000));
+  RTF_ASSERT(iter->secondary_key == 2000);
+
+  // Between keys → next higher.
+  RTF_ASSERT(iter.find_by_secondary_key(2250));
+  RTF_ASSERT(iter->secondary_key == 2500);
+
+  // Before first.
+  RTF_ASSERT(iter.find_by_secondary_key(0));
+  RTF_ASSERT(iter->secondary_key == 1000);
+
+  // Past last.
+  RTF_ASSERT(!iter.find_by_secondary_key(100000));
+  RTF_ASSERT(!iter.valid());
+}
+
+// Mixing keyed and unkeyed writes on the same stream is rejected.
+void test_nanots::test_nanots_secondary_key_mismatch() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Case 1: stream is locked as "keyed" on first write; later unkeyed write
+  // throws.
+  {
+    auto wctx = db.create_write_context("sk_mismatch_a", "");
+    db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/42);
+
+    bool threw = false;
+    nanots_ec_t ec = NANOTS_EC_OK;
+    try {
+      db.write(wctx, (uint8_t*)"b", 1, 0, 1100);
+    } catch (const nanots_exception& e) {
+      threw = true;
+      ec = e.get_ec();
+    }
+    RTF_ASSERT(threw);
+    RTF_ASSERT(ec == NANOTS_EC_SECONDARY_KEY_MISMATCH);
+  }
+
+  // Case 2: stream locked as "unkeyed"; later keyed write throws.
+  {
+    auto wctx = db.create_write_context("sk_mismatch_b", "");
+    db.write(wctx, (uint8_t*)"a", 1, 0, 1000);
+
+    bool threw = false;
+    nanots_ec_t ec = NANOTS_EC_OK;
+    try {
+      db.write(wctx, (uint8_t*)"b", 1, 0, 1100, /*sec_key=*/99);
+    } catch (const nanots_exception& e) {
+      threw = true;
+      ec = e.get_ec();
+    }
+    RTF_ASSERT(threw);
+    RTF_ASSERT(ec == NANOTS_EC_SECONDARY_KEY_MISMATCH);
+  }
+
+  // Case 3: a new write_context on a previously-keyed stream must continue
+  // to be keyed; passing UNSET in the first write of the new context throws.
+  {
+    {
+      auto wctx = db.create_write_context("sk_mismatch_c", "");
+      db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/1);
+    }
+    auto wctx2 = db.create_write_context("sk_mismatch_c", "");
+    bool threw = false;
+    try {
+      db.write(wctx2, (uint8_t*)"b", 1, 0, 2000);
+    } catch (const nanots_exception& e) {
+      threw = true;
+      RTF_ASSERT(e.get_ec() == NANOTS_EC_SECONDARY_KEY_MISMATCH);
+    }
+    RTF_ASSERT(threw);
+  }
+}
+
+// Secondary key must be monotonic within a write context, same rule as
+// timestamps.
+void test_nanots::test_nanots_secondary_key_monotonic() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  auto wctx = db.create_write_context("sk_mono", "");
+
+  db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/100);
+  db.write(wctx, (uint8_t*)"b", 1, 0, 2000, /*sec_key=*/200);
+
+  bool threw = false;
+  nanots_ec_t ec = NANOTS_EC_OK;
+  try {
+    // Lower sec_key than previous; must throw even though ts is higher.
+    db.write(wctx, (uint8_t*)"c", 1, 0, 3000, /*sec_key=*/150);
+  } catch (const nanots_exception& e) {
+    threw = true;
+    ec = e.get_ec();
+  }
+  RTF_ASSERT(threw);
+  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY);
+
+  // Equal sec_key also rejected (strict monotonic).
+  threw = false;
+  try {
+    db.write(wctx, (uint8_t*)"d", 1, 0, 3000, /*sec_key=*/200);
+  } catch (const nanots_exception& e) {
+    threw = true;
+    ec = e.get_ec();
+  }
+  RTF_ASSERT(threw);
+  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY);
+
+  // Strictly greater sec_key succeeds.
+  db.write(wctx, (uint8_t*)"e", 1, 0, 3000, /*sec_key=*/300);
+}
+
+// A file with no v2 magic at offset 0 must be rejected on open. We synthesise
+// the legacy v1 header (block_size at offset 0, n_blocks at offset 4) and
+// verify the writer ctor throws NANOTS_EC_BAD_MAGIC.
+void test_nanots::test_nanots_v1_file_rejected() {
+  const char* nts = "nanots_legacy_v1.nts";
+  // Whack any leftovers.
+  if (rtf_file_exists(nts)) rtf_remove_file(nts);
+  std::string db_name = "nanots_legacy_v1.db";
+  if (rtf_file_exists(db_name.c_str())) rtf_remove_file(db_name.c_str());
+
+  // Create a tiny file that looks like a legacy v1 header: 4 byte block_size,
+  // 4 byte n_blocks. Padded out to 64KB.
+  {
+    auto f = nts_file::open(nts, "w+");
+    std::vector<uint8_t> hdr(FILE_HEADER_BLOCK_SIZE, 0);
+    *(uint32_t*)(hdr.data() + 0) = 64 * 1024;  // block_size
+    *(uint32_t*)(hdr.data() + 4) = 1;          // n_blocks
+    fwrite(hdr.data(), 1, hdr.size(), f);
+    // One empty block so the file has a sensible size.
+    std::vector<uint8_t> blk(64 * 1024, 0);
+    fwrite(blk.data(), 1, blk.size(), f);
+    f.close();
+  }
+
+  // nanots_writer ctor must reject it.
+  bool threw = false;
+  nanots_ec_t ec = NANOTS_EC_OK;
+  try {
+    nanots_writer w(nts, false);
+  } catch (const nanots_exception& e) {
+    threw = true;
+    ec = e.get_ec();
+  }
+  RTF_ASSERT(threw);
+  RTF_ASSERT(ec == NANOTS_EC_BAD_MAGIC);
+
+  // nanots_reader ctor must reject it too.
+  threw = false;
+  try {
+    nanots_reader r(nts);
+  } catch (const nanots_exception& e) {
+    threw = true;
+    ec = e.get_ec();
+  }
+  RTF_ASSERT(threw);
+  RTF_ASSERT(ec == NANOTS_EC_BAD_MAGIC);
+
+  // Cleanup.
+  if (rtf_file_exists(nts)) rtf_remove_file(nts);
+  if (rtf_file_exists(db_name.c_str())) rtf_remove_file(db_name.c_str());
+}
+
+// Force many frames so the stream spans multiple blocks, then exercise
+// find_by_secondary_key across block boundaries (the SQL-backed _ts_index
+// lookup) and verify ++/-- around the boundary.
+void test_nanots::test_nanots_secondary_key_cross_blocks() {
+  // 4 KB blocks → ~3 frames per block at 1 KB rows; 64 frames = ~22 blocks.
+  nanots_writer db("nanots_test_2048_4k_blocks.nts", false);
+
+  const int N = 64;
+  {
+    auto wctx = db.create_write_context("sk_cross", "");
+    std::vector<uint8_t> row(1024, 0xCC);
+    for (int i = 0; i < N; i++) {
+      // Distinctive: timestamp and sec_key advance at *different* rates so
+      // the two indexes can't accidentally substitute for each other.
+      db.write(wctx, row.data(), row.size(), 0,
+               /*ts=*/1000 + i * 10,
+               /*sec_key=*/500 + i * 73);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_2048_4k_blocks.nts", "sk_cross");
+  RTF_ASSERT(iter.has_secondary_key());
+
+  // Confirm we actually filled multiple blocks (otherwise this test isn't
+  // doing what it claims).
+  std::set<int64_t> blocks_seen;
+  iter.reset();
+  while (iter.valid()) {
+    blocks_seen.insert(iter->block_sequence);
+    ++iter;
+  }
+  printf("sk_cross blocks: %zu\n", blocks_seen.size());
+  RTF_ASSERT(blocks_seen.size() > 1);
+
+  // Walk every frame via find_by_secondary_key and verify we land on the
+  // right one. Frame i has sec_key = 500 + i*73.
+  for (int i = 0; i < N; i++) {
+    int64_t target = 500 + i * 73;
+    RTF_ASSERT(iter.find_by_secondary_key(target));
+    RTF_ASSERT(iter->secondary_key == target);
+    RTF_ASSERT(iter->timestamp == 1000 + i * 10);
+  }
+
+  // Find between two keys → next higher.
+  RTF_ASSERT(iter.find_by_secondary_key(500 + 5 * 73 + 1));
+  RTF_ASSERT(iter->secondary_key == 500 + 6 * 73);
+}
+
+// After a find_by_secondary_key, ++ and -- must walk by physical order
+// (which for monotonic streams is the same as sec-key order).
+void test_nanots::test_nanots_secondary_key_bidirectional() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  const int N = 20;
+  {
+    auto wctx = db.create_write_context("sk_bidi", "");
+    for (int i = 0; i < N; i++) {
+      std::string d = "bidi_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               /*ts=*/1000 + i, /*sec_key=*/100 + i * 11);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_bidi");
+
+  // Land in the middle by sec key.
+  RTF_ASSERT(iter.find_by_secondary_key(100 + 10 * 11));
+  RTF_ASSERT(iter->secondary_key == 100 + 10 * 11);
+
+  // Walk forward.
+  for (int i = 11; i < N; i++) {
+    ++iter;
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->secondary_key == 100 + i * 11);
+  }
+  ++iter;
+  RTF_ASSERT(!iter.valid());
+
+  // Reseek and walk backward.
+  RTF_ASSERT(iter.find_by_secondary_key(100 + 5 * 11));
+  for (int i = 4; i >= 0; i--) {
+    --iter;
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->secondary_key == 100 + i * 11);
+  }
+  --iter;
+  RTF_ASSERT(!iter.valid());
+}
+
+// Multiple write contexts (= multiple segments) on the same stream. All must
+// be keyed (locked by the first segment), and find/iterate must cross
+// segment boundaries cleanly.
+void test_nanots::test_nanots_secondary_key_multi_segment() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Segment 1.
+  {
+    auto wctx = db.create_write_context("sk_segs", "s1");
+    for (int i = 0; i < 5; i++) {
+      std::string d = "s1_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               1000 + i, /*sec_key=*/100 + i);
+    }
+  }
+  // Segment 2 (must remain keyed).
+  {
+    auto wctx = db.create_write_context("sk_segs", "s2");
+    for (int i = 0; i < 5; i++) {
+      std::string d = "s2_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               2000 + i, /*sec_key=*/200 + i);
+    }
+  }
+  // Segment 3.
+  {
+    auto wctx = db.create_write_context("sk_segs", "s3");
+    for (int i = 0; i < 5; i++) {
+      std::string d = "s3_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               3000 + i, /*sec_key=*/300 + i);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_segs");
+  RTF_ASSERT(iter.has_secondary_key());
+
+  // Find in segment 1.
+  RTF_ASSERT(iter.find_by_secondary_key(102));
+  RTF_ASSERT(iter->secondary_key == 102);
+  RTF_ASSERT(iter.current_metadata() == "s1");
+
+  // Find in segment 2.
+  RTF_ASSERT(iter.find_by_secondary_key(201));
+  RTF_ASSERT(iter->secondary_key == 201);
+  RTF_ASSERT(iter.current_metadata() == "s2");
+
+  // Find in segment 3.
+  RTF_ASSERT(iter.find_by_secondary_key(304));
+  RTF_ASSERT(iter->secondary_key == 304);
+  RTF_ASSERT(iter.current_metadata() == "s3");
+
+  // Find between segments — should land on first frame of next segment.
+  RTF_ASSERT(iter.find_by_secondary_key(150));
+  RTF_ASSERT(iter->secondary_key == 200);
+  RTF_ASSERT(iter.current_metadata() == "s2");
+
+  // Walk all 15 frames in order by repeatedly stepping forward from the
+  // very first key.
+  RTF_ASSERT(iter.find_by_secondary_key(0));
+  int seen = 0;
+  int64_t last_sk = -1;
+  while (iter.valid()) {
+    RTF_ASSERT(iter->secondary_key > last_sk);
+    last_sk = iter->secondary_key;
+    seen++;
+    ++iter;
+  }
+  RTF_ASSERT(seen == 15);
+}
+
+// On an unkeyed stream, find_by_secondary_key must fail cleanly.
+void test_nanots::test_nanots_secondary_key_unkeyed_stream_rejects_find() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  {
+    auto wctx = db.create_write_context("plain", "");
+    for (int i = 0; i < 5; i++) {
+      db.write(wctx, (uint8_t*)"x", 1, 0, 1000 + i);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "plain");
+  RTF_ASSERT(!iter.has_secondary_key());
+
+  // The iterator is valid (pointing at the first frame).
+  RTF_ASSERT(iter.valid());
+
+  // find_by_secondary_key returns false and invalidates the iterator.
+  RTF_ASSERT(!iter.find_by_secondary_key(123));
+  RTF_ASSERT(!iter.valid());
+
+  // Iterator can be recovered with reset().
+  iter.reset();
+  RTF_ASSERT(iter.valid());
+  RTF_ASSERT(iter->secondary_key == NANOTS_SEC_KEY_UNSET);
+}
+
+// Two streams in the same file: one keyed, one unkeyed. They must not
+// interfere with each other.
+void test_nanots::test_nanots_secondary_key_mixed_streams_same_file() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  {
+    auto keyed   = db.create_write_context("keyed", "k");
+    auto unkeyed = db.create_write_context("unkeyed", "u");
+    for (int i = 0; i < 5; i++) {
+      db.write(keyed, (uint8_t*)"k", 1, 0, 1000 + i, /*sec_key=*/10 + i);
+      db.write(unkeyed, (uint8_t*)"u", 1, 0, 2000 + i);
+    }
+  }
+
+  // Keyed stream: has_secondary_key true, find_by_secondary_key works.
+  {
+    nanots_iterator it("nanots_test_4mb.nts", "keyed");
+    RTF_ASSERT(it.has_secondary_key());
+    RTF_ASSERT(it.find_by_secondary_key(12));
+    RTF_ASSERT(it->secondary_key == 12);
+    RTF_ASSERT(it->timestamp == 1002);
+  }
+
+  // Unkeyed stream: has_secondary_key false, find_by_secondary_key fails.
+  {
+    nanots_iterator it("nanots_test_4mb.nts", "unkeyed");
+    RTF_ASSERT(!it.has_secondary_key());
+    RTF_ASSERT(it.valid());
+    RTF_ASSERT(it->secondary_key == NANOTS_SEC_KEY_UNSET);
+    RTF_ASSERT(!it.find_by_secondary_key(0));
+    // Normal timestamp seeking on the unkeyed stream still works.
+    it.reset();
+    RTF_ASSERT(it.find(2003));
+    RTF_ASSERT(it->timestamp == 2003);
+  }
+}
+
+// Sparse keys: huge gaps must still binary-search correctly.
+void test_nanots::test_nanots_secondary_key_sparse() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Keys span 0 .. 10^15 in geometric-ish steps.
+  std::vector<int64_t> keys = {
+      1, 100, 10000, 1000000, 100000000, 10000000000LL,
+      1000000000000LL, 100000000000000LL, 1000000000000000LL,
+  };
+  {
+    auto wctx = db.create_write_context("sk_sparse", "");
+    for (size_t i = 0; i < keys.size(); i++) {
+      std::string d = "sp_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               /*ts=*/1000 + (int64_t)i, /*sec_key=*/keys[i]);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_sparse");
+  RTF_ASSERT(iter.has_secondary_key());
+
+  // Exact matches.
+  for (size_t i = 0; i < keys.size(); i++) {
+    RTF_ASSERT(iter.find_by_secondary_key(keys[i]));
+    RTF_ASSERT(iter->secondary_key == keys[i]);
+  }
+
+  // Between-key seeks land on next higher.
+  RTF_ASSERT(iter.find_by_secondary_key(50));
+  RTF_ASSERT(iter->secondary_key == 100);
+  RTF_ASSERT(iter.find_by_secondary_key(99999));
+  RTF_ASSERT(iter->secondary_key == 1000000);
+  RTF_ASSERT(iter.find_by_secondary_key(999999999999LL));
+  RTF_ASSERT(iter->secondary_key == 1000000000000LL);
+
+  // Below the smallest → first.
+  RTF_ASSERT(iter.find_by_secondary_key(0));
+  RTF_ASSERT(iter->secondary_key == 1);
+
+  // Above the largest → invalid.
+  RTF_ASSERT(!iter.find_by_secondary_key(9999999999999999LL));
+  RTF_ASSERT(!iter.valid());
+}
+
+// Secondary keys are int64, signed. Negative keys and values close to
+// INT64_MAX must work. INT64_MIN is reserved as the "unset" sentinel and is
+// implicitly off-limits for keyed streams.
+void test_nanots::test_nanots_secondary_key_extreme_values() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  // Strictly increasing sequence of "interesting" int64 values.
+  std::vector<int64_t> keys = {
+      INT64_MIN + 1,        // smallest legal key (INT64_MIN is the sentinel)
+      -1000000000000LL,
+      -1,
+      0,
+      1,
+      1000000000000LL,
+      INT64_MAX - 1,
+      INT64_MAX,
+  };
+  {
+    auto wctx = db.create_write_context("sk_extreme", "");
+    for (size_t i = 0; i < keys.size(); i++) {
+      std::string d = "ex_" + std::to_string(i);
+      db.write(wctx, (uint8_t*)d.c_str(), d.size(), 0,
+               /*ts=*/1000 + (int64_t)i, keys[i]);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "sk_extreme");
+  RTF_ASSERT(iter.has_secondary_key());
+
+  // Round-trip each value.
+  for (size_t i = 0; i < keys.size(); i++) {
+    RTF_ASSERT(iter.find_by_secondary_key(keys[i]));
+    RTF_ASSERT(iter->secondary_key == keys[i]);
+  }
+
+  // Boundary: searching for INT64_MIN (= sentinel) on a keyed stream should
+  // land on the smallest real key (INT64_MIN + 1).
+  RTF_ASSERT(iter.find_by_secondary_key(INT64_MIN));
+  RTF_ASSERT(iter->secondary_key == INT64_MIN + 1);
+
+  // Going below INT64_MIN + 1 lands on the first real key (already the
+  // smallest, but exercise the lower-bound path).
+  RTF_ASSERT(iter.find_by_secondary_key(INT64_MIN + 1));
+  RTF_ASSERT(iter->secondary_key == INT64_MIN + 1);
+  // Step backwards from there → invalid.
+  --iter;
+  RTF_ASSERT(!iter.valid());
+
+  // Step forward from INT64_MAX (the last frame) → invalid.
+  RTF_ASSERT(iter.find_by_secondary_key(INT64_MAX));
+  ++iter;
+  RTF_ASSERT(!iter.valid());
+}
+
+// The reader callback must surface the secondary key for keyed streams,
+// and NANOTS_SEC_KEY_UNSET for unkeyed streams.
+void test_nanots::test_nanots_secondary_key_reader_callback() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  {
+    auto k = db.create_write_context("rk_keyed", "");
+    for (int i = 0; i < 4; i++) {
+      db.write(k, (uint8_t*)"x", 1, 0, 1000 + i, /*sec_key=*/500 + i);
+    }
+    auto u = db.create_write_context("rk_unkeyed", "");
+    for (int i = 0; i < 4; i++) {
+      db.write(u, (uint8_t*)"y", 1, 0, 2000 + i);
+    }
+  }
+
+  nanots_reader reader("nanots_test_4mb.nts");
+
+  // Keyed: every callback should see the right sec_key.
+  std::vector<int64_t> seen_keyed;
+  reader.read("rk_keyed", 0, 100000,
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t ts, int64_t sk,
+                  int64_t block_seq, const std::string& meta) {
+                seen_keyed.push_back(sk);
+              });
+  RTF_ASSERT(seen_keyed.size() == 4);
+  for (int i = 0; i < 4; i++) {
+    RTF_ASSERT(seen_keyed[i] == 500 + i);
+  }
+
+  // Unkeyed: every callback should see NANOTS_SEC_KEY_UNSET.
+  std::vector<int64_t> seen_unkeyed;
+  reader.read("rk_unkeyed", 0, 100000,
+              [&](const uint8_t* data, size_t size, uint32_t flags,
+                  int64_t ts, int64_t sk,
+                  int64_t block_seq, const std::string& meta) {
+                seen_unkeyed.push_back(sk);
+              });
+  RTF_ASSERT(seen_unkeyed.size() == 4);
+  for (auto sk : seen_unkeyed) {
+    RTF_ASSERT(sk == NANOTS_SEC_KEY_UNSET);
+  }
 }

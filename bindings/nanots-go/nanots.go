@@ -15,8 +15,9 @@ package nanots
 #include "../../amalgamated_src/nanots.h"
 
 // Callback bridge for Go
-extern void goReadCallback(const uint8_t* data, size_t size, uint8_t flags,
-                          int64_t timestamp, int64_t block_sequence,
+extern void goReadCallback(const uint8_t* data, size_t size, uint32_t flags,
+                          int64_t timestamp, int64_t secondary_key,
+                          int64_t block_sequence,
                           const char* metadata, void* user_data);
 */
 import "C"
@@ -32,21 +33,29 @@ import (
 type ErrorCode int
 
 const (
-	ErrOK                      ErrorCode = C.NANOTS_EC_OK
-	ErrCantOpen                ErrorCode = C.NANOTS_EC_CANT_OPEN
-	ErrSchema                  ErrorCode = C.NANOTS_EC_SCHEMA
-	ErrNoFreeBlocks            ErrorCode = C.NANOTS_EC_NO_FREE_BLOCKS
-	ErrInvalidBlockSize        ErrorCode = C.NANOTS_EC_INVALID_BLOCK_SIZE
-	ErrDuplicateStreamTag      ErrorCode = C.NANOTS_EC_DUPLICATE_STREAM_TAG
-	ErrUnableToCreateSegment   ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT
+	ErrOK                         ErrorCode = C.NANOTS_EC_OK
+	ErrCantOpen                   ErrorCode = C.NANOTS_EC_CANT_OPEN
+	ErrSchema                     ErrorCode = C.NANOTS_EC_SCHEMA
+	ErrNoFreeBlocks               ErrorCode = C.NANOTS_EC_NO_FREE_BLOCKS
+	ErrInvalidBlockSize           ErrorCode = C.NANOTS_EC_INVALID_BLOCK_SIZE
+	ErrDuplicateStreamTag         ErrorCode = C.NANOTS_EC_DUPLICATE_STREAM_TAG
+	ErrUnableToCreateSegment      ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT
 	ErrUnableToCreateSegmentBlock ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK
-	ErrNonMonotonicTimestamp   ErrorCode = C.NANOTS_EC_NON_MONOTONIC_TIMESTAMP
-	ErrRowSizeTooBig           ErrorCode = C.NANOTS_EC_ROW_SIZE_TOO_BIG
-	ErrUnableToAllocateFile    ErrorCode = C.NANOTS_EC_UNABLE_TO_ALLOCATE_FILE
-	ErrInvalidArgument         ErrorCode = C.NANOTS_EC_INVALID_ARGUMENT
-	ErrUnknown                 ErrorCode = C.NANOTS_EC_UNKNOWN
-	ErrNotFound                ErrorCode = C.NANOTS_EC_NOT_FOUND
+	ErrNonMonotonicTimestamp      ErrorCode = C.NANOTS_EC_NON_MONOTONIC_TIMESTAMP
+	ErrRowSizeTooBig              ErrorCode = C.NANOTS_EC_ROW_SIZE_TOO_BIG
+	ErrUnableToAllocateFile       ErrorCode = C.NANOTS_EC_UNABLE_TO_ALLOCATE_FILE
+	ErrInvalidArgument            ErrorCode = C.NANOTS_EC_INVALID_ARGUMENT
+	ErrUnknown                    ErrorCode = C.NANOTS_EC_UNKNOWN
+	ErrNotFound                   ErrorCode = C.NANOTS_EC_NOT_FOUND
+	ErrBadMagic                   ErrorCode = C.NANOTS_EC_BAD_MAGIC
+	ErrBadVersion                 ErrorCode = C.NANOTS_EC_BAD_VERSION
+	ErrSecondaryKeyMismatch       ErrorCode = C.NANOTS_EC_SECONDARY_KEY_MISMATCH
+	ErrNonMonotonicSecondaryKey   ErrorCode = C.NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY
 )
+
+// SecKeyUnset is the sentinel for "this frame has no secondary key". Mirrors
+// the C-level NANOTS_SEC_KEY_UNSET (INT64_MIN).
+const SecKeyUnset int64 = -1 << 63
 
 // Error represents a nanots error with an error code
 type Error struct {
@@ -89,6 +98,14 @@ func newError(code ErrorCode) error {
 		msg = "invalid argument"
 	case ErrNotFound:
 		msg = "not found"
+	case ErrBadMagic:
+		msg = "not a nanots v2 file (bad magic)"
+	case ErrBadVersion:
+		msg = "unsupported nanots format version"
+	case ErrSecondaryKeyMismatch:
+		msg = "stream secondary-key mode mismatch"
+	case ErrNonMonotonicSecondaryKey:
+		msg = "secondary key must be monotonic"
 	default:
 		msg = "unknown error"
 	}
@@ -196,8 +213,20 @@ func (wc *WriteContext) Close() error {
 	return nil
 }
 
-// Write writes data to the database with the specified timestamp and flags
-func (w *Writer) Write(ctx *WriteContext, data []byte, timestamp int64, flags uint8) error {
+// Write writes data to an *unkeyed* stream. Equivalent to
+// WriteWithSecondaryKey with secondaryKey = SecKeyUnset. For keyed streams
+// use WriteWithSecondaryKey instead.
+func (w *Writer) Write(ctx *WriteContext, data []byte, flags uint32,
+	timestamp int64) error {
+	return w.WriteWithSecondaryKey(ctx, data, flags, timestamp, SecKeyUnset)
+}
+
+// WriteWithSecondaryKey writes data to the database, including an explicit
+// secondary key. Pass any int64 except math.MinInt64 (= SecKeyUnset) to
+// write into a keyed stream. The first write to a stream tag fixes the
+// stream as keyed or unkeyed; mixing returns ErrSecondaryKeyMismatch.
+func (w *Writer) WriteWithSecondaryKey(ctx *WriteContext, data []byte,
+	flags uint32, timestamp int64, secondaryKey int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -218,8 +247,9 @@ func (w *Writer) Write(ctx *WriteContext, data []byte, timestamp int64, flags ui
 		ctx.handle,
 		dataPtr,
 		C.size_t(len(data)),
+		C.uint32_t(flags),
 		C.int64_t(timestamp),
-		C.uint8_t(flags),
+		C.int64_t(secondaryKey),
 	)
 	return newError(ErrorCode(ec))
 }
@@ -277,8 +307,9 @@ func (r *Reader) Close() error {
 type Frame struct {
 	Data          []byte
 	Timestamp     int64
+	SecondaryKey  int64
 	BlockSequence int64
-	Flags         uint8
+	Flags         uint32
 	Metadata      string
 }
 
@@ -458,8 +489,9 @@ func (it *Iterator) Valid() bool {
 type FrameInfo struct {
 	Data          []byte
 	Timestamp     int64
+	SecondaryKey  int64
 	BlockSequence int64
-	Flags         uint8
+	Flags         uint32
 }
 
 // Current returns the current frame information
@@ -483,8 +515,9 @@ func (it *Iterator) Current() (FrameInfo, error) {
 	return FrameInfo{
 		Data:          data,
 		Timestamp:     int64(cFrame.timestamp),
+		SecondaryKey:  int64(cFrame.secondary_key),
 		BlockSequence: int64(cFrame.block_sequence),
-		Flags:         uint8(cFrame.flags),
+		Flags:         uint32(cFrame.flags),
 	}, nil
 }
 
@@ -525,6 +558,32 @@ func (it *Iterator) Find(timestamp int64) error {
 
 	ec := C.nanots_iterator_find(it.handle, C.int64_t(timestamp))
 	return newError(ErrorCode(ec))
+}
+
+// FindBySecondaryKey seeks to the first frame whose secondary key is >=
+// the specified value. Only valid on streams that store a secondary key.
+func (it *Iterator) FindBySecondaryKey(secondaryKey int64) error {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.handle == nil {
+		return errors.New("iterator is closed")
+	}
+
+	ec := C.nanots_iterator_find_by_secondary_key(it.handle, C.int64_t(secondaryKey))
+	return newError(ErrorCode(ec))
+}
+
+// HasSecondaryKey reports whether this stream stores a secondary key on
+// every frame.
+func (it *Iterator) HasSecondaryKey() bool {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	if it.handle == nil {
+		return false
+	}
+	return C.nanots_iterator_has_secondary_key(it.handle) != 0
 }
 
 // Reset moves the iterator to the first frame

@@ -390,7 +390,11 @@ enum nanots_ec_t {
   NANOTS_EC_UNABLE_TO_ALLOCATE_FILE = 10,
   NANOTS_EC_INVALID_ARGUMENT = 11,
   NANOTS_EC_UNKNOWN = 12,
-  NANOTS_EC_NOT_FOUND = 13
+  NANOTS_EC_NOT_FOUND = 13,
+  NANOTS_EC_BAD_MAGIC = 14,
+  NANOTS_EC_BAD_VERSION = 15,
+  NANOTS_EC_SECONDARY_KEY_MISMATCH = 16,
+  NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY = 17
 };
 
 }
@@ -415,26 +419,79 @@ private:
   int _line;
 };
 
+// --- On-disk format version 2 -------------------------------------------
+// File magic: ASCII "NTS\0". Legacy v1 files had block_size (always a
+// multiple of 65536) at offset 0, which can never collide with this magic
+// in its low byte ('N' = 0x4E), so the sniff is unambiguous.
+#define NANOTS_FILE_MAGIC "NTS\0"
+#define NANOTS_FILE_MAGIC_LEN 4
+#define NANOTS_FORMAT_VERSION 2
+
 #define FILE_HEADER_BLOCK_SIZE 65536
-// 8 + 4 + 4 bytes (with padding)
+// File header field offsets (within the first 64 KB; rest is reserved):
+//   0  : magic[4]                = "NTS\0"
+//   4  : format_version (u16)    = 2
+//   6  : header_size    (u16)    = bytes actually used (>= 32)
+//   8  : block_size     (u32)
+//   12 : n_blocks       (u32; 0 = growable)
+//   16 : max_blocks     (u32; growable cap, 0 = unbounded)
+//   20 : flags          (u32; reserved, currently 0)
+//   24 : feature_bits   (u64; bit 0 = secondary_key bit reserved for future
+//                       per-file features. Per-stream secondary-key opt-in
+//                       is recorded in segments.has_secondary_key.)
+//   32 : reserved (zeroed)
+#define FILE_HEADER_MAGIC_OFFSET     0
+#define FILE_HEADER_VERSION_OFFSET   4
+#define FILE_HEADER_HSIZE_OFFSET     6
+#define FILE_HEADER_BLOCK_SIZE_OFFSET 8
+#define FILE_HEADER_N_BLOCKS_OFFSET  12
+#define FILE_HEADER_MAX_BLOCKS_OFFSET 16
+#define FILE_HEADER_FLAGS_OFFSET     20
+#define FILE_HEADER_FEATURES_OFFSET  24
+#define FILE_HEADER_USED_BYTES       32
+
+// 8 + 4 + 4 bytes. block_feature_bits (was 'reserved') is repurposed as
+// per-block feature flags for future use; currently always 0.
 #define BLOCK_HEADER_SIZE 16
-// 8 + 8 bytes
-#define INDEX_ENTRY_SIZE 16
-// 16 + 1 + 4 bytes
-#define FRAME_HEADER_SIZE 21
-#define FRAME_UUID_OFFSET 0
-#define FRAME_SIZE_OFFSET 16
-#define FRAME_FLAGS_OFFSET 20
+
+// v2 index entry: 8 + 8 + 8 + 8 = 32 bytes.
+//   0  : timestamp     (int64)
+//   8  : secondary_key (int64; NANOTS_SEC_KEY_UNSET if the stream has none)
+//   16 : offset        (uint64; byte offset of frame in block)
+//   24 : reserved      (uint64; zeroed)
+#define INDEX_ENTRY_SIZE 32
+#define INDEX_ENTRY_TS_OFFSET      0
+#define INDEX_ENTRY_SECKEY_OFFSET  8
+#define INDEX_ENTRY_OFFSET_OFFSET 16
+#define INDEX_ENTRY_RESERVED_OFFSET 24
+
+// v2 frame header: 16 + 8 + 4 + 4 = 32 bytes (8-byte aligned, payload at +32).
+//   0  : uuid[16]
+//   16 : secondary_key (int64; NANOTS_SEC_KEY_UNSET if the stream has none)
+//   24 : size          (uint32)
+//   28 : flags         (uint32 — widened from u8 in v2)
+#define FRAME_HEADER_SIZE 32
+#define FRAME_UUID_OFFSET        0
+#define FRAME_SECKEY_OFFSET     16
+#define FRAME_SIZE_OFFSET       24
+#define FRAME_FLAGS_OFFSET      28
+
+// Sentinel for "no secondary key on this frame". Streams either always have
+// one or never have one; the choice is fixed at the first write into the
+// stream and stored in segments.has_secondary_key.
+#define NANOTS_SEC_KEY_UNSET INT64_MIN
 
 struct block_header {
   int64_t block_start_timestamp{0};
   uint32_t n_valid_indexes{0};
-  uint32_t reserved{0};
+  uint32_t block_feature_bits{0};
 };
 
 struct index_entry {
-  int64_t timestamp;
-  uint32_t offset;
+  int64_t timestamp{0};
+  int64_t secondary_key{NANOTS_SEC_KEY_UNSET};
+  uint64_t offset{0};
+  uint64_t reserved{0};
 };
 
 struct block {
@@ -447,6 +504,10 @@ struct segment {
   std::string stream_tag;
   std::string metadata;
   int64_t sequence{0};
+  // True if every write into this segment must include a secondary key.
+  // Locked at segment creation time and (for the stream as a whole) recorded
+  // on the first segment created for that stream tag — see _db_create_segment.
+  bool has_secondary_key{false};
 };
 
 struct segment_block {
@@ -457,6 +518,8 @@ struct segment_block {
   int64_t block_idx{0};
   int64_t start_timestamp{0};
   int64_t end_timestamp{0};
+  int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
+  int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
   uint8_t uuid[16];
 };
 
@@ -597,6 +660,7 @@ struct NANOTS_API write_context final {
   std::string metadata;
   std::string stream_tag;
   std::optional<int64_t> last_timestamp;
+  std::optional<int64_t> last_secondary_key;
   std::optional<segment> current_segment;
   std::optional<segment_block> current_block;
   nts_file file;
@@ -617,11 +681,21 @@ class NANOTS_API nanots_writer {
   write_context create_write_context(const std::string& stream_tag,
                                      const std::string& metadata);
 
+  // `secondary_key` defaults to NANOTS_SEC_KEY_UNSET — pass any other int64
+  // to write into a *keyed* stream. The choice is fixed by the first write to
+  // a given stream tag; mixing keyed and unkeyed writes on the same stream is
+  // rejected with NANOTS_EC_SECONDARY_KEY_MISMATCH. Keys are strictly
+  // monotonic within a stream.
+  //
+  // Argument order: (timestamp, secondary_key) are grouped at the end as the
+  // frame's ordering keys, with flags before them so the unkeyed call shape
+  // is just write(wctx, data, size, flags, timestamp).
   void write(write_context& wctx,
              const uint8_t* data,
              size_t size,
+             uint32_t flags,
              int64_t timestamp,
-             uint8_t flags);
+             int64_t secondary_key = NANOTS_SEC_KEY_UNSET);
 
   static void free_blocks(const std::string& file_name,
                           const std::string& stream_tag,
@@ -710,12 +784,15 @@ class NANOTS_API nanots_reader {
   nanots_reader& operator=(nanots_reader&&) = default;
   ~nanots_reader() = default;
 
+  // Callback signature is:
+  //   (data, size, flags, timestamp, secondary_key, block_sequence, metadata)
+  // `secondary_key` is NANOTS_SEC_KEY_UNSET for streams that don't use one.
   void read(
       const std::string& stream_tag,
       int64_t start_timestamp,
       int64_t end_timestamp,
       const std::function<
-          void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback);
+          void(const uint8_t*, size_t, uint32_t, int64_t, int64_t, int64_t, const std::string&)>& callback);
   
   std::vector<std::string> query_stream_tags(int64_t start_timestamp, int64_t end_timestamp);
 
@@ -739,8 +816,9 @@ class NANOTS_API nanots_reader {
 struct frame_info {
   const uint8_t* data{nullptr};
   size_t size{0};
-  uint8_t flags{0};
+  uint32_t flags{0};
   int64_t timestamp{0};
+  int64_t secondary_key{NANOTS_SEC_KEY_UNSET};
   int64_t block_sequence{0};
 };
 
@@ -752,6 +830,9 @@ struct block_info {
   std::string uuid_hex;
   int64_t start_timestamp{0};
   int64_t end_timestamp{0};
+  int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
+  int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
+  bool has_secondary_key{false};
 
   // Loaded block data
   nts_memory_map mm;
@@ -779,12 +860,17 @@ class NANOTS_API nanots_iterator {
   nanots_iterator& operator++();  // Move to next frame
   nanots_iterator& operator--();  // Move to previous frame
   bool find(int64_t timestamp);  // Find first frame >= timestamp
+  // Find first frame with secondary_key >= sec_key. Only valid on streams
+  // whose has_secondary_key == true; returns false otherwise.
+  bool find_by_secondary_key(int64_t sec_key);
   bool seek_end();               // Go to last frame
   void reset();                   // Go to first frame
 
   // Utility
   int64_t current_block_sequence() const { return _current_block_sequence; }
   const std::string& current_metadata() const;
+  // True if this stream stores a secondary key on every frame.
+  bool has_secondary_key();
 
  private:
   // In-memory index of all blocks in this stream, sorted by start_ts
@@ -798,6 +884,8 @@ class NANOTS_API nanots_iterator {
     int64_t end_ts;       // 0 = open block (currently being written)
     int64_t segment_id;
     int64_t sequence;
+    int64_t start_sk;     // NANOTS_SEC_KEY_UNSET if stream has no sec key
+    int64_t end_sk;       // 0 boundary semantics same as end_ts
   };
 
   block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
@@ -806,6 +894,7 @@ class NANOTS_API nanots_iterator {
   block_info* _get_next_block();
   block_info* _get_prev_block();
   block_info* _find_block_for_timestamp(int64_t timestamp);
+  block_info* _find_block_for_secondary_key(int64_t sec_key);
 
   // Build (or rebuild) the timestamp index from SQL. _ensure_ts_index is the
   // lazy entry point used by navigation methods.
@@ -817,6 +906,10 @@ class NANOTS_API nanots_iterator {
   // block that covers ts (start_ts <= ts <= end_ts, or end_ts == 0); otherwise
   // returns the first block with start_ts >= ts.
   size_t _ts_index_find(int64_t ts) const;
+
+  // Same as _ts_index_find but searches by secondary key. Only meaningful for
+  // streams whose has_secondary_key is true.
+  size_t _ts_index_find_by_sk(int64_t sk) const;
 
   // True if _ts_index_pos matches (current_segment_id, current_block_sequence).
   bool   _ts_index_pos_is_valid() const;
@@ -832,6 +925,9 @@ class NANOTS_API nanots_iterator {
   std::string _stream_tag;
   nts_file _file;
   uint32_t _block_size;
+  // Cached from the segments row for this stream. -1 = not yet known;
+  // 0 = no, 1 = yes.
+  int _has_secondary_key_cache{-1};
 
   // Current position
   int64_t _current_block_sequence;
@@ -896,15 +992,17 @@ typedef struct {
 typedef struct {
   const uint8_t* data;
   size_t size;
-  uint8_t flags;
+  uint32_t flags;
   int64_t timestamp;
+  int64_t secondary_key;
   int64_t block_sequence;
 } nanots_frame_info_t;
 
 typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        size_t size,
-                                       uint8_t flags,
+                                       uint32_t flags,
                                        int64_t timestamp,
+                                       int64_t secondary_key,
                                        int64_t block_sequence,
                                        const char* metadata,
                                        void* user_data);
@@ -924,12 +1022,19 @@ NANOTS_API nanots_write_context_t nanots_writer_create_context(nanots_writer_t w
 
 NANOTS_API void nanots_write_context_destroy(nanots_write_context_t context);
 
+// Pass NANOTS_SEC_KEY_UNSET (INT64_MIN) for `secondary_key` to write into
+// a stream without a secondary key. The first write to a stream fixes the
+// choice; mixing yields NANOTS_EC_SECONDARY_KEY_MISMATCH.
+//
+// Argument order mirrors the C++ method: flags, then timestamp, then the
+// optional secondary key. The C ABI has no defaults — pass all 7 args.
 NANOTS_API nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
+                                    uint32_t flags,
                                     int64_t timestamp,
-                                    uint8_t flags);
+                                    int64_t secondary_key);
 
 NANOTS_API nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                       const char* stream_tag,
@@ -981,6 +1086,14 @@ NANOTS_API nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
 
 NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp);
+
+// Returns NANOTS_EC_INVALID_ARGUMENT if the stream has no secondary key.
+NANOTS_API nanots_ec_t nanots_iterator_find_by_secondary_key(
+    nanots_iterator_t iterator,
+    int64_t secondary_key);
+
+// 1 if this iterator's stream stores secondary keys, 0 otherwise.
+NANOTS_API int nanots_iterator_has_secondary_key(nanots_iterator_t iterator);
 
 NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 

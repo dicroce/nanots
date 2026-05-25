@@ -34,19 +34,24 @@ cdef extern from "nanots.h":
         NANOTS_EC_INVALID_ARGUMENT = 11
         NANOTS_EC_UNKNOWN = 12
         NANOTS_EC_NOT_FOUND = 13
-    
+        NANOTS_EC_BAD_MAGIC = 14
+        NANOTS_EC_BAD_VERSION = 15
+        NANOTS_EC_SECONDARY_KEY_MISMATCH = 16
+        NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY = 17
+
     ctypedef struct nanots_contiguous_segment_t:
         int segment_id
         int64_t start_timestamp
         int64_t end_timestamp
-    
+
     ctypedef struct nanots_frame_info_t:
         const uint8_t* data
         size_t size
-        uint8_t flags
+        uint32_t flags
         int64_t timestamp
+        int64_t secondary_key
         int64_t block_sequence
-    
+
     # Function declarations
     nanots_writer_t nanots_writer_create(const char* file_name, int auto_reclaim)
     void nanots_writer_destroy(nanots_writer_t writer)
@@ -58,8 +63,9 @@ cdef extern from "nanots.h":
                                     nanots_write_context_t context,
                                     const uint8_t* data,
                                     size_t size,
+                                    uint32_t flags,
                                     int64_t timestamp,
-                                    uint8_t flags)
+                                    int64_t secondary_key)
     nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
@@ -75,8 +81,9 @@ cdef extern from "nanots.h":
     void nanots_reader_destroy(nanots_reader_t reader)
     ctypedef void (*nanots_read_callback_t)(const uint8_t* data,
                                            size_t size,
-                                           uint8_t flags,
+                                           uint32_t flags,
                                            int64_t timestamp,
+                                           int64_t secondary_key,
                                            int64_t block_sequence,
                                            const char* metadata,
                                            void* user_data)
@@ -113,9 +120,16 @@ cdef extern from "nanots.h":
     nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator)
     nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
                                      int64_t timestamp)
+    nanots_ec_t nanots_iterator_find_by_secondary_key(nanots_iterator_t iterator,
+                                                     int64_t secondary_key)
+    int nanots_iterator_has_secondary_key(nanots_iterator_t iterator)
     nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator)
     int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator)
     const char* nanots_iterator_current_metadata(nanots_iterator_t iterator)
+
+# Sentinel for "this frame has no secondary key" (matches the C-level
+# NANOTS_SEC_KEY_UNSET = INT64_MIN).
+SEC_KEY_UNSET = -0x8000000000000000
 
 # Python exceptions
 class NanoTSError(Exception):
@@ -157,6 +171,18 @@ class InvalidArgumentError(NanoTSError):
 class NotFoundError(NanoTSError):
     pass
 
+class BadMagicError(NanoTSError):
+    pass
+
+class BadVersionError(NanoTSError):
+    pass
+
+class SecondaryKeyMismatchError(NanoTSError):
+    pass
+
+class NonMonotonicSecondaryKeyError(NanoTSError):
+    pass
+
 # Helper function to check results and raise appropriate exceptions
 cdef void _check_result(nanots_ec_t result):
     if result == NANOTS_EC_OK:
@@ -185,6 +211,14 @@ cdef void _check_result(nanots_ec_t result):
         raise InvalidArgumentError("Invalid argument")
     elif result == NANOTS_EC_NOT_FOUND:
         raise NotFoundError("Not found")
+    elif result == NANOTS_EC_BAD_MAGIC:
+        raise BadMagicError("Not a nanots v2 file (bad magic)")
+    elif result == NANOTS_EC_BAD_VERSION:
+        raise BadVersionError("Unsupported nanots format version")
+    elif result == NANOTS_EC_SECONDARY_KEY_MISMATCH:
+        raise SecondaryKeyMismatchError("Stream secondary-key mode mismatch")
+    elif result == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY:
+        raise NonMonotonicSecondaryKeyError("Secondary key must be monotonic")
     else:
         raise NanoTSError(f"Unknown error: {result}")
 
@@ -255,10 +289,20 @@ cdef class Writer:
             raise NanoTSError("Failed to create write context")
         return context
     
-    def write(self, WriteContext context, bytes data, int64_t timestamp, uint8_t flags=0):
-        """Write data to the database."""
+    def write(self, WriteContext context, bytes data,
+              uint32_t flags, int64_t timestamp,
+              int64_t secondary_key=SEC_KEY_UNSET):
+        """Write data to the database.
+
+        Pass ``secondary_key`` to write into a stream that uses a secondary
+        key (the choice is fixed by the first write to that stream tag).
+        Default ``SEC_KEY_UNSET`` writes into an unkeyed stream. Any other
+        value — including 0 — counts as a real key and locks the stream as
+        keyed.
+        """
         cdef nanots_ec_t result = nanots_writer_write(
-            self._writer, context._context, data, len(data), timestamp, flags)
+            self._writer, context._context, data, len(data),
+            flags, timestamp, secondary_key)
         _check_result(result)
     
     @staticmethod
@@ -387,18 +431,19 @@ cdef class Iterator:
         """Get the current frame data."""
         if not self.valid():
             raise NanoTSError("Iterator not at valid position")
-        
+
         cdef nanots_frame_info_t frame_info
         cdef nanots_ec_t result = nanots_iterator_get_current_frame(
             self._iterator, &frame_info)
         _check_result(result)
-        
+
         # Copy the data to a Python bytes object
         cdef bytes data = frame_info.data[:frame_info.size]
-        
+
         return {
             'data': data,
             'timestamp': frame_info.timestamp,
+            'secondary_key': frame_info.secondary_key,
             'flags': frame_info.flags,
             'block_sequence': frame_info.block_sequence,
             'metadata': self.current_metadata()
@@ -418,6 +463,20 @@ cdef class Iterator:
         """Find frame at or after given timestamp."""
         cdef nanots_ec_t result = nanots_iterator_find(self._iterator, timestamp)
         _check_result(result)
+
+    def find_by_secondary_key(self, int64_t secondary_key):
+        """Find first frame at or after the given secondary key.
+
+        Only valid on streams that store a secondary key. Returns False if
+        no such frame exists (and invalidates the iterator).
+        """
+        cdef nanots_ec_t result = nanots_iterator_find_by_secondary_key(
+            self._iterator, secondary_key)
+        return result == NANOTS_EC_OK
+
+    def has_secondary_key(self):
+        """True if this stream stores a secondary key on every frame."""
+        return nanots_iterator_has_secondary_key(self._iterator) != 0
     
     def reset(self):
         """Reset iterator to beginning."""

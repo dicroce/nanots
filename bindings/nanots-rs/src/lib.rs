@@ -13,14 +13,15 @@
 //! // Allocate a new database file
 //! Writer::allocate_file("data.nts", 1024 * 1024, 100)?;
 //!
-//! // Write some data
+//! // Write some data (unkeyed stream)
 //! let writer = Writer::new("data.nts", false)?;
 //! let context = writer.create_context("sensor_data", "temperature readings")?;
-//! writer.write(&context, b"hello world", 1234567890, 0)?;
+//! writer.write(&context, b"hello world", /*flags=*/0, 1234567890)?;
 //!
 //! // Read it back
 //! let reader = Reader::new("data.nts")?;
-//! reader.read("sensor_data", 0, i64::MAX, |data, flags, timestamp, block_seq, metadata| {
+//! reader.read("sensor_data", 0, i64::MAX,
+//!             |data, flags, timestamp, sec_key, block_seq, metadata| {
 //!     println!("Read {} bytes at timestamp {}, metadata: {}", data.len(), timestamp, metadata);
 //! })?;
 //! # Ok(())
@@ -31,6 +32,10 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
+
+/// Sentinel for "frame has no secondary key" (matches the C-level
+/// `NANOTS_SEC_KEY_UNSET = INT64_MIN`).
+pub const SEC_KEY_UNSET: i64 = i64::MIN;
 
 /// Error codes matching the C enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +55,10 @@ pub enum ErrorCode {
     InvalidArgument = 11,
     Unknown = 12,
     NotFound = 13,
+    BadMagic = 14,
+    BadVersion = 15,
+    SecondaryKeyMismatch = 16,
+    NonMonotonicSecondaryKey = 17,
 }
 
 impl ErrorCode {
@@ -68,6 +77,10 @@ impl ErrorCode {
             10 => ErrorCode::UnableToAllocateFile,
             11 => ErrorCode::InvalidArgument,
             13 => ErrorCode::NotFound,
+            14 => ErrorCode::BadMagic,
+            15 => ErrorCode::BadVersion,
+            16 => ErrorCode::SecondaryKeyMismatch,
+            17 => ErrorCode::NonMonotonicSecondaryKey,
             _ => ErrorCode::Unknown,
         }
     }
@@ -90,6 +103,10 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::InvalidArgument => "Invalid argument",
             ErrorCode::Unknown => "Unknown error",
             ErrorCode::NotFound => "Not found",
+            ErrorCode::BadMagic => "Not a nanots v2 file (bad magic)",
+            ErrorCode::BadVersion => "Unsupported nanots format version",
+            ErrorCode::SecondaryKeyMismatch => "Stream secondary-key mode mismatch",
+            ErrorCode::NonMonotonicSecondaryKey => "Secondary key must be monotonic",
         };
         write!(f, "{}", msg)
     }
@@ -113,8 +130,9 @@ pub struct ContiguousSegment {
 struct FrameInfo {
     data: *const u8,
     size: usize,
-    flags: u8,
+    flags: u32,
     timestamp: i64,
+    secondary_key: i64,
     block_sequence: i64,
 }
 
@@ -133,8 +151,9 @@ type IteratorPtr = *mut IteratorHandle;
 type ReadCallback = extern "C" fn(
     data: *const u8,
     size: usize,
-    flags: u8,
+    flags: u32,
     timestamp: i64,
+    secondary_key: i64,
     block_sequence: i64,
     metadata: *const c_char,
     user_data: *mut c_void,
@@ -167,8 +186,9 @@ extern "C" {
         context: WriteContextPtr,
         data: *const u8,
         size: usize,
+        flags: u32,
         timestamp: i64,
-        flags: u8,
+        secondary_key: i64,
     ) -> u32;
 
     // Note: free_blocks takes file_name, not writer
@@ -219,6 +239,11 @@ extern "C" {
     fn nanots_iterator_next(iterator: IteratorPtr) -> u32;
     fn nanots_iterator_prev(iterator: IteratorPtr) -> u32;
     fn nanots_iterator_find(iterator: IteratorPtr, timestamp: i64) -> u32;
+    fn nanots_iterator_find_by_secondary_key(
+        iterator: IteratorPtr,
+        secondary_key: i64,
+    ) -> u32;
+    fn nanots_iterator_has_secondary_key(iterator: IteratorPtr) -> c_int;
     fn nanots_iterator_reset(iterator: IteratorPtr) -> u32;
     fn nanots_iterator_current_block_sequence(iterator: IteratorPtr) -> i64;
     fn nanots_iterator_current_metadata(iterator: IteratorPtr) -> *const c_char;
@@ -259,13 +284,35 @@ impl Writer {
         }
     }
 
-    /// Write data to the database
+    /// Write data to an *unkeyed* stream.
+    ///
+    /// The first write to a stream tag fixes the stream as either keyed or
+    /// unkeyed; this method always passes `SEC_KEY_UNSET`, so use it only on
+    /// streams that have no secondary key. For keyed streams use
+    /// [`write_with_secondary_key`](Self::write_with_secondary_key).
     pub fn write(
         &self,
         context: &WriteContext,
         data: &[u8],
+        flags: u32,
         timestamp: i64,
-        flags: u8,
+    ) -> Result<()> {
+        self.write_with_secondary_key(context, data, flags, timestamp, SEC_KEY_UNSET)
+    }
+
+    /// Write data with an explicit secondary key.
+    ///
+    /// Pass any `i64` *except* `i64::MIN` (= [`SEC_KEY_UNSET`]) to write into
+    /// a keyed stream. Mixing keyed and unkeyed writes on the same stream
+    /// returns [`ErrorCode::SecondaryKeyMismatch`]; non-monotonic keys
+    /// return [`ErrorCode::NonMonotonicSecondaryKey`].
+    pub fn write_with_secondary_key(
+        &self,
+        context: &WriteContext,
+        data: &[u8],
+        flags: u32,
+        timestamp: i64,
+        secondary_key: i64,
     ) -> Result<()> {
         let result = unsafe {
             nanots_writer_write(
@@ -273,8 +320,9 @@ impl Writer {
                 context.ptr,
                 data.as_ptr(),
                 data.len(),
-                timestamp,
                 flags,
+                timestamp,
+                secondary_key,
             )
         };
         let error_code = ErrorCode::from_c(result);
@@ -414,7 +462,9 @@ impl Reader {
 
     /// Read data from a stream in a time range
     ///
-    /// The callback receives: data slice, flags, timestamp, block_sequence, and metadata
+    /// The callback receives: data slice, flags, timestamp, secondary_key,
+    /// block_sequence, and metadata. `secondary_key` will be `SEC_KEY_UNSET`
+    /// for streams that don't store one.
     pub fn read<F>(
         &self,
         stream_tag: &str,
@@ -423,31 +473,36 @@ impl Reader {
         mut callback: F,
     ) -> Result<()>
     where
-        F: FnMut(&[u8], u8, i64, i64, &str),
+        F: FnMut(&[u8], u32, i64, i64, i64, &str),
     {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
 
         extern "C" fn c_callback(
             data: *const u8,
             size: usize,
-            flags: u8,
+            flags: u32,
             timestamp: i64,
+            secondary_key: i64,
             block_sequence: i64,
             metadata: *const c_char,
             user_data: *mut c_void,
         ) {
-            let callback =
-                unsafe { &mut *(user_data as *mut &mut dyn FnMut(&[u8], u8, i64, i64, &str)) };
+            let callback = unsafe {
+                &mut *(user_data
+                    as *mut &mut dyn FnMut(&[u8], u32, i64, i64, i64, &str))
+            };
             let data_slice = unsafe { slice::from_raw_parts(data, size) };
             let metadata_str = if metadata.is_null() {
                 ""
             } else {
                 unsafe { CStr::from_ptr(metadata) }.to_str().unwrap_or("")
             };
-            callback(data_slice, flags, timestamp, block_sequence, metadata_str);
+            callback(
+                data_slice, flags, timestamp, secondary_key, block_sequence, metadata_str,
+            );
         }
 
-        let mut callback_ref: &mut dyn FnMut(&[u8], u8, i64, i64, &str) = &mut callback;
+        let mut callback_ref: &mut dyn FnMut(&[u8], u32, i64, i64, i64, &str) = &mut callback;
         let user_data = &mut callback_ref as *mut _ as *mut c_void;
 
         let result = unsafe {
@@ -577,6 +632,7 @@ impl Iterator {
             size: 0,
             flags: 0,
             timestamp: 0,
+            secondary_key: SEC_KEY_UNSET,
             block_sequence: 0,
         };
 
@@ -596,6 +652,7 @@ impl Iterator {
             data,
             flags: frame_info.flags,
             timestamp: frame_info.timestamp,
+            secondary_key: frame_info.secondary_key,
             block_sequence: frame_info.block_sequence,
         })
     }
@@ -642,6 +699,20 @@ impl Iterator {
         Ok(error_code == ErrorCode::Ok)
     }
 
+    /// Find the first frame at or after the given secondary key. Only valid
+    /// on streams whose [`has_secondary_key`](Self::has_secondary_key) is true.
+    pub fn find_by_secondary_key(&mut self, secondary_key: i64) -> Result<bool> {
+        let result =
+            unsafe { nanots_iterator_find_by_secondary_key(self.ptr, secondary_key) };
+        let error_code = ErrorCode::from_c(result);
+        Ok(error_code == ErrorCode::Ok)
+    }
+
+    /// True if this stream stores a secondary key on every frame.
+    pub fn has_secondary_key(&self) -> bool {
+        unsafe { nanots_iterator_has_secondary_key(self.ptr) != 0 }
+    }
+
     /// Reset to the first frame
     pub fn reset(&mut self) -> Result<()> {
         let result = unsafe { nanots_iterator_reset(self.ptr) };
@@ -669,8 +740,9 @@ impl Drop for Iterator {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub data: Vec<u8>,
-    pub flags: u8,
+    pub flags: u32,
     pub timestamp: i64,
+    pub secondary_key: i64,
     pub block_sequence: i64,
 }
 

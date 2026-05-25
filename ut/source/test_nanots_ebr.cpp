@@ -78,7 +78,7 @@ void test_nanots_ebr::test_basic_auto_reclaim_no_readers() {
     int64_t ts = 1000 + i * 100;
     _fill_payload_with_ts(payload, ts);
     RTF_ASSERT_NO_THROW(
-        writer.write(wctx, payload.data(), payload.size(), ts, 0));
+        writer.write(wctx, payload.data(), payload.size(), 0, ts));
   }
   // If we got here, auto_reclaim worked. With no readers, every retire
   // should clear limbo immediately and migrate to ready.
@@ -101,7 +101,7 @@ void test_nanots_ebr::test_reader_pins_then_releases() {
     for (int i = 0; i < 32; ++i) {
       int64_t ts = 1000 + i * 100;
       _fill_payload_with_ts(payload, ts);
-      writer.write(wctx, payload.data(), payload.size(), ts, 0);
+      writer.write(wctx, payload.data(), payload.size(), 0, ts);
     }
   }
 
@@ -165,7 +165,7 @@ void test_nanots_ebr::test_dead_heartbeat_does_not_pin() {
     auto wctx = writer.create_write_context("stream_a", "meta");
     std::vector<uint8_t> payload(256, 0xEF);
     for (int i = 0; i < 8; ++i) {
-      writer.write(wctx, payload.data(), payload.size(), 1000 + i * 100, 0);
+      writer.write(wctx, payload.data(), payload.size(), 0, 1000 + i * 100);
     }
   }
 
@@ -204,7 +204,7 @@ void test_nanots_ebr::test_iterator_op_advances_epoch() {
     auto wctx = writer.create_write_context("stream_a", "meta");
     std::vector<uint8_t> payload(256, 0x11);
     for (int i = 0; i < 8; ++i) {
-      writer.write(wctx, payload.data(), payload.size(), 1000 + i * 100, 0);
+      writer.write(wctx, payload.data(), payload.size(), 0, 1000 + i * 100);
     }
   }
 
@@ -260,7 +260,7 @@ void test_nanots_ebr::test_stress_concurrent_writer_readers() {
     while (!stop.load(std::memory_order_relaxed)) {
       _fill_payload_with_ts(payload, ts);
       try {
-        writer.write(wctx, payload.data(), payload.size(), ts, 0);
+        writer.write(wctx, payload.data(), payload.size(), 0, ts);
         frames_written.fetch_add(1, std::memory_order_relaxed);
         max_written_ts.store(ts, std::memory_order_relaxed);
         ts += 100;
@@ -287,8 +287,9 @@ void test_nanots_ebr::test_stress_concurrent_writer_readers() {
         int64_t lo = hi > 100000 ? hi - 100000 : 1000;
         try {
           reader.read("stream_a", lo, hi,
-              [&](const uint8_t* data, size_t size, uint8_t /*flags*/,
-                  int64_t ts, int64_t /*block_seq*/,
+              [&](const uint8_t* data, size_t size, uint32_t /*flags*/,
+                  int64_t ts, int64_t /*sec_key*/,
+                  int64_t /*block_seq*/,
                   const std::string& /*meta*/) {
                 if (!_verify_payload_matches_ts(data, size, ts)) {
                   integrity_failures.fetch_add(1, std::memory_order_relaxed);
@@ -344,7 +345,7 @@ void test_nanots_ebr::test_ts_index_refresh_finds_new_blocks() {
     for (int i = 0; i < 32; ++i) {
       int64_t ts = 1000 + i * 100;
       _fill_payload_with_ts(payload, ts);
-      writer.write(wctx, payload.data(), payload.size(), ts, 0);
+      writer.write(wctx, payload.data(), payload.size(), 0, ts);
     }
   }
 
@@ -361,7 +362,7 @@ void test_nanots_ebr::test_ts_index_refresh_finds_new_blocks() {
     for (int i = 32; i < 64; ++i) {
       int64_t ts = 1000 + i * 100;
       _fill_payload_with_ts(payload, ts);
-      writer.write(wctx, payload.data(), payload.size(), ts, 0);
+      writer.write(wctx, payload.data(), payload.size(), 0, ts);
     }
   }
 

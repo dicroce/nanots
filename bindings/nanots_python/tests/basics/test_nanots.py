@@ -30,7 +30,7 @@ def nanots_basics_example():
             }).encode('utf-8')
             
             print("Writing data:", data.decode('utf-8'), "at", timestamp)
-            writer.write(context, data, timestamp, 0)
+            writer.write(context, data, 0, timestamp)
         
         # 3. READ DATA
         reader = nanots.Reader(db_file)

@@ -31,12 +31,12 @@ func TestBasicWriteReadCycle(t *testing.T) {
 		}
 		defer ctx.Close()
 
-		err = writer.Write(ctx, []byte("hello world"), 1000, 0)
+		err = writer.Write(ctx, []byte("hello world"), 0, 1000)
 		if err != nil {
 			t.Fatalf("Failed to write first frame: %v", err)
 		}
 
-		err = writer.Write(ctx, []byte("goodbye world"), 2000, 1)
+		err = writer.Write(ctx, []byte("goodbye world"), 1, 2000)
 		if err != nil {
 			t.Fatalf("Failed to write second frame: %v", err)
 		}
@@ -52,7 +52,7 @@ func TestBasicWriteReadCycle(t *testing.T) {
 
 		type record struct {
 			data      []byte
-			flags     uint8
+			flags     uint32
 			timestamp int64
 		}
 		var records []record
@@ -118,7 +118,7 @@ func TestIteratorInterface(t *testing.T) {
 
 		for i := 0; i < 5; i++ {
 			data := fmt.Sprintf("item_%d", i)
-			err = writer.Write(ctx, []byte(data), int64(i*1000), 0)
+			err = writer.Write(ctx, []byte(data), 0, int64(i*1000))
 			if err != nil {
 				t.Fatalf("Failed to write frame %d: %v", i, err)
 			}
@@ -194,7 +194,7 @@ func TestFindFunctionality(t *testing.T) {
 		timestamps := []int64{1000, 2000, 3000, 5000, 8000}
 		for i, timestamp := range timestamps {
 			data := fmt.Sprintf("data_%d", i)
-			err = writer.Write(ctx, []byte(data), timestamp, 0)
+			err = writer.Write(ctx, []byte(data), 0, timestamp)
 			if err != nil {
 				t.Fatalf("Failed to write frame %d: %v", i, err)
 			}
@@ -291,7 +291,7 @@ func TestContiguousSegments(t *testing.T) {
 		}
 		defer ctx.Close()
 
-		err = writer.Write(ctx, []byte("test data"), 1000, 0)
+		err = writer.Write(ctx, []byte("test data"), 0, 1000)
 		if err != nil {
 			t.Fatalf("Failed to write data: %v", err)
 		}
@@ -372,22 +372,22 @@ func TestMultipleStreams(t *testing.T) {
 		}
 		defer ctx2.Close()
 
-		err = writer.Write(ctx1, []byte("stream1_data1"), 1000, 0)
+		err = writer.Write(ctx1, []byte("stream1_data1"), 0, 1000)
 		if err != nil {
 			t.Fatalf("Failed to write to stream1: %v", err)
 		}
 
-		err = writer.Write(ctx2, []byte("stream2_data1"), 1500, 0)
+		err = writer.Write(ctx2, []byte("stream2_data1"), 0, 1500)
 		if err != nil {
 			t.Fatalf("Failed to write to stream2: %v", err)
 		}
 
-		err = writer.Write(ctx1, []byte("stream1_data2"), 2000, 0)
+		err = writer.Write(ctx1, []byte("stream1_data2"), 0, 2000)
 		if err != nil {
 			t.Fatalf("Failed to write to stream1: %v", err)
 		}
 
-		err = writer.Write(ctx2, []byte("stream2_data2"), 2500, 0)
+		err = writer.Write(ctx2, []byte("stream2_data2"), 0, 2500)
 		if err != nil {
 			t.Fatalf("Failed to write to stream2: %v", err)
 		}
@@ -489,7 +489,7 @@ func TestQueryStreamTags(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create context for %s: %v", streamTag, err)
 			}
-			err = writer.Write(ctx, []byte("data"), 1000, 0)
+			err = writer.Write(ctx, []byte("data"), 0, 1000)
 			if err != nil {
 				t.Fatalf("Failed to write to %s: %v", streamTag, err)
 			}

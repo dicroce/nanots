@@ -153,16 +153,20 @@ static uint32_t _round_to_64k_boundary(uint32_t requested_size) {
 
 static bool _validate_frame_header(const uint8_t* frame_p,
                                    const uint8_t* expected_uuid,
-                                   uint8_t* flags_out,
-                                   uint32_t* size_out) {
+                                   uint32_t* flags_out,
+                                   uint32_t* size_out,
+                                   int64_t* sec_key_out) {
   if (memcmp(frame_p + FRAME_UUID_OFFSET, expected_uuid, 16) != 0)
     return false;
+
+  if (sec_key_out)
+    *sec_key_out = *(int64_t*)(frame_p + FRAME_SECKEY_OFFSET);
 
   if (size_out)
     *size_out = *(uint32_t*)(frame_p + FRAME_SIZE_OFFSET);
 
   if (flags_out)
-    *flags_out = *(frame_p + FRAME_FLAGS_OFFSET);
+    *flags_out = *(uint32_t*)(frame_p + FRAME_FLAGS_OFFSET);
 
   return true;
 }
@@ -180,35 +184,35 @@ static void _free_block(nts_sqlite_conn& conn, int sb_id, int block_id) {
   });
 }
 
-static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size, 
-                                     int index, uint32_t n_valid_indexes, 
+static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size,
+                                     int index, uint32_t n_valid_indexes,
                                      const uint8_t* uuid) {
   uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (index * INDEX_ENTRY_SIZE);
-  int64_t timestamp = *(int64_t*)index_p;
-  uint64_t offset = *(uint64_t*)(index_p + 8);
+  int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
+  uint64_t offset = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
   // Skip zeroed entries
   if (timestamp == 0 || offset == 0) {
     return false;
   }
-  
+
   // Check frame offset bounds
   uint32_t index_region_end = BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
   if (offset < index_region_end || offset > block_size - FRAME_HEADER_SIZE) {
     return false;
   }
-  
+
   // Validate frame header
   uint32_t frame_size = 0;
-  if (!_validate_frame_header(block_p + offset, uuid, nullptr, &frame_size)) {
+  if (!_validate_frame_header(block_p + offset, uuid, nullptr, &frame_size, nullptr)) {
     return false;
   }
-  
+
   // Check if frame size fits within block
   if (frame_size > block_size - offset - FRAME_HEADER_SIZE) {
     return false;
   }
-  
+
   return true;
 }
 
@@ -226,7 +230,13 @@ static void _validate_blocks(const std::string& file_name) {
         nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
         nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
 
-    block_size = *(uint32_t*)mm.map();
+    uint8_t* hp = (uint8_t*)mm.map();
+    if (memcmp(hp + FILE_HEADER_MAGIC_OFFSET, NANOTS_FILE_MAGIC, NANOTS_FILE_MAGIC_LEN) != 0)
+      throw nanots_exception(NANOTS_EC_BAD_MAGIC, "Not a nanots v2 file (bad magic).", __FILE__, __LINE__);
+    uint16_t version = *(uint16_t*)(hp + FILE_HEADER_VERSION_OFFSET);
+    if (version != NANOTS_FORMAT_VERSION)
+      throw nanots_exception(NANOTS_EC_BAD_VERSION, "Unsupported nanots format version.", __FILE__, __LINE__);
+    block_size = *(uint32_t*)(hp + FILE_HEADER_BLOCK_SIZE_OFFSET);
   }
 
   auto db_name = _database_name(file_name);
@@ -303,13 +313,15 @@ static void _validate_blocks(const std::string& file_name) {
         nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
           uint8_t* last_index_p =
               block_p + BLOCK_HEADER_SIZE + (last_valid * INDEX_ENTRY_SIZE);
-          int64_t actual_last_timestamp = *(int64_t*)last_index_p;
+          int64_t actual_last_timestamp = *(int64_t*)(last_index_p + INDEX_ENTRY_TS_OFFSET);
+          int64_t actual_last_sk = *(int64_t*)(last_index_p + INDEX_ENTRY_SECKEY_OFFSET);
           auto stmt = conn.prepare(
-              "UPDATE segment_blocks SET end_timestamp = ? WHERE block_idx = ? AND uuid "
-              "= ?");
+              "UPDATE segment_blocks SET end_timestamp = ?, end_secondary_key = ? "
+              "WHERE block_idx = ? AND uuid = ?");
           stmt.bind(1, actual_last_timestamp)
-              .bind(2, block_idx)
-              .bind(3, uuid_hex)
+              .bind(2, actual_last_sk)
+              .bind(3, block_idx)
+              .bind(4, uuid_hex)
               .exec_no_result();
         });
       }
@@ -334,10 +346,18 @@ static void _set_db_version(const nts_sqlite_conn& conn, int version) {
 static void _upgrade_db(const nts_sqlite_conn& conn) {
   auto current_version = _get_db_version(conn);
 
+  // v2-only build: any pre-v2 database is rejected. (Fresh DBs created by
+  // allocate() are stamped to version 2 below.)
+  if (current_version != 0 && current_version < 2) {
+    throw nanots_exception(NANOTS_EC_BAD_VERSION,
+                           "Legacy nanots catalog (pre-v2) is not supported.",
+                           __FILE__, __LINE__);
+  }
+
   switch (current_version) {
     case 0: {
       nts_sqlite_transaction(
-          conn, true, [&](const nts_sqlite_conn& conn) { _set_db_version(conn, 1); });
+          conn, true, [&](const nts_sqlite_conn& conn) { _set_db_version(conn, 2); });
     }
       [[fallthrough]];
     default:
@@ -397,14 +417,36 @@ static std::optional<block> _db_get_free_block(const nts_sqlite_conn& conn) {
 //  which composes _db_get_free_block / _grow_blocks / _db_reclaim_oldest_used_block
 //  with the EBR limbo/ready machinery.)
 
+// Look up whether any existing segment for this stream tag uses the secondary
+// key. Returns nullopt if no segment exists yet for this stream (caller's
+// choice will become the canonical one), or the 0/1 value otherwise.
+static std::optional<int> _db_lookup_stream_has_secondary_key(
+    const nts_sqlite_conn& conn, const std::string& stream_tag) {
+  auto stmt = conn.prepare(
+      "SELECT has_secondary_key FROM segments WHERE stream_tag = ? LIMIT 1");
+  auto rows = stmt.bind(1, stream_tag).exec();
+  if (rows.empty()) return std::nullopt;
+  return std::stoi(rows.front()["has_secondary_key"].value());
+}
+
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
                                                  const std::string& stream_tag,
-                                                 const std::string& metadata) {
-  auto stmt =
-      conn.prepare("INSERT INTO segments (stream_tag, metadata) VALUES (?, ?)");
-  stmt.bind(1, stream_tag).bind(2, metadata).exec_no_result();
+                                                 const std::string& metadata,
+                                                 bool has_secondary_key) {
+  auto stmt = conn.prepare(
+      "INSERT INTO segments (stream_tag, metadata, has_secondary_key) VALUES (?, ?, ?)");
+  stmt.bind(1, stream_tag)
+      .bind(2, metadata)
+      .bind(3, has_secondary_key ? 1 : 0)
+      .exec_no_result();
 
-  return segment{std::stoll(conn.last_insert_id()), stream_tag, metadata, 0};
+  segment s;
+  s.id = std::stoll(conn.last_insert_id());
+  s.stream_tag = stream_tag;
+  s.metadata = metadata;
+  s.sequence = 0;
+  s.has_secondary_key = has_secondary_key;
+  return s;
 }
 
 static std::optional<segment_block> _db_create_segment_block(
@@ -415,6 +457,8 @@ static std::optional<segment_block> _db_create_segment_block(
     int64_t block_idx,
     int64_t start_timestamp,
     int64_t end_timestamp,
+    int64_t start_secondary_key,
+    int64_t end_secondary_key,
     const uint8_t* uuid) {
   auto stmt = conn.prepare(
       "INSERT INTO segment_blocks ("
@@ -424,8 +468,10 @@ static std::optional<segment_block> _db_create_segment_block(
       "block_idx, "
       "start_timestamp, "
       "end_timestamp, "
+      "start_secondary_key, "
+      "end_secondary_key, "
       "uuid"
-      ") VALUES (?, ?, ?, ?, ?, ?, ?)");
+      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
   auto hex_uuid = entropy_id_to_s(uuid);
 
@@ -435,7 +481,9 @@ static std::optional<segment_block> _db_create_segment_block(
       .bind(4, block_idx)
       .bind(5, start_timestamp)
       .bind(6, end_timestamp)
-      .bind(7, hex_uuid)
+      .bind(7, start_secondary_key)
+      .bind(8, end_secondary_key)
+      .bind(9, hex_uuid)
       .exec_no_result();
 
   struct segment_block sb;
@@ -446,6 +494,8 @@ static std::optional<segment_block> _db_create_segment_block(
   sb.block_idx = block_idx;
   sb.start_timestamp = start_timestamp;
   sb.end_timestamp = end_timestamp;
+  sb.start_secondary_key = start_secondary_key;
+  sb.end_secondary_key = end_secondary_key;
   memcpy(sb.uuid, uuid, 16);
 
   return sb;
@@ -453,9 +503,15 @@ static std::optional<segment_block> _db_create_segment_block(
 
 static void _db_finalize_block(const nts_sqlite_conn& conn,
                                int64_t segment_block_id,
-                               int64_t timestamp) {
-  auto stmt = conn.prepare("UPDATE segment_blocks SET end_timestamp = ? WHERE id = ?");
-  stmt.bind(1, timestamp).bind(2, segment_block_id).exec_no_result();
+                               int64_t timestamp,
+                               int64_t secondary_key) {
+  auto stmt = conn.prepare(
+      "UPDATE segment_blocks SET end_timestamp = ?, end_secondary_key = ? "
+      "WHERE id = ?");
+  stmt.bind(1, timestamp)
+      .bind(2, secondary_key)
+      .bind(3, segment_block_id)
+      .exec_no_result();
 }
 
 static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
@@ -512,8 +568,10 @@ write_context::~write_context() {
     auto db_name = _database_name(file_name);
     nts_sqlite_conn conn(db_name, true, true);
 
+    int64_t end_sk = last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
+
     nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      _db_finalize_block(conn, current_block->id, last_timestamp.value());
+      _db_finalize_block(conn, current_block->id, last_timestamp.value(), end_sk);
       // This is a maintenance task that needs to be done periodically.
       _db_trans_finalize_reserved_blocks(conn);
     });
@@ -531,16 +589,24 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
           nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
           nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED),
       _file_header_p((uint8_t*)_file_header_mm.map()),
-      _block_size(*(uint32_t*)_file_header_p),
-      _n_blocks(*(uint32_t*)(_file_header_p + sizeof(uint32_t))),
-      // max_blocks lives at offset 8. For legacy preallocated files this byte
-      // range was zeroed by fallocate (Linux/macOS) or left at whatever
-      // SetEndOfFile produced (Windows). Only consulted in growable mode, and
-      // new allocate() always writes 0 here, so legacy preallocated files are
-      // unaffected.
-      _max_blocks(*(uint32_t*)(_file_header_p + 8)),
+      _block_size(*(uint32_t*)(_file_header_p + FILE_HEADER_BLOCK_SIZE_OFFSET)),
+      _n_blocks(*(uint32_t*)(_file_header_p + FILE_HEADER_N_BLOCKS_OFFSET)),
+      _max_blocks(*(uint32_t*)(_file_header_p + FILE_HEADER_MAX_BLOCKS_OFFSET)),
       _auto_reclaim(auto_reclaim),
       _epoch(nanots_epoch_registry::get_or_create(file_name)) {
+  // Validate v2 magic + version up front. Legacy v1 files (which had
+  // block_size at offset 0) are rejected by design.
+  if (memcmp(_file_header_p + FILE_HEADER_MAGIC_OFFSET,
+             NANOTS_FILE_MAGIC, NANOTS_FILE_MAGIC_LEN) != 0)
+    throw nanots_exception(NANOTS_EC_BAD_MAGIC,
+                           "Not a nanots v2 file (bad magic). Legacy v1 files are not supported.",
+                           __FILE__, __LINE__);
+  uint16_t version = *(uint16_t*)(_file_header_p + FILE_HEADER_VERSION_OFFSET);
+  if (version != NANOTS_FORMAT_VERSION)
+    throw nanots_exception(NANOTS_EC_BAD_VERSION,
+                           "Unsupported nanots format version.",
+                           __FILE__, __LINE__);
+
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
@@ -605,7 +671,7 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
                                                   const std::string& metadata) {
 
   std::string key = _file_name + ":" + stream_tag;
-  
+
   std::lock_guard<std::mutex> g(current_stream_tags_lok);
   if(current_stream_tags.find(key) != current_stream_tags.end())
     throw nanots_exception(NANOTS_EC_DUPLICATE_STREAM_TAG, "Only one current writer per active stream tag.", __FILE__, __LINE__);
@@ -616,15 +682,9 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
   wctx.file_name = _file_name;
   wctx._block_size = _block_size;
 
-  auto db_name = _database_name(_file_name);
-
-  nts_sqlite_conn conn(db_name.c_str(), true, true);
-
-  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-    wctx.current_segment = _db_create_segment(conn, stream_tag, metadata);
-    if (!wctx.current_segment)
-      throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
-  });
+  // Segment creation is deferred to the first write(): only then do we know
+  // whether the caller intends this stream to carry a secondary key, which
+  // is recorded permanently on the segments row.
 
   current_stream_tags.insert(key);
 
@@ -722,14 +782,59 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
 void nanots_writer::write(write_context& wctx,
                           const uint8_t* data,
                           size_t size,
+                          uint32_t flags,
                           int64_t timestamp,
-                          uint8_t flags) {
+                          int64_t secondary_key) {
   if (wctx.last_timestamp && timestamp <= wctx.last_timestamp.value())
     throw nanots_exception(NANOTS_EC_NON_MONOTONIC_TIMESTAMP, "Timestamp is not monotonic.", __FILE__, __LINE__);
 
   if (size >
       _block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE))
     throw nanots_exception(NANOTS_EC_ROW_SIZE_TOO_BIG, "Frame size is too large. Use a much larger block size.", __FILE__, __LINE__);
+
+  // First write to this context: lazily create (or attach to) the segment
+  // row. The very first write to a brand-new stream tag fixes the choice of
+  // whether the stream stores a secondary key on every frame.
+  if (!wctx.current_segment) {
+    bool wants_sec_key = (secondary_key != NANOTS_SEC_KEY_UNSET);
+
+    nts_sqlite_conn conn(_database_name(_file_name), true, true);
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+      auto existing = _db_lookup_stream_has_secondary_key(conn, wctx.stream_tag);
+      if (existing.has_value()) {
+        bool existing_yes = (*existing != 0);
+        if (existing_yes != wants_sec_key) {
+          throw nanots_exception(
+              NANOTS_EC_SECONDARY_KEY_MISMATCH,
+              "Stream's secondary-key mode is fixed by its first write and "
+              "this write does not match.", __FILE__, __LINE__);
+        }
+      }
+      wctx.current_segment = _db_create_segment(
+          conn, wctx.stream_tag, wctx.metadata, wants_sec_key);
+      if (!wctx.current_segment)
+        throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
+    });
+  } else {
+    // Subsequent writes: enforce the per-stream choice that was locked in
+    // on the first write.
+    bool stream_wants = wctx.current_segment->has_secondary_key;
+    bool this_write_provides = (secondary_key != NANOTS_SEC_KEY_UNSET);
+    if (stream_wants != this_write_provides) {
+      throw nanots_exception(
+          NANOTS_EC_SECONDARY_KEY_MISMATCH,
+          "Stream's secondary-key mode is fixed and this write does not match.",
+          __FILE__, __LINE__);
+    }
+  }
+
+  if (secondary_key != NANOTS_SEC_KEY_UNSET &&
+      wctx.last_secondary_key.has_value() &&
+      secondary_key <= wctx.last_secondary_key.value()) {
+    throw nanots_exception(NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY,
+                           "Secondary key is not monotonic.",
+                           __FILE__, __LINE__);
+  }
 
   if (!wctx.current_block) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
@@ -747,7 +852,7 @@ void nanots_writer::write(write_context& wctx,
 
       wctx.current_block = _db_create_segment_block(
           conn, wctx.current_segment->id, wctx.current_segment->sequence,
-          phys.id, phys.idx, timestamp, 0, uuid);
+          phys.id, phys.idx, timestamp, 0, secondary_key, 0, uuid);
 
       if (!wctx.current_block)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
@@ -783,7 +888,7 @@ void nanots_writer::write(write_context& wctx,
   if (n_valid_indexes > 0) {
     uint8_t* last_index_p = block_p + BLOCK_HEADER_SIZE +
                             ((n_valid_indexes - 1) * INDEX_ENTRY_SIZE);
-    uint64_t last_frame_offset = *(uint64_t*)(last_index_p + 8);
+    uint64_t last_frame_offset = *(uint64_t*)(last_index_p + INDEX_ENTRY_OFFSET_OFFSET);
     if (last_frame_offset >= padded_frame_size) {
       uint64_t candidate_ofs = last_frame_offset - padded_frame_size;
       new_block_ofs = (candidate_ofs >= index_end) ? candidate_ofs : index_end;
@@ -797,26 +902,31 @@ void nanots_writer::write(write_context& wctx,
 
     wctx.mm.flush(wctx.mm.map(), _block_size, true);
 
+    int64_t end_sk = wctx.last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
     nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      _db_finalize_block(conn, wctx.current_block->id, wctx.last_timestamp.value());
+      _db_finalize_block(conn, wctx.current_block->id,
+                         wctx.last_timestamp.value(), end_sk);
     });
 
     wctx.current_block = std::nullopt;
     wctx.mm = nts_memory_map();
 
-    return write(wctx, data, size, timestamp, flags);
+    return write(wctx, data, size, flags, timestamp, secondary_key);
   }
 
   uint8_t* frame_p = block_p + new_block_ofs;
-  memcpy(frame_p, wctx.current_block->uuid, 16);
-  *(uint32_t*)(frame_p + 16) = (uint32_t)size;
-  *(frame_p + 20) = flags;
+  memcpy(frame_p + FRAME_UUID_OFFSET, wctx.current_block->uuid, 16);
+  *(int64_t*)(frame_p + FRAME_SECKEY_OFFSET) = secondary_key;
+  *(uint32_t*)(frame_p + FRAME_SIZE_OFFSET) = (uint32_t)size;
+  *(uint32_t*)(frame_p + FRAME_FLAGS_OFFSET) = flags;
   memcpy(frame_p + FRAME_HEADER_SIZE, data, size);
 
   uint8_t* index_p =
       block_p + BLOCK_HEADER_SIZE + (n_valid_indexes * INDEX_ENTRY_SIZE);
-  *(int64_t*)index_p = timestamp;
-  *(uint64_t*)(index_p + 8) = new_block_ofs;
+  *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET) = timestamp;
+  *(int64_t*)(index_p + INDEX_ENTRY_SECKEY_OFFSET) = secondary_key;
+  *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET) = new_block_ofs;
+  *(uint64_t*)(index_p + INDEX_ENTRY_RESERVED_OFFSET) = 0;
 
   auto valid_counter = (uint32_t*)(block_p + 8);
 
@@ -827,6 +937,8 @@ void nanots_writer::write(write_context& wctx,
 #endif
 
   wctx.last_timestamp = timestamp;
+  if (secondary_key != NANOTS_SEC_KEY_UNSET)
+    wctx.last_secondary_key = secondary_key;
 }
 
 void nanots_writer::free_blocks(const std::string& file_name,
@@ -868,7 +980,6 @@ void nanots_writer::allocate_growable(const std::string& file_name,
                                       uint32_t block_size,
                                       uint32_t max_blocks) {
   // Growable mode is signalled by n_blocks == 0 in the file header.
-  // The optional max_blocks cap is stored at offset 8.
   allocate(file_name, block_size, 0);
 
   if (max_blocks > 0) {
@@ -878,8 +989,8 @@ void nanots_writer::allocate_growable(const std::string& file_name,
         nts_memory_map::NMM_PROT_READ | nts_memory_map::NMM_PROT_WRITE,
         nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
     uint8_t* p = (uint8_t*)mm.map();
-    *(uint32_t*)(p + 8) = max_blocks;
-    mm.flush(mm.map(), 12);
+    *(uint32_t*)(p + FILE_HEADER_MAX_BLOCKS_OFFSET) = max_blocks;
+    mm.flush(mm.map(), FILE_HEADER_USED_BYTES);
   }
 }
 
@@ -912,16 +1023,19 @@ void nanots_writer::allocate(const std::string& file_name,
 
     uint8_t* p = (uint8_t*)mm.map();
 
-    // write a file header
-    *(uint32_t*)p = block_size;
-    p += sizeof(uint32_t);
-    *(uint32_t*)p = n_blocks;
-    p += sizeof(uint32_t);
-    // offset 8: max_blocks cap for growable mode (0 = unbounded). Always
-    // zero here; allocate_growable() overwrites it if a cap was requested.
-    *(uint32_t*)p = 0;
+    // Write the v2 file header. Zero the first 64 bytes first so we have a
+    // clean slate (fallocate / SetEndOfFile leave indeterminate bytes here).
+    memset(p, 0, 64);
+    memcpy(p + FILE_HEADER_MAGIC_OFFSET, NANOTS_FILE_MAGIC, NANOTS_FILE_MAGIC_LEN);
+    *(uint16_t*)(p + FILE_HEADER_VERSION_OFFSET) = (uint16_t)NANOTS_FORMAT_VERSION;
+    *(uint16_t*)(p + FILE_HEADER_HSIZE_OFFSET)   = (uint16_t)FILE_HEADER_USED_BYTES;
+    *(uint32_t*)(p + FILE_HEADER_BLOCK_SIZE_OFFSET) = block_size;
+    *(uint32_t*)(p + FILE_HEADER_N_BLOCKS_OFFSET)   = n_blocks;
+    *(uint32_t*)(p + FILE_HEADER_MAX_BLOCKS_OFFSET) = 0;
+    *(uint32_t*)(p + FILE_HEADER_FLAGS_OFFSET)      = 0;
+    *(uint64_t*)(p + FILE_HEADER_FEATURES_OFFSET)   = 0;
 
-    mm.flush(mm.map(), 12);
+    mm.flush(mm.map(), 64);
   }
 
   auto db_name = _database_name(file_name);
@@ -944,7 +1058,8 @@ void nanots_writer::allocate(const std::string& file_name,
       "CREATE TABLE segments ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
       "stream_tag STRING, "
-      "metadata STRING "
+      "metadata STRING, "
+      "has_secondary_key INTEGER NOT NULL DEFAULT 0"
       ");";
   db.exec(query);
 
@@ -957,6 +1072,8 @@ void nanots_writer::allocate(const std::string& file_name,
       "block_idx INTEGER, "
       "start_timestamp INTEGER, "
       "end_timestamp INTEGER, "
+      "start_secondary_key INTEGER, "
+      "end_secondary_key INTEGER, "
       "uuid STRING, "
       "FOREIGN KEY (segment_id) REFERENCES segments(id)"
       ");";
@@ -982,6 +1099,11 @@ void nanots_writer::allocate(const std::string& file_name,
 
   query =
       "CREATE INDEX idx_segment_blocks_time_range ON segment_blocks(start_timestamp);";
+  db.exec(query);
+
+  query =
+      "CREATE INDEX idx_segment_blocks_sec_key ON "
+      "segment_blocks(segment_id, start_secondary_key);";
   db.exec(query);
 
   query = "CREATE INDEX idx_segments_stream_tag ON segments(stream_tag);";
@@ -1014,14 +1136,24 @@ nanots_reader::nanots_reader(const std::string& file_name)
 
   auto header_p = (uint8_t*)mm.map();
 
-  _block_size = *(uint32_t*)header_p;
+  if (memcmp(header_p + FILE_HEADER_MAGIC_OFFSET,
+             NANOTS_FILE_MAGIC, NANOTS_FILE_MAGIC_LEN) != 0)
+    throw nanots_exception(NANOTS_EC_BAD_MAGIC,
+                           "Not a nanots v2 file (bad magic).",
+                           __FILE__, __LINE__);
+  uint16_t version = *(uint16_t*)(header_p + FILE_HEADER_VERSION_OFFSET);
+  if (version != NANOTS_FORMAT_VERSION)
+    throw nanots_exception(NANOTS_EC_BAD_VERSION,
+                           "Unsupported nanots format version.",
+                           __FILE__, __LINE__);
 
-  _n_blocks = (*(uint32_t*)(header_p + sizeof(uint32_t)));
+  _block_size = *(uint32_t*)(header_p + FILE_HEADER_BLOCK_SIZE_OFFSET);
+  _n_blocks   = *(uint32_t*)(header_p + FILE_HEADER_N_BLOCKS_OFFSET);
 }
 
 static int _compare_index_entry_timestamp(uint8_t* index_entry_p,
                                           uint8_t* target_timestamp_p) {
-  int64_t entry_timestamp = *(int64_t*)index_entry_p;
+  int64_t entry_timestamp = *(int64_t*)(index_entry_p + INDEX_ENTRY_TS_OFFSET);
   int64_t target_timestamp = *(int64_t*)target_timestamp_p;
 
   if (entry_timestamp < target_timestamp)
@@ -1031,12 +1163,24 @@ static int _compare_index_entry_timestamp(uint8_t* index_entry_p,
   return 0;
 }
 
+static int _compare_index_entry_secondary_key(uint8_t* index_entry_p,
+                                              uint8_t* target_sk_p) {
+  int64_t entry_sk = *(int64_t*)(index_entry_p + INDEX_ENTRY_SECKEY_OFFSET);
+  int64_t target_sk = *(int64_t*)target_sk_p;
+
+  if (entry_sk < target_sk)
+    return -1;
+  if (entry_sk > target_sk)
+    return 1;
+  return 0;
+}
+
 void nanots_reader::read(
     const std::string& stream_tag,
     int64_t start_timestamp,
     int64_t end_timestamp,
     const std::function<
-        void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback) {
+        void(const uint8_t*, size_t, uint32_t, int64_t, int64_t, int64_t, const std::string&)>& callback) {
   // EBR critical section spans the entire read(): the writer must not
   // overwrite any block whose bytes the callback might dereference.
   nanots_op_scope _op(_slot_guard);
@@ -1104,25 +1248,26 @@ void nanots_reader::read(
     // Iterate through frames in this block
     for (size_t i = start_index; i < n_valid_indexes; i++) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
-      int64_t timestamp = *(int64_t*)index_p;
-      uint64_t offset = *(uint64_t*)(index_p + 8);
+      int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
+      uint64_t offset   = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
       // Check if we've passed the end time
       if (timestamp > end_timestamp)
         return;  // All done!
 
       // Validate frame header
-      uint8_t flags;
+      uint32_t flags;
       uint32_t frame_size;
+      int64_t sec_key;
       if (!_validate_frame_header(block_p + offset, uuid, &flags,
-                                  &frame_size)) {
+                                  &frame_size, &sec_key)) {
         // Log warning? Skip corrupted frame
         continue;
       }
 
       // Callback with frame data
       callback(block_p + offset + FRAME_HEADER_SIZE, (size_t)frame_size, flags,
-               timestamp, block_sequence, metadata);
+               timestamp, sec_key, block_sequence, metadata);
     }
   }
 }
@@ -1221,16 +1366,43 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _valid(false),
       _initialized(false),
       _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
-  // Read block size from file header
+  // Read block size + validate magic/version from file header.
   auto header_mm = nts_memory_map(
       filenum(_file), 0, FILE_HEADER_BLOCK_SIZE, nts_memory_map::NMM_PROT_READ,
       nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
 
   auto header_p = (uint8_t*)header_mm.map();
-  _block_size = *(uint32_t*)header_p;
+
+  if (memcmp(header_p + FILE_HEADER_MAGIC_OFFSET,
+             NANOTS_FILE_MAGIC, NANOTS_FILE_MAGIC_LEN) != 0)
+    throw nanots_exception(NANOTS_EC_BAD_MAGIC,
+                           "Not a nanots v2 file (bad magic).",
+                           __FILE__, __LINE__);
+  uint16_t version = *(uint16_t*)(header_p + FILE_HEADER_VERSION_OFFSET);
+  if (version != NANOTS_FORMAT_VERSION)
+    throw nanots_exception(NANOTS_EC_BAD_VERSION,
+                           "Unsupported nanots format version.",
+                           __FILE__, __LINE__);
+
+  _block_size = *(uint32_t*)(header_p + FILE_HEADER_BLOCK_SIZE_OFFSET);
 
   // Initialize to first frame if stream exists
   reset();
+}
+
+bool nanots_iterator::has_secondary_key() {
+  if (_has_secondary_key_cache >= 0) return _has_secondary_key_cache != 0;
+  auto& db = _ensure_db_connection();
+  auto stmt = db.prepare(
+      "SELECT has_secondary_key FROM segments WHERE stream_tag = ? LIMIT 1");
+  auto rows = stmt.bind(1, _stream_tag).exec();
+  int v = 0;
+  if (!rows.empty()) {
+    auto& cell = rows.front()["has_secondary_key"];
+    if (cell.has_value()) v = std::stoi(cell.value());
+  }
+  _has_secondary_key_cache = v;
+  return v != 0;
 }
 
 nts_sqlite_conn& nanots_iterator::_ensure_db_connection() {
@@ -1253,11 +1425,14 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
     _stmt_get_block_by_id.emplace(_ensure_db_connection().prepare(
         "SELECT "
         "s.metadata as metadata, "
+        "s.has_secondary_key as has_secondary_key, "
         "sb.segment_id as segment_id, "
         "sb.sequence as block_sequence, "
         "sb.block_idx as block_idx, "
         "sb.start_timestamp as start_timestamp, "
         "sb.end_timestamp as end_timestamp, "
+        "sb.start_secondary_key as start_secondary_key, "
+        "sb.end_secondary_key as end_secondary_key, "
         "sb.uuid as uuid "
         "FROM segments s "
         "JOIN segment_blocks sb ON sb.segment_id = s.id "
@@ -1276,11 +1451,21 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   block.block_idx = std::stoll(row["block_idx"].value());
   block.block_sequence = std::stoll(row["block_sequence"].value());
   block.segment_id = std::stoll(row["segment_id"].value());
-  block.metadata = row["metadata"].value();
+  // Metadata may legitimately be the empty string, which the sqlite wrapper
+  // reports as a missing optional.
+  block.metadata = row["metadata"].has_value() ? row["metadata"].value() : std::string();
   block.uuid_hex = row["uuid"].value();
   block.start_timestamp = std::stoll(row["start_timestamp"].value());
   block.end_timestamp = std::stoll(row["end_timestamp"].value());
-  
+  auto& hsk = row["has_secondary_key"];
+  block.has_secondary_key = hsk.has_value() && std::stoi(hsk.value()) != 0;
+  auto& sk_start = row["start_secondary_key"];
+  block.start_secondary_key = sk_start.has_value()
+      ? std::stoll(sk_start.value()) : NANOTS_SEC_KEY_UNSET;
+  auto& sk_end = row["end_secondary_key"];
+  block.end_secondary_key = sk_end.has_value()
+      ? std::stoll(sk_end.value()) : NANOTS_SEC_KEY_UNSET;
+
   auto result = _block_cache.emplace(cache_key, std::move(block));
   return &result.first->second;
 }
@@ -1301,7 +1486,8 @@ void nanots_iterator::_refresh_ts_index() {
   // already in start_ts order — no sort needed.
   auto stmt = db.prepare(
       "SELECT sb.segment_id, sb.sequence, "
-      "       sb.start_timestamp, sb.end_timestamp "
+      "       sb.start_timestamp, sb.end_timestamp, "
+      "       sb.start_secondary_key, sb.end_secondary_key "
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
       "WHERE s.stream_tag = ? "
@@ -1316,9 +1502,32 @@ void nanots_iterator::_refresh_ts_index() {
     br.sequence   = std::stoll(row["sequence"].value());
     br.start_ts   = std::stoll(row["start_timestamp"].value());
     br.end_ts     = std::stoll(row["end_timestamp"].value());
+    auto& s_sk = row["start_secondary_key"];
+    auto& e_sk = row["end_secondary_key"];
+    br.start_sk = s_sk.has_value() ? std::stoll(s_sk.value())
+                                   : NANOTS_SEC_KEY_UNSET;
+    br.end_sk   = e_sk.has_value() ? std::stoll(e_sk.value())
+                                   : NANOTS_SEC_KEY_UNSET;
     _ts_index.push_back(br);
   }
   _ts_index_filled = true;
+}
+
+size_t nanots_iterator::_ts_index_find_by_sk(int64_t sk) const {
+  // Prefer a block that covers sk.
+  auto it = std::upper_bound(_ts_index.begin(), _ts_index.end(), sk,
+      [](int64_t k, const BlockRange& br) { return k < br.start_sk; });
+  if (it != _ts_index.begin()) {
+    auto prev = std::prev(it);
+    if (sk >= prev->start_sk &&
+        (prev->end_sk == 0 || sk <= prev->end_sk)) {
+      return static_cast<size_t>(std::distance(_ts_index.begin(), prev));
+    }
+  }
+  if (it != _ts_index.end()) {
+    return static_cast<size_t>(std::distance(_ts_index.begin(), it));
+  }
+  return _ts_index.size();
 }
 
 size_t nanots_iterator::_ts_index_find(int64_t ts) const {
@@ -1456,6 +1665,73 @@ block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
   return try_at(pos);
 }
 
+block_info* nanots_iterator::_find_block_for_secondary_key(int64_t sec_key) {
+  _ensure_ts_index();
+
+  auto try_at = [&](size_t pos) -> block_info* {
+    if (pos >= _ts_index.size()) return nullptr;
+    const auto& br = _ts_index[pos];
+    auto* b = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
+    if (b) _ts_index_pos = pos;
+    return b;
+  };
+
+  size_t pos = _ts_index_find_by_sk(sec_key);
+  if (auto* b = try_at(pos)) return b;
+
+  _refresh_ts_index();
+  pos = _ts_index_find_by_sk(sec_key);
+  return try_at(pos);
+}
+
+bool nanots_iterator::find_by_secondary_key(int64_t sec_key) {
+  nanots_op_scope _op(_slot_guard);
+
+  if (!has_secondary_key()) {
+    _valid = false;
+    return false;
+  }
+
+  block_info* block = _find_block_for_secondary_key(sec_key);
+  if (!block) {
+    _valid = false;
+    return false;
+  }
+
+  if (!_load_block_data(*block)) {
+    _valid = false;
+    return false;
+  }
+
+  _current_block_start_ts = block->start_timestamp;
+  _current_block_end_ts   = block->end_timestamp;
+  _current_segment_id     = block->segment_id;
+  _current_block_sequence = block->block_sequence;
+
+  uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
+  uint8_t* index_end   = index_start + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
+
+  uint8_t* found_entry =
+      lower_bound_bytes(index_start, index_end, (uint8_t*)&sec_key,
+                        INDEX_ENTRY_SIZE,
+                        _compare_index_entry_secondary_key);
+
+  _current_frame_idx = (found_entry - index_start) / INDEX_ENTRY_SIZE;
+
+  if (_current_frame_idx >= block->n_valid_indexes) {
+    auto* next_block = _get_next_block();
+    if (!next_block) {
+      _valid = false;
+      return false;
+    }
+    _current_segment_id = next_block->segment_id;
+    _current_block_sequence = next_block->block_sequence;
+    _current_frame_idx = 0;
+  }
+
+  return _load_current_frame();
+}
+
 bool nanots_iterator::_load_block_data(block_info& block) {
   if (block.is_loaded)
     return true;
@@ -1504,14 +1780,15 @@ bool nanots_iterator::_load_current_frame() {
   // Get frame info from index
   uint8_t* index_p = block->block_p + BLOCK_HEADER_SIZE +
                      (_current_frame_idx * INDEX_ENTRY_SIZE);
-  int64_t timestamp = *(int64_t*)index_p;
-  uint64_t offset = *(uint64_t*)(index_p + 8);
+  int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
+  uint64_t offset   = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
   // Validate frame header
-  uint8_t flags;
+  uint32_t flags;
   uint32_t frame_size;
+  int64_t sec_key;
   if (!_validate_frame_header(block->block_p + offset, block->uuid, &flags,
-                              &frame_size)) {
+                              &frame_size, &sec_key)) {
     _valid = false;
     return false;
   }
@@ -1521,6 +1798,7 @@ bool nanots_iterator::_load_current_frame() {
   _current_frame.size = frame_size;
   _current_frame.flags = flags;
   _current_frame.timestamp = timestamp;
+  _current_frame.secondary_key = sec_key;
   _current_frame.block_sequence = block->block_sequence;
 
   _valid = true;
@@ -1643,14 +1921,15 @@ bool nanots_iterator::find(int64_t timestamp) {
   // Get frame info from index
   uint8_t* index_p = block->block_p + BLOCK_HEADER_SIZE +
                      (_current_frame_idx * INDEX_ENTRY_SIZE);
-  int64_t found_timestamp = *(int64_t*)index_p;
-  uint64_t offset = *(uint64_t*)(index_p + 8);
+  int64_t found_timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
+  uint64_t offset = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
   // Validate frame header
-  uint8_t flags;
+  uint32_t flags;
   uint32_t frame_size;
+  int64_t sec_key;
   if (!_validate_frame_header(block->block_p + offset, block->uuid, &flags,
-                              &frame_size)) {
+                              &frame_size, &sec_key)) {
     _valid = false;
     return false;
   }
@@ -1660,6 +1939,7 @@ bool nanots_iterator::find(int64_t timestamp) {
   _current_frame.size = frame_size;
   _current_frame.flags = flags;
   _current_frame.timestamp = found_timestamp;
+  _current_frame.secondary_key = sec_key;
   _current_frame.block_sequence = block->block_sequence;
 
   _valid = true;
@@ -1819,8 +2099,9 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
                                 nanots_write_context_t context,
                                 const uint8_t* data,
                                 size_t size,
+                                uint32_t flags,
                                 int64_t timestamp,
-                                uint8_t flags) {
+                                int64_t secondary_key) {
   if (!writer || !writer->writer) {
     return NANOTS_EC_INVALID_ARGUMENT;
   }
@@ -1829,7 +2110,8 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
   }
 
   try {
-    writer->writer->write(context->context, data, size, timestamp, flags);
+    writer->writer->write(context->context, data, size,
+                          flags, timestamp, secondary_key);
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
     return e.get_ec();
@@ -1904,9 +2186,10 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
   try {
     nanots_callback_context ctx{callback, user_data};
     reader->reader->read(std::string(stream_tag), start_timestamp, end_timestamp,
-                         [&ctx](const uint8_t* data, size_t size, uint8_t flags,
-                                int64_t timestamp, int64_t block_sequence, const std::string& metadata) {
-                           ctx.callback(data, size, flags, timestamp,
+                         [&ctx](const uint8_t* data, size_t size, uint32_t flags,
+                                int64_t timestamp, int64_t secondary_key,
+                                int64_t block_sequence, const std::string& metadata) {
+                           ctx.callback(data, size, flags, timestamp, secondary_key,
                                         block_sequence, metadata.c_str(), ctx.user_data);
                          });
     return NANOTS_EC_OK;
@@ -2057,6 +2340,7 @@ nanots_ec_t nanots_iterator_get_current_frame(
     frame_info->size = frame.size;
     frame_info->flags = frame.flags;
     frame_info->timestamp = frame.timestamp;
+    frame_info->secondary_key = frame.secondary_key;
     frame_info->block_sequence = frame.block_sequence;
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
@@ -2125,6 +2409,37 @@ nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
   } catch (...) {
     fprintf(stderr,"Exception in nanots_iterator_find\n");
     return NANOTS_EC_UNKNOWN;
+  }
+}
+
+nanots_ec_t nanots_iterator_find_by_secondary_key(nanots_iterator_t iterator,
+                                                  int64_t secondary_key) {
+  if (!iterator || !iterator->iterator) {
+    return NANOTS_EC_INVALID_ARGUMENT;
+  }
+
+  try {
+    bool found = iterator->iterator->find_by_secondary_key(secondary_key);
+    return found ? NANOTS_EC_OK : NANOTS_EC_INVALID_ARGUMENT;
+  } catch (const nanots_exception& e) {
+    return e.get_ec();
+  } catch (const std::exception& e) {
+    fprintf(stderr,"Exception in nanots_iterator_find_by_secondary_key: %s\n", e.what());
+    return NANOTS_EC_UNKNOWN;
+  } catch (...) {
+    fprintf(stderr,"Exception in nanots_iterator_find_by_secondary_key\n");
+    return NANOTS_EC_UNKNOWN;
+  }
+}
+
+int nanots_iterator_has_secondary_key(nanots_iterator_t iterator) {
+  if (!iterator || !iterator->iterator) {
+    return 0;
+  }
+  try {
+    return iterator->iterator->has_secondary_key() ? 1 : 0;
+  } catch (...) {
+    return 0;
   }
 }
 

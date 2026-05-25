@@ -39,6 +39,7 @@
 #include <unordered_map>
 #include <vector>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <algorithm>

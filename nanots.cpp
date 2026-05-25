@@ -6,6 +6,141 @@
 std::mutex current_stream_tags_lok;
 std::set<std::string> current_stream_tags;
 
+// ---------------------------------------------------------------------------
+// Epoch-Based Reclamation registry implementation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int64_t _now_us() {
+  using namespace std::chrono;
+  return duration_cast<microseconds>(
+             steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Path-keyed table of registries. Both writers and iterators look up here
+// at construction time. weak_ptr means entries naturally evaporate when the
+// last writer and iterator on a file are destroyed.
+std::mutex                                                    g_registry_table_mu;
+std::map<std::string, std::weak_ptr<nanots_epoch_registry>>   g_registry_table;
+
+}  // namespace
+
+nanots_epoch_registry::Slot& nanots_epoch_registry::slot(uint32_t id) {
+  // The slot's address is stable once allocated (unique_ptr in a vector).
+  // We still take the lock so concurrent grows are safe.
+  std::lock_guard<std::mutex> g(_slots_mu);
+  return *_slots[id];
+}
+
+uint32_t nanots_epoch_registry::acquire_slot() {
+  std::lock_guard<std::mutex> g(_slots_mu);
+
+  // First try to reuse an INACTIVE slot.
+  for (size_t i = 0; i < _slots.size(); ++i) {
+    if (_slots[i]->epoch.load(std::memory_order_relaxed) == INACTIVE) {
+      // Mark acquired with a temporary 0 epoch; caller will overwrite via
+      // op_begin().
+      _slots[i]->epoch.store(0, std::memory_order_relaxed);
+      return static_cast<uint32_t>(i);
+    }
+  }
+
+  // No free slot; grow.
+  _slots.emplace_back(std::make_unique<Slot>());
+  _slots.back()->epoch.store(0, std::memory_order_relaxed);
+  return static_cast<uint32_t>(_slots.size() - 1);
+}
+
+void nanots_epoch_registry::release_slot(uint32_t id) {
+  std::lock_guard<std::mutex> g(_slots_mu);
+  if (id < _slots.size()) {
+    _slots[id]->epoch.store(INACTIVE, std::memory_order_release);
+  }
+}
+
+bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
+                                        int64_t  now_us) const {
+  std::lock_guard<std::mutex> g(_slots_mu);
+  for (const auto& slot_ptr : _slots) {
+    uint64_t e = slot_ptr->epoch.load(std::memory_order_acquire);
+    if (e == INACTIVE) continue;
+    if (e > retired_epoch) continue;
+
+    // Slot is at-or-before the retire. Check liveness via heartbeat.
+    int64_t hb = slot_ptr->heartbeat_us.load(std::memory_order_relaxed);
+    if (now_us - hb > NANOTS_HEARTBEAT_TIMEOUT_US) continue;  // dead, ignore
+
+    return false;  // active reader still pinning this retire
+  }
+  return true;
+}
+
+std::shared_ptr<nanots_epoch_registry>
+nanots_epoch_registry::get_or_create(const std::string& file_path) {
+  std::lock_guard<std::mutex> g(g_registry_table_mu);
+
+  auto it = g_registry_table.find(file_path);
+  if (it != g_registry_table.end()) {
+    if (auto sp = it->second.lock()) return sp;
+    // weak_ptr expired; fall through and create a new one.
+  }
+
+  auto sp = std::make_shared<nanots_epoch_registry>();
+  g_registry_table[file_path] = sp;
+  return sp;
+}
+
+// ---------------------------------------------------------------------------
+// nanots_slot_guard
+// ---------------------------------------------------------------------------
+
+nanots_slot_guard::nanots_slot_guard(
+    std::shared_ptr<nanots_epoch_registry> registry)
+    : _registry(std::move(registry)) {
+  if (_registry) {
+    _slot_id = _registry->acquire_slot();
+    op_begin();  // publish initial epoch + heartbeat
+  }
+}
+
+nanots_slot_guard::~nanots_slot_guard() { _release(); }
+
+nanots_slot_guard::nanots_slot_guard(nanots_slot_guard&& other) noexcept
+    : _registry(std::move(other._registry)), _slot_id(other._slot_id) {
+  other._slot_id = UINT32_MAX;
+}
+
+nanots_slot_guard& nanots_slot_guard::operator=(
+    nanots_slot_guard&& other) noexcept {
+  if (this != &other) {
+    _release();
+    _registry      = std::move(other._registry);
+    _slot_id       = other._slot_id;
+    other._slot_id = UINT32_MAX;
+  }
+  return *this;
+}
+
+void nanots_slot_guard::op_begin() {
+  if (_slot_id == UINT32_MAX) return;
+  auto& s = _registry->slot(_slot_id);
+  uint64_t e = _registry->global_epoch_load();
+  s.epoch.store(e, std::memory_order_release);
+  s.heartbeat_us.store(_now_us(), std::memory_order_relaxed);
+}
+
+void nanots_slot_guard::_release() noexcept {
+  if (_slot_id != UINT32_MAX && _registry) {
+    _registry->release_slot(_slot_id);
+    _slot_id = UINT32_MAX;
+  }
+  _registry.reset();
+}
+
+// ---------------------------------------------------------------------------
+
 static uint32_t _round_to_64k_boundary(uint32_t requested_size) {
   const uint32_t BOUNDARY = 65536;  // 64KB
 

@@ -90,6 +90,102 @@ struct segment_block {
   uint8_t uuid[16];
 };
 
+// ---------------------------------------------------------------------------
+// Epoch-Based Reclamation (EBR) registry.
+// ---------------------------------------------------------------------------
+//
+// One registry per file (in-process, path-keyed singleton). Shared by every
+// nanots_writer and nanots_iterator opened on that file. EBR lets the writer
+// recycle physical blocks safely even when readers are concurrently iterating:
+// the writer defers byte-overwriting reclaim of a block until no reader's slot
+// can still be holding pointers into that block's bytes.
+//
+// Hot-path cost: one atomic load + one atomic store per iterator operation;
+// one atomic increment per writer retire.
+//
+// Within a single process only. Cross-process readers are not protected.
+//
+class NANOTS_API nanots_epoch_registry {
+ public:
+  static constexpr uint64_t INACTIVE = UINT64_MAX;
+
+  struct Slot {
+    std::atomic<uint64_t> epoch{INACTIVE};
+    std::atomic<int64_t>  heartbeat_us{0};
+  };
+
+  // Hot-path operations.
+  uint64_t global_epoch_load() const {
+    return _global_epoch.load(std::memory_order_acquire);
+  }
+  uint64_t global_epoch_bump() {
+    return _global_epoch.fetch_add(1, std::memory_order_release);
+  }
+
+  // Returns true if no active slot's epoch is <= retired_epoch. Slots whose
+  // heartbeat is older than NANOTS_HEARTBEAT_TIMEOUT_US are treated as dead
+  // and ignored.
+  bool can_recycle(uint64_t retired_epoch, int64_t now_us) const;
+
+  // Accessor for slot_guard.
+  Slot& slot(uint32_t id);
+
+  // Acquire/release; called by nanots_slot_guard.
+  uint32_t acquire_slot();
+  void     release_slot(uint32_t id);
+
+  // Path-keyed singleton accessor. Same path string returns the same registry
+  // for the lifetime of any caller holding the shared_ptr.
+  static std::shared_ptr<nanots_epoch_registry> get_or_create(
+      const std::string& file_path);
+
+ private:
+  std::atomic<uint64_t>               _global_epoch{1};
+  mutable std::mutex                  _slots_mu;
+  std::vector<std::unique_ptr<Slot>>  _slots;
+};
+
+// Heartbeat timeout: a slot whose last heartbeat is older than this is
+// treated as dead by can_recycle().
+constexpr int64_t NANOTS_HEARTBEAT_TIMEOUT_US = 60LL * 1000 * 1000;  // 60s
+
+// ---------------------------------------------------------------------------
+// RAII wrapper for slot acquisition + publishing.
+// ---------------------------------------------------------------------------
+//
+// On construction: acquires a slot from the registry and publishes the current
+// global_epoch + heartbeat. On destruction: sets the slot to INACTIVE and
+// releases it. Pairing the acquire and the release in one object means an
+// exception thrown anywhere in iterator construction or operation still leaves
+// the slot in a clean state.
+//
+// Move-only.
+//
+class NANOTS_API nanots_slot_guard {
+ public:
+  nanots_slot_guard() = default;
+  explicit nanots_slot_guard(std::shared_ptr<nanots_epoch_registry> registry);
+  ~nanots_slot_guard();
+
+  nanots_slot_guard(const nanots_slot_guard&)            = delete;
+  nanots_slot_guard& operator=(const nanots_slot_guard&) = delete;
+  nanots_slot_guard(nanots_slot_guard&& other) noexcept;
+  nanots_slot_guard& operator=(nanots_slot_guard&& other) noexcept;
+
+  // Publishes the latest global_epoch to our slot and updates the heartbeat.
+  // Call at the start of every iterator operation. No-op if !active().
+  void op_begin();
+
+  // True if this guard owns a slot.
+  bool active() const { return _slot_id != UINT32_MAX; }
+
+ private:
+  void _release() noexcept;
+
+  std::shared_ptr<nanots_epoch_registry> _registry;
+  uint32_t                                _slot_id{UINT32_MAX};
+};
+
 struct NANOTS_API write_context final {
   write_context() = default;
   write_context(const write_context&) = delete;

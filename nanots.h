@@ -359,6 +359,11 @@ class NANOTS_API nanots_reader {
   nts_file _file;
   uint32_t _block_size;
   uint32_t _n_blocks;
+
+  // EBR slot. Acquired on construction, released on destruction. read() opens
+  // a critical section for its duration so the writer cannot overwrite block
+  // bytes while the callback is dereferencing them.
+  nanots_slot_guard _slot_guard;
 };
 
 struct frame_info {

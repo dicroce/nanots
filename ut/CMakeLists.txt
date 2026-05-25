@@ -9,6 +9,8 @@ add_executable(
     source/test_nanots.cpp
     include/test_nanots_c_api.h
     source/test_nanots_c_api.cpp
+    include/test_nanots_ebr.h
+    source/test_nanots_ebr.cpp
 )
 
 target_include_directories(

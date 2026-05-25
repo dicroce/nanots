@@ -1006,7 +1006,8 @@ nanots_reader::nanots_reader(const std::string& file_name)
     : _file_name(file_name),
       _file(nts_file::open(file_name, "r")),
       _block_size(),
-      _n_blocks() {
+      _n_blocks(),
+      _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
   auto mm = nts_memory_map(
       filenum(_file), 0, FILE_HEADER_BLOCK_SIZE, nts_memory_map::NMM_PROT_READ,
       nts_memory_map::NMM_TYPE_FILE | nts_memory_map::NMM_SHARED);
@@ -1036,6 +1037,10 @@ void nanots_reader::read(
     int64_t end_timestamp,
     const std::function<
         void(const uint8_t*, size_t, uint8_t, int64_t, int64_t, const std::string&)>& callback) {
+  // EBR critical section spans the entire read(): the writer must not
+  // overwrite any block whose bytes the callback might dereference.
+  nanots_op_scope _op(_slot_guard);
+
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
   auto stmt = db.prepare(

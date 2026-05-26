@@ -5,7 +5,10 @@
       "PowerShell(cargo --version 2>&1)",
       "PowerShell(rustc --version 2>&1)",
       "PowerShell(python --version 2>&1)",
-      "Bash(grep -E \"\\\\.\\(c|cpp|so|pyd|o\\)$\")"
+      "Bash(grep -E \"\\\\.\\(c|cpp|so|pyd|o\\)$\")",
+      "PowerShell(cmake --build c:/dev/nanots/build --config Debug 2>&1)",
+      "Bash(./nanots_ut.exe)",
+      "Bash(python -c ' *)"
     ]
   }
 }

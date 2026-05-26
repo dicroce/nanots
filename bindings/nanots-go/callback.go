@@ -6,8 +6,9 @@ package nanots
 
 typedef void (*nanots_read_callback_t)(const uint8_t* data,
                                        size_t size,
-                                       uint8_t flags,
+                                       uint32_t flags,
                                        int64_t timestamp,
+                                       int64_t secondary_key,
                                        int64_t block_sequence,
                                        const char* metadata,
                                        void* user_data);
@@ -18,8 +19,8 @@ import (
 )
 
 //export goReadCallback
-func goReadCallback(data *C.uint8_t, size C.size_t, flags C.uint8_t,
-	timestamp C.int64_t, blockSequence C.int64_t,
+func goReadCallback(data *C.uint8_t, size C.size_t, flags C.uint32_t,
+	timestamp C.int64_t, secondaryKey C.int64_t, blockSequence C.int64_t,
 	metadata *C.char, userData unsafe.Pointer) {
 
 	// Get the callback ID from user_data
@@ -42,8 +43,9 @@ func goReadCallback(data *C.uint8_t, size C.size_t, flags C.uint8_t,
 	frame := Frame{
 		Data:          goData,
 		Timestamp:     int64(timestamp),
+		SecondaryKey:  int64(secondaryKey),
 		BlockSequence: int64(blockSequence),
-		Flags:         uint8(flags),
+		Flags:         uint32(flags),
 		Metadata:      C.GoString(metadata),
 	}
 

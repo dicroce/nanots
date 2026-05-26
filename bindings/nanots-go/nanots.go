@@ -15,8 +15,9 @@ package nanots
 #include "../../amalgamated_src/nanots.h"
 
 // Callback bridge for Go
-extern void goReadCallback(const uint8_t* data, size_t size, uint8_t flags,
-                          int64_t timestamp, int64_t block_sequence,
+extern void goReadCallback(const uint8_t* data, size_t size, uint32_t flags,
+                          int64_t timestamp, int64_t secondary_key,
+                          int64_t block_sequence,
                           const char* metadata, void* user_data);
 */
 import "C"
@@ -32,21 +33,31 @@ import (
 type ErrorCode int
 
 const (
-	ErrOK                      ErrorCode = C.NANOTS_EC_OK
-	ErrCantOpen                ErrorCode = C.NANOTS_EC_CANT_OPEN
-	ErrSchema                  ErrorCode = C.NANOTS_EC_SCHEMA
-	ErrNoFreeBlocks            ErrorCode = C.NANOTS_EC_NO_FREE_BLOCKS
-	ErrInvalidBlockSize        ErrorCode = C.NANOTS_EC_INVALID_BLOCK_SIZE
-	ErrDuplicateStreamTag      ErrorCode = C.NANOTS_EC_DUPLICATE_STREAM_TAG
-	ErrUnableToCreateSegment   ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT
+	ErrOK                         ErrorCode = C.NANOTS_EC_OK
+	ErrCantOpen                   ErrorCode = C.NANOTS_EC_CANT_OPEN
+	ErrSchema                     ErrorCode = C.NANOTS_EC_SCHEMA
+	ErrNoFreeBlocks               ErrorCode = C.NANOTS_EC_NO_FREE_BLOCKS
+	ErrInvalidBlockSize           ErrorCode = C.NANOTS_EC_INVALID_BLOCK_SIZE
+	ErrDuplicateStreamTag         ErrorCode = C.NANOTS_EC_DUPLICATE_STREAM_TAG
+	ErrUnableToCreateSegment      ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT
 	ErrUnableToCreateSegmentBlock ErrorCode = C.NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK
-	ErrNonMonotonicTimestamp   ErrorCode = C.NANOTS_EC_NON_MONOTONIC_TIMESTAMP
-	ErrRowSizeTooBig           ErrorCode = C.NANOTS_EC_ROW_SIZE_TOO_BIG
-	ErrUnableToAllocateFile    ErrorCode = C.NANOTS_EC_UNABLE_TO_ALLOCATE_FILE
-	ErrInvalidArgument         ErrorCode = C.NANOTS_EC_INVALID_ARGUMENT
-	ErrUnknown                 ErrorCode = C.NANOTS_EC_UNKNOWN
-	ErrNotFound                ErrorCode = C.NANOTS_EC_NOT_FOUND
+	ErrNonMonotonicTimestamp      ErrorCode = C.NANOTS_EC_NON_MONOTONIC_TIMESTAMP
+	ErrRowSizeTooBig              ErrorCode = C.NANOTS_EC_ROW_SIZE_TOO_BIG
+	ErrUnableToAllocateFile       ErrorCode = C.NANOTS_EC_UNABLE_TO_ALLOCATE_FILE
+	ErrInvalidArgument            ErrorCode = C.NANOTS_EC_INVALID_ARGUMENT
+	ErrUnknown                    ErrorCode = C.NANOTS_EC_UNKNOWN
+	ErrNotFound                   ErrorCode = C.NANOTS_EC_NOT_FOUND
+	ErrBadMagic                   ErrorCode = C.NANOTS_EC_BAD_MAGIC
+	ErrBadVersion                 ErrorCode = C.NANOTS_EC_BAD_VERSION
 )
+
+// SecKeyUnset is the sentinel for "no secondary key" (mirrors the C-level
+// NANOTS_SEC_KEY_UNSET = INT64_MIN). Smallest possible secondary key.
+const SecKeyUnset int64 = -1 << 63
+
+// SecKeyMax is the largest possible secondary key. Default upper bound
+// for range queries that don't want to constrain on sec_key.
+const SecKeyMax int64 = (1 << 63) - 1
 
 // Error represents a nanots error with an error code
 type Error struct {
@@ -89,6 +100,10 @@ func newError(code ErrorCode) error {
 		msg = "invalid argument"
 	case ErrNotFound:
 		msg = "not found"
+	case ErrBadMagic:
+		msg = "not a nanots v2 file (bad magic)"
+	case ErrBadVersion:
+		msg = "unsupported nanots format version"
 	default:
 		msg = "unknown error"
 	}
@@ -196,8 +211,23 @@ func (wc *WriteContext) Close() error {
 	return nil
 }
 
-// Write writes data to the database with the specified timestamp and flags
-func (w *Writer) Write(ctx *WriteContext, data []byte, timestamp int64, flags uint8) error {
+// Write writes a frame with no secondary key. Equivalent to
+// WriteWithSecondaryKey with secondaryKey = SecKeyUnset. Composite ordering
+// degenerates to "timestamp strictly increasing" for streams that always
+// call Write.
+func (w *Writer) Write(ctx *WriteContext, data []byte, flags uint32,
+	timestamp int64) error {
+	return w.WriteWithSecondaryKey(ctx, data, flags, timestamp, SecKeyUnset)
+}
+
+// WriteWithSecondaryKey writes a frame with an explicit secondary key.
+//
+// Frames are ordered by the composite (timestamp, secondaryKey), which must
+// strictly increase across writes. Pass any int64 except math.MinInt64 (=
+// SecKeyUnset) to disambiguate frames at the same timestamp. Violating the
+// composite ordering returns ErrNonMonotonicTimestamp.
+func (w *Writer) WriteWithSecondaryKey(ctx *WriteContext, data []byte,
+	flags uint32, timestamp int64, secondaryKey int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -218,14 +248,28 @@ func (w *Writer) Write(ctx *WriteContext, data []byte, timestamp int64, flags ui
 		ctx.handle,
 		dataPtr,
 		C.size_t(len(data)),
+		C.uint32_t(flags),
 		C.int64_t(timestamp),
-		C.uint8_t(flags),
+		C.int64_t(secondaryKey),
 	)
 	return newError(ErrorCode(ec))
 }
 
-// FreeBlocks frees blocks in the specified time range for the given stream tag
+// FreeBlocks frees blocks in the specified time range (no sec_key
+// tiebreaker). Equivalent to FreeBlocksWithSecondaryKeys with
+// SecKeyUnset / SecKeyMax for the sec_key bounds.
 func FreeBlocks(fileName, streamTag string, startTimestamp, endTimestamp int64) error {
+	return FreeBlocksWithSecondaryKeys(
+		fileName, streamTag,
+		startTimestamp, SecKeyUnset,
+		endTimestamp, SecKeyMax,
+	)
+}
+
+// FreeBlocksWithSecondaryKeys frees blocks fully contained in the composite
+// window [(startTimestamp, startSecondaryKey), (endTimestamp, endSecondaryKey)].
+func FreeBlocksWithSecondaryKeys(fileName, streamTag string,
+	startTimestamp, startSecondaryKey, endTimestamp, endSecondaryKey int64) error {
 	cFileName := C.CString(fileName)
 	defer C.free(unsafe.Pointer(cFileName))
 	cStreamTag := C.CString(streamTag)
@@ -235,7 +279,9 @@ func FreeBlocks(fileName, streamTag string, startTimestamp, endTimestamp int64) 
 		cFileName,
 		cStreamTag,
 		C.int64_t(startTimestamp),
+		C.int64_t(startSecondaryKey),
 		C.int64_t(endTimestamp),
+		C.int64_t(endSecondaryKey),
 	)
 	return newError(ErrorCode(ec))
 }
@@ -277,8 +323,9 @@ func (r *Reader) Close() error {
 type Frame struct {
 	Data          []byte
 	Timestamp     int64
+	SecondaryKey  int64
 	BlockSequence int64
-	Flags         uint8
+	Flags         uint32
 	Metadata      string
 }
 
@@ -291,8 +338,22 @@ var (
 	callbackID    uintptr
 )
 
-// Read reads data from the specified stream in the given time range
+// Read reads data from the specified stream in the given time range (no
+// sec_key tiebreaker). Equivalent to ReadWithSecondaryKeys with
+// SecKeyUnset / SecKeyMax for the sec_key bounds.
 func (r *Reader) Read(streamTag string, startTimestamp, endTimestamp int64, callback ReadCallback) error {
+	return r.ReadWithSecondaryKeys(streamTag,
+		startTimestamp, SecKeyUnset,
+		endTimestamp, SecKeyMax,
+		callback)
+}
+
+// ReadWithSecondaryKeys reads frames whose composite (timestamp,
+// secondary_key) lies in [(startTimestamp, startSecondaryKey),
+// (endTimestamp, endSecondaryKey)].
+func (r *Reader) ReadWithSecondaryKeys(streamTag string,
+	startTimestamp, startSecondaryKey, endTimestamp, endSecondaryKey int64,
+	callback ReadCallback) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -320,15 +381,28 @@ func (r *Reader) Read(streamTag string, startTimestamp, endTimestamp int64, call
 		r.handle,
 		cStreamTag,
 		C.int64_t(startTimestamp),
+		C.int64_t(startSecondaryKey),
 		C.int64_t(endTimestamp),
+		C.int64_t(endSecondaryKey),
 		C.nanots_read_callback_t(C.goReadCallback),
 		unsafe.Pointer(id),
 	)
 	return newError(ErrorCode(ec))
 }
 
-// QueryStreamTags returns all stream tags in the specified time range
+// QueryStreamTags returns all stream tags in the specified time range (no
+// sec_key tiebreaker).
 func (r *Reader) QueryStreamTags(startTimestamp, endTimestamp int64) ([]string, error) {
+	return r.QueryStreamTagsWithSecondaryKeys(
+		startTimestamp, SecKeyUnset,
+		endTimestamp, SecKeyMax)
+}
+
+// QueryStreamTagsWithSecondaryKeys returns all stream tags whose blocks
+// overlap the composite window.
+func (r *Reader) QueryStreamTagsWithSecondaryKeys(
+	startTimestamp, startSecondaryKey, endTimestamp, endSecondaryKey int64,
+) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -339,7 +413,9 @@ func (r *Reader) QueryStreamTags(startTimestamp, endTimestamp int64) ([]string, 
 	ec := C.nanots_reader_query_stream_tags_start(
 		r.handle,
 		C.int64_t(startTimestamp),
+		C.int64_t(startSecondaryKey),
 		C.int64_t(endTimestamp),
+		C.int64_t(endSecondaryKey),
 	)
 	if err := newError(ErrorCode(ec)); err != nil {
 		return nil, err
@@ -359,13 +435,26 @@ func (r *Reader) QueryStreamTags(startTimestamp, endTimestamp int64) ([]string, 
 
 // ContiguousSegment represents a contiguous segment of data
 type ContiguousSegment struct {
-	SegmentID      int64
-	StartTimestamp int64
-	EndTimestamp   int64
+	SegmentID         int64
+	StartTimestamp    int64
+	StartSecondaryKey int64
+	EndTimestamp      int64
+	EndSecondaryKey   int64
 }
 
-// QueryContiguousSegments returns all contiguous segments for the specified stream in the given time range
+// QueryContiguousSegments returns all contiguous segments for the specified
+// stream in the given time range (no sec_key tiebreaker).
 func (r *Reader) QueryContiguousSegments(streamTag string, startTimestamp, endTimestamp int64) ([]ContiguousSegment, error) {
+	return r.QueryContiguousSegmentsWithSecondaryKeys(streamTag,
+		startTimestamp, SecKeyUnset,
+		endTimestamp, SecKeyMax)
+}
+
+// QueryContiguousSegmentsWithSecondaryKeys returns contiguous block runs
+// within the composite window.
+func (r *Reader) QueryContiguousSegmentsWithSecondaryKeys(streamTag string,
+	startTimestamp, startSecondaryKey, endTimestamp, endSecondaryKey int64,
+) ([]ContiguousSegment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -383,7 +472,9 @@ func (r *Reader) QueryContiguousSegments(streamTag string, startTimestamp, endTi
 		r.handle,
 		cStreamTag,
 		C.int64_t(startTimestamp),
+		C.int64_t(startSecondaryKey),
 		C.int64_t(endTimestamp),
+		C.int64_t(endSecondaryKey),
 		&segments,
 		&count,
 	)
@@ -399,9 +490,11 @@ func (r *Reader) QueryContiguousSegments(streamTag string, startTimestamp, endTi
 	segmentSlice := unsafe.Slice(segments, int(count))
 	for i, seg := range segmentSlice {
 		result[i] = ContiguousSegment{
-			SegmentID:      int64(seg.segment_id),
-			StartTimestamp: int64(seg.start_timestamp),
-			EndTimestamp:   int64(seg.end_timestamp),
+			SegmentID:         int64(seg.segment_id),
+			StartTimestamp:    int64(seg.start_timestamp),
+			StartSecondaryKey: int64(seg.start_secondary_key),
+			EndTimestamp:      int64(seg.end_timestamp),
+			EndSecondaryKey:   int64(seg.end_secondary_key),
 		}
 	}
 
@@ -458,8 +551,9 @@ func (it *Iterator) Valid() bool {
 type FrameInfo struct {
 	Data          []byte
 	Timestamp     int64
+	SecondaryKey  int64
 	BlockSequence int64
-	Flags         uint8
+	Flags         uint32
 }
 
 // Current returns the current frame information
@@ -483,8 +577,9 @@ func (it *Iterator) Current() (FrameInfo, error) {
 	return FrameInfo{
 		Data:          data,
 		Timestamp:     int64(cFrame.timestamp),
+		SecondaryKey:  int64(cFrame.secondary_key),
 		BlockSequence: int64(cFrame.block_sequence),
-		Flags:         uint8(cFrame.flags),
+		Flags:         uint32(cFrame.flags),
 	}, nil
 }
 
@@ -514,8 +609,10 @@ func (it *Iterator) Prev() error {
 	return newError(ErrorCode(ec))
 }
 
-// Find seeks to the first frame with timestamp >= the specified timestamp
-func (it *Iterator) Find(timestamp int64) error {
+// Find seeks to the first frame whose composite (timestamp, secondaryKey)
+// is >= the requested composite. Pass SecKeyUnset for secondaryKey to land
+// on the first frame at the requested timestamp regardless of sec_key.
+func (it *Iterator) Find(timestamp int64, secondaryKey int64) error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
@@ -523,7 +620,8 @@ func (it *Iterator) Find(timestamp int64) error {
 		return errors.New("iterator is closed")
 	}
 
-	ec := C.nanots_iterator_find(it.handle, C.int64_t(timestamp))
+	ec := C.nanots_iterator_find(it.handle, C.int64_t(timestamp),
+		C.int64_t(secondaryKey))
 	return newError(ErrorCode(ec))
 }
 

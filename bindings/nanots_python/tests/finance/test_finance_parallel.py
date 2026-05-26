@@ -176,9 +176,9 @@ class ParallelNanoTSStressTest:
                     trade_data = struct.pack('if', record['trades'], record['volume'])
                     
                     # Write to different contexts with unique stream tags
-                    writer.write(price_context, price_data, record['timestamp'], price_tag)
-                    writer.write(volume_context, volume_data, record['timestamp'], volume_tag)
-                    writer.write(trade_context, trade_data, record['timestamp'], trade_tag)
+                    writer.write(price_context, price_data, price_tag, record['timestamp'])
+                    writer.write(volume_context, volume_data, volume_tag, record['timestamp'])
+                    writer.write(trade_context, trade_data, trade_tag, record['timestamp'])
                     
                     write_time = time.time() - write_start
                     

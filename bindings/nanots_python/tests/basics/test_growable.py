@@ -32,7 +32,7 @@ def growable_example():
         payload = bytes(i & 0xff for i in range(block_size // 2))
 
         for i in range(1, 9):
-            writer.write(ctx, payload, i * 1000, 0)
+            writer.write(ctx, payload, 0, i * 1000)
             print(f"  file size after write {i}: {os.path.getsize(db_file):6d} bytes")
 
         # Drop the writer/ctx explicitly so their destructors run (flushing

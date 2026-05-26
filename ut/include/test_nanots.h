@@ -38,6 +38,19 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_growable_basic);
   TEST(test_nanots::test_nanots_growable_doubling);
   TEST(test_nanots::test_nanots_growable_max_cap);
+  TEST(test_nanots::test_nanots_secondary_key_basic);
+  TEST(test_nanots::test_nanots_secondary_key_find);
+  TEST(test_nanots::test_nanots_secondary_key_monotonic);
+  TEST(test_nanots::test_nanots_v1_file_rejected);
+  TEST(test_nanots::test_nanots_secondary_key_cross_blocks);
+  TEST(test_nanots::test_nanots_secondary_key_bidirectional);
+  TEST(test_nanots::test_nanots_secondary_key_multi_segment);
+  TEST(test_nanots::test_nanots_secondary_key_mixed_streams_same_file);
+  TEST(test_nanots::test_nanots_secondary_key_sparse);
+  TEST(test_nanots::test_nanots_secondary_key_extreme_values);
+  TEST(test_nanots::test_nanots_secondary_key_reader_callback);
+  TEST(test_nanots::test_nanots_composite_duplicate_timestamps);
+  TEST(test_nanots::test_nanots_composite_find_lands_on_first_at_ts);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -80,4 +93,17 @@ class test_nanots : public test_fixture {
   void test_nanots_growable_basic();
   void test_nanots_growable_doubling();
   void test_nanots_growable_max_cap();
+  void test_nanots_secondary_key_basic();
+  void test_nanots_secondary_key_find();
+  void test_nanots_secondary_key_monotonic();
+  void test_nanots_v1_file_rejected();
+  void test_nanots_secondary_key_cross_blocks();
+  void test_nanots_secondary_key_bidirectional();
+  void test_nanots_secondary_key_multi_segment();
+  void test_nanots_secondary_key_mixed_streams_same_file();
+  void test_nanots_secondary_key_sparse();
+  void test_nanots_secondary_key_extreme_values();
+  void test_nanots_secondary_key_reader_callback();
+  void test_nanots_composite_duplicate_timestamps();
+  void test_nanots_composite_find_lands_on_first_at_ts();
 };

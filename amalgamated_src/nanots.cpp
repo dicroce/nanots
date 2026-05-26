@@ -1846,22 +1846,35 @@ void nanots_writer::write(write_context& wctx,
 void nanots_writer::free_blocks(const std::string& file_name,
                                 const std::string& stream_tag,
                                 int64_t start_timestamp,
-                                int64_t end_timestamp) {
+                                int64_t start_secondary_key,
+                                int64_t end_timestamp,
+                                int64_t end_secondary_key) {
   auto db_name = _database_name(file_name);
   nts_sqlite_conn conn(db_name, true, true);
 
   nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-    // Find blocks that fall entirely within the deletion time range
+    // Find blocks fully contained in the composite window
+    // [(start_ts, start_sk), (end_ts, end_sk)]:
+    //   block_start >= window_start:
+    //     start_ts > ? OR (start_ts = ? AND start_sk >= ?)
+    //   block_end <= window_end:
+    //     end_ts < ? OR (end_ts = ? AND end_sk <= ?)
+    // Plus end_timestamp != 0 to skip the currently-open block.
     auto stmt = conn.prepare(
         "SELECT sb.id as segment_block_id, sb.block_id "
         "FROM segment_blocks sb "
         "JOIN segments s ON sb.segment_id = s.id "
         "WHERE s.stream_tag = ? "
-        "AND sb.start_timestamp >= ? "
-        "AND sb.end_timestamp <= ? "
+        "AND (sb.start_timestamp > ? OR "
+        "     (sb.start_timestamp = ? AND sb.start_secondary_key >= ?)) "
+        "AND (sb.end_timestamp < ? OR "
+        "     (sb.end_timestamp = ? AND sb.end_secondary_key <= ?)) "
         "AND sb.end_timestamp != 0");
     auto blocks_to_delete =
-        stmt.bind(1, stream_tag).bind(2, start_timestamp).bind(3, end_timestamp).exec();
+        stmt.bind(1, stream_tag)
+            .bind(2, start_timestamp).bind(3, start_timestamp).bind(4, start_secondary_key)
+            .bind(5, end_timestamp).bind(6, end_timestamp).bind(7, end_secondary_key)
+            .exec();
 
     for (auto& block_row : blocks_to_delete) {
       int64_t segment_block_id = std::stoll(block_row["segment_block_id"].value());
@@ -2070,7 +2083,9 @@ static int _compare_index_entry_composite(uint8_t* index_entry_p,
 void nanots_reader::read(
     const std::string& stream_tag,
     int64_t start_timestamp,
+    int64_t start_secondary_key,
     int64_t end_timestamp,
+    int64_t end_secondary_key,
     const std::function<
         void(const uint8_t*, size_t, uint32_t, int64_t, int64_t, int64_t, const std::string&)>& callback) {
   // EBR critical section spans the entire read(): the writer must not
@@ -2079,6 +2094,13 @@ void nanots_reader::read(
 
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
+  // Composite overlap: include a block whose lex range
+  // [(start_ts, start_sk), (end_ts, end_sk)] intersects the requested
+  // window. Two lex comparisons:
+  //   block_start <= window_end:
+  //     start_ts < ?  OR  (start_ts = ? AND start_sk <= ?)
+  //   block_end >= window_start  (or open block end_ts == 0):
+  //     end_ts = 0 OR end_ts > ? OR (end_ts = ? AND end_sk >= ?)
   auto stmt = db.prepare(
       "SELECT "
       "s.metadata as metadata, "
@@ -2090,11 +2112,16 @@ void nanots_reader::read(
       "FROM segments s "
       "JOIN segment_blocks sb ON sb.segment_id = s.id "
       "WHERE s.stream_tag = ? "
-      "AND sb.start_timestamp <= ? "
-      "AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) "
+      "AND (sb.start_timestamp < ? OR "
+      "     (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
+      "AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "
+      "     (sb.end_timestamp = ? AND sb.end_secondary_key >= ?)) "
       "ORDER BY sb.sequence ASC;");
   auto results =
-      stmt.bind(1, stream_tag).bind(2, end_timestamp).bind(3, start_timestamp).exec();
+      stmt.bind(1, stream_tag)
+          .bind(2, end_timestamp).bind(3, end_timestamp).bind(4, end_secondary_key)
+          .bind(5, start_timestamp).bind(6, start_timestamp).bind(7, start_secondary_key)
+          .exec();
 
   bool need_binary_search = true;
 
@@ -2129,9 +2156,8 @@ void nanots_reader::read(
     int64_t start_index = 0;
 
     if (need_binary_search) {
-      // Composite lower_bound at (start_timestamp, INT64_MIN) — i.e. the
-      // first frame at start_timestamp regardless of sec_key.
-      int64_t target[2] = {start_timestamp, NANOTS_SEC_KEY_UNSET};
+      // Composite lower_bound at (start_timestamp, start_secondary_key).
+      int64_t target[2] = {start_timestamp, start_secondary_key};
       uint8_t* first_entry =
           lower_bound_bytes(index_start, index_end, (uint8_t*)target,
                             INDEX_ENTRY_SIZE, _compare_index_entry_composite);
@@ -2144,10 +2170,12 @@ void nanots_reader::read(
     for (size_t i = start_index; i < n_valid_indexes; i++) {
       uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (i * INDEX_ENTRY_SIZE);
       int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
+      int64_t sk_index  = *(int64_t*)(index_p + INDEX_ENTRY_SECKEY_OFFSET);
       uint64_t offset   = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
-      // Check if we've passed the end time
-      if (timestamp > end_timestamp)
+      // Check if we've passed the end composite.
+      if (timestamp > end_timestamp ||
+          (timestamp == end_timestamp && sk_index > end_secondary_key))
         return;  // All done!
 
       // Validate frame header
@@ -2167,16 +2195,27 @@ void nanots_reader::read(
   }
 }
 
-std::vector<std::string> nanots_reader::query_stream_tags(int64_t start_timestamp, int64_t end_timestamp) {
+std::vector<std::string> nanots_reader::query_stream_tags(
+    int64_t start_timestamp,
+    int64_t start_secondary_key,
+    int64_t end_timestamp,
+    int64_t end_secondary_key) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
+  // Composite overlap: a block contributes if its lex range overlaps the
+  // requested window. Same predicate as nanots_reader::read.
   auto stmt = db.prepare(
       "SELECT DISTINCT s.stream_tag "
       "FROM segments s "
       "JOIN segment_blocks sb ON s.id = sb.segment_id "
-      "WHERE sb.start_timestamp <= ? AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0);");
+      "WHERE (sb.start_timestamp < ? OR "
+      "       (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
+      "AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "
+      "     (sb.end_timestamp = ? AND sb.end_secondary_key >= ?));");
   auto results =
-      stmt.bind(1, end_timestamp).bind(2, start_timestamp).exec();
+      stmt.bind(1, end_timestamp).bind(2, end_timestamp).bind(3, end_secondary_key)
+          .bind(4, start_timestamp).bind(5, start_timestamp).bind(6, start_secondary_key)
+          .exec();
 
   std::vector<std::string> stream_tags;
 
@@ -2190,58 +2229,84 @@ std::vector<std::string> nanots_reader::query_stream_tags(int64_t start_timestam
 std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
     const std::string& stream_tag,
     int64_t start_timestamp,
-    int64_t end_timestamp) {
+    int64_t start_secondary_key,
+    int64_t end_timestamp,
+    int64_t end_secondary_key) {
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
-  // Create a grouping key by subtracting sequence from row number
-  // Contiguous sequences will have the same group_key
-
+  // Create a grouping key by subtracting sequence from row number; within
+  // a stream blocks are composite-monotonic, so contiguous-by-sequence is
+  // also contiguous-by-composite. For each group we want the first block's
+  // (start_ts, start_sk) and the last block's (end_ts, end_sk).
+  //
+  // Composite overlap predicate matches nanots_reader::read.
   auto stmt = db.prepare(
     "WITH contiguous_groups AS ( "
     "  SELECT "
     "    sb.segment_id, "
     "    sb.sequence, "
     "    sb.start_timestamp, "
+    "    sb.start_secondary_key, "
     "    sb.end_timestamp, "
+    "    sb.end_secondary_key, "
     "    ROW_NUMBER() OVER (PARTITION BY sb.segment_id ORDER BY sb.sequence) "
     "      - sb.sequence AS group_key "
     "  FROM segment_blocks sb "
     "  JOIN segments s ON sb.segment_id = s.id "
-    "  WHERE sb.start_timestamp <= ? "                    /* bind(1) = window_end    */
-    "    AND (sb.end_timestamp >= ? OR sb.end_timestamp = 0) " /* bind(2) = window_start */
-    "    AND s.stream_tag = ? "                           /* bind(3) = stream_tag    */
+    "  WHERE s.stream_tag = ? "                       /* bind(1) */
+    "    AND (sb.start_timestamp < ? OR "             /* bind(2,3,4) — end composite */
+    "         (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
+    "    AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "  /* bind(5,6,7) — start composite */
+    "         (sb.end_timestamp = ? AND sb.end_secondary_key >= ?)) "
     "), "
     "region_boundaries AS ( "
     "  SELECT "
     "    segment_id, "
     "    group_key, "
-    "    MIN(start_timestamp) AS region_start, "
-    "    CASE "
-    "      WHEN MIN(end_timestamp) = 0 THEN 0 "
-    "      ELSE MAX(end_timestamp) "
-    "    END AS region_end, "
-    "    COUNT(*) AS block_count "
+    "    FIRST_VALUE(start_timestamp) "
+    "      OVER w AS region_start_ts, "
+    "    FIRST_VALUE(start_secondary_key) "
+    "      OVER w AS region_start_sk, "
+    "    LAST_VALUE(end_timestamp) "
+    "      OVER w_full AS region_end_ts, "
+    "    LAST_VALUE(end_secondary_key) "
+    "      OVER w_full AS region_end_sk, "
+    "    COUNT(*) OVER (PARTITION BY segment_id, group_key) AS block_count "
     "  FROM contiguous_groups "
-    "  GROUP BY segment_id, group_key "
+    "  WINDOW "
+    "    w AS (PARTITION BY segment_id, group_key ORDER BY sequence), "
+    "    w_full AS (PARTITION BY segment_id, group_key ORDER BY sequence "
+    "               ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
     ") "
-    "SELECT "
+    "SELECT DISTINCT "
     "  segment_id, "
-    "  region_start, "
-    "  region_end, "
+    "  region_start_ts, "
+    "  region_start_sk, "
+    "  region_end_ts, "
+    "  region_end_sk, "
     "  block_count "
     "FROM region_boundaries "
-    "ORDER BY segment_id, region_start;"
+    "ORDER BY segment_id, region_start_ts;"
   );
   auto results =
-      stmt.bind(1, end_timestamp).bind(2, start_timestamp).bind(3, stream_tag).exec();
+      stmt.bind(1, stream_tag)
+          .bind(2, end_timestamp).bind(3, end_timestamp).bind(4, end_secondary_key)
+          .bind(5, start_timestamp).bind(6, start_timestamp).bind(7, start_secondary_key)
+          .exec();
 
   std::vector<contiguous_segment> segments;
 
   for (auto& row : results) {
     contiguous_segment segment;
     segment.segment_id = std::stoll(row["segment_id"].value());
-    segment.start_timestamp = std::stoll(row["region_start"].value());
-    segment.end_timestamp = std::stoll(row["region_end"].value());
+    segment.start_timestamp = std::stoll(row["region_start_ts"].value());
+    segment.end_timestamp = std::stoll(row["region_end_ts"].value());
+    auto& s_sk = row["region_start_sk"];
+    auto& e_sk = row["region_end_sk"];
+    segment.start_secondary_key = s_sk.has_value()
+        ? std::stoll(s_sk.value()) : NANOTS_SEC_KEY_UNSET;
+    segment.end_secondary_key = e_sk.has_value()
+        ? std::stoll(e_sk.value()) : NANOTS_SEC_KEY_UNSET;
     segments.push_back(segment);
   }
 
@@ -2917,13 +2982,17 @@ nanots_ec_t nanots_writer_write(nanots_writer_t writer,
 nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
-                                          int64_t end_timestamp) {
+                                          int64_t start_secondary_key,
+                                          int64_t end_timestamp,
+                                          int64_t end_secondary_key) {
   if (!file_name || !stream_tag) {
     return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
-    nanots_writer::free_blocks(std::string(file_name), std::string(stream_tag), start_timestamp, end_timestamp);
+    nanots_writer::free_blocks(std::string(file_name), std::string(stream_tag),
+                               start_timestamp, start_secondary_key,
+                               end_timestamp, end_secondary_key);
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {
     return e.get_ec();
@@ -2963,7 +3032,9 @@ struct nanots_callback_context {
 nanots_ec_t nanots_reader_read(nanots_reader_t reader,
                                const char* stream_tag,
                                int64_t start_timestamp,
+                               int64_t start_secondary_key,
                                int64_t end_timestamp,
+                               int64_t end_secondary_key,
                                nanots_read_callback_t callback,
                                void* user_data) {
   if (!reader || !reader->reader) {
@@ -2975,7 +3046,9 @@ nanots_ec_t nanots_reader_read(nanots_reader_t reader,
 
   try {
     nanots_callback_context ctx{callback, user_data};
-    reader->reader->read(std::string(stream_tag), start_timestamp, end_timestamp,
+    reader->reader->read(std::string(stream_tag),
+                         start_timestamp, start_secondary_key,
+                         end_timestamp, end_secondary_key,
                          [&ctx](const uint8_t* data, size_t size, uint32_t flags,
                                 int64_t timestamp, int64_t secondary_key,
                                 int64_t block_sequence, const std::string& metadata) {
@@ -2998,7 +3071,9 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
+    int64_t start_secondary_key,
     int64_t end_timestamp,
+    int64_t end_secondary_key,
     nanots_contiguous_segment_t** segments,
     size_t* count) {
   if (!reader || !reader->reader) {
@@ -3010,7 +3085,9 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
 
   try {
     auto cpp_segments = reader->reader->query_contiguous_segments(
-        std::string(stream_tag), start_timestamp, end_timestamp);
+        std::string(stream_tag),
+        start_timestamp, start_secondary_key,
+        end_timestamp, end_secondary_key);
 
     *count = cpp_segments.size();
     if (*count == 0) {
@@ -3027,7 +3104,9 @@ nanots_ec_t nanots_reader_query_contiguous_segments(
     for (size_t i = 0; i < *count; i++) {
       (*segments)[i].segment_id = cpp_segments[i].segment_id;
       (*segments)[i].start_timestamp = cpp_segments[i].start_timestamp;
+      (*segments)[i].start_secondary_key = cpp_segments[i].start_secondary_key;
       (*segments)[i].end_timestamp = cpp_segments[i].end_timestamp;
+      (*segments)[i].end_secondary_key = cpp_segments[i].end_secondary_key;
     }
 
     return NANOTS_EC_OK;
@@ -3048,13 +3127,17 @@ void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments) {
 
 nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
                                                   int64_t start_timestamp,
-                                                  int64_t end_timestamp) {
+                                                  int64_t start_secondary_key,
+                                                  int64_t end_timestamp,
+                                                  int64_t end_secondary_key) {
   if (!reader || !reader->reader) {
     return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
-    reader->cached_stream_tags = reader->reader->query_stream_tags(start_timestamp, end_timestamp);
+    reader->cached_stream_tags = reader->reader->query_stream_tags(
+        start_timestamp, start_secondary_key,
+        end_timestamp, end_secondary_key);
     reader->stream_tags_iterator = 0;
     return NANOTS_EC_OK;
   } catch (const nanots_exception& e) {

@@ -40,7 +40,9 @@ cdef extern from "nanots.h":
     ctypedef struct nanots_contiguous_segment_t:
         int segment_id
         int64_t start_timestamp
+        int64_t start_secondary_key
         int64_t end_timestamp
+        int64_t end_secondary_key
 
     ctypedef struct nanots_frame_info_t:
         const uint8_t* data
@@ -67,7 +69,9 @@ cdef extern from "nanots.h":
     nanots_ec_t nanots_writer_free_blocks(const char* file_name,
                                           const char* stream_tag,
                                           int64_t start_timestamp,
-                                          int64_t end_timestamp)
+                                          int64_t start_secondary_key,
+                                          int64_t end_timestamp,
+                                          int64_t end_secondary_key)
     nanots_ec_t nanots_writer_allocate_file(const char* file_name,
                                             uint32_t block_size,
                                             uint32_t n_blocks)
@@ -89,22 +93,28 @@ cdef extern from "nanots.h":
     nanots_ec_t nanots_reader_read(nanots_reader_t reader,
                                    const char* stream_tag,
                                    int64_t start_timestamp,
+                                   int64_t start_secondary_key,
                                    int64_t end_timestamp,
+                                   int64_t end_secondary_key,
                                    nanots_read_callback_t callback,
                                    void* user_data)
-    
+
     nanots_ec_t nanots_reader_query_contiguous_segments(
         nanots_reader_t reader,
         const char* stream_tag,
         int64_t start_timestamp,
+        int64_t start_secondary_key,
         int64_t end_timestamp,
+        int64_t end_secondary_key,
         nanots_contiguous_segment_t** segments,
         size_t* count)
     void nanots_free_contiguous_segments(nanots_contiguous_segment_t* segments)
-    
+
     nanots_ec_t nanots_reader_query_stream_tags_start(nanots_reader_t reader,
                                                       int64_t start_timestamp,
-                                                      int64_t end_timestamp)
+                                                      int64_t start_secondary_key,
+                                                      int64_t end_timestamp,
+                                                      int64_t end_secondary_key)
     const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader)
     
     nanots_iterator_t nanots_iterator_create(const char* file_name,
@@ -123,9 +133,13 @@ cdef extern from "nanots.h":
     int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator)
     const char* nanots_iterator_current_metadata(nanots_iterator_t iterator)
 
-# Sentinel for "this frame has no secondary key" (matches the C-level
-# NANOTS_SEC_KEY_UNSET = INT64_MIN).
+# Sentinel for "no secondary key" (matches the C-level
+# NANOTS_SEC_KEY_UNSET = INT64_MIN). The smallest possible secondary key.
 SEC_KEY_UNSET = -0x8000000000000000
+
+# Largest possible secondary key. Default upper bound for range queries
+# that don't want to constrain on sec_key.
+SEC_KEY_MAX = 0x7fffffffffffffff
 
 # Python exceptions
 class NanoTSError(Exception):
@@ -294,12 +308,22 @@ cdef class Writer:
         _check_result(result)
     
     @staticmethod
-    def free_blocks(str filename, str stream_tag, int64_t start_timestamp, int64_t end_timestamp):
-        """Free blocks for a time range in a stream."""
+    def free_blocks(str filename, str stream_tag,
+                    int64_t start_timestamp, int64_t end_timestamp,
+                    int64_t start_secondary_key=SEC_KEY_UNSET,
+                    int64_t end_secondary_key=SEC_KEY_MAX):
+        """Free blocks fully contained in the composite window
+        ``[(start_timestamp, start_secondary_key), (end_timestamp, end_secondary_key)]``.
+
+        Default sec_key bounds (``SEC_KEY_UNSET`` and ``SEC_KEY_MAX``) ignore
+        the sec_key axis — equivalent to a timestamp-only deletion.
+        """
         cdef bytes filename_bytes = filename.encode('utf-8')
         cdef bytes stream_tag_bytes = stream_tag.encode('utf-8')
         cdef nanots_ec_t result = nanots_writer_free_blocks(
-            filename_bytes, stream_tag_bytes, start_timestamp, end_timestamp)
+            filename_bytes, stream_tag_bytes,
+            start_timestamp, start_secondary_key,
+            end_timestamp, end_secondary_key)
         _check_result(result)
 
 # Reader wrapper
@@ -318,65 +342,75 @@ cdef class Reader:
         if self._reader != NULL:
             nanots_reader_destroy(self._reader)
     
-    def read(self, str stream_tag, int64_t start_timestamp, int64_t end_timestamp):
-        """Read data from the database, returning a list of frames."""
+    def read(self, str stream_tag,
+             int64_t start_timestamp, int64_t end_timestamp,
+             int64_t start_secondary_key=SEC_KEY_UNSET,
+             int64_t end_secondary_key=SEC_KEY_MAX):
+        """Read frames whose composite (timestamp, secondary_key) lies in
+        ``[(start_timestamp, start_secondary_key), (end_timestamp, end_secondary_key)]``.
+
+        Default sec_key bounds ignore the sec_key axis.
+        Returns a list of frame dicts.
+        """
         frames = []
-        
-        def callback(data, size, flags, timestamp, block_sequence, metadata):
-            # Copy data to Python bytes object
-            frame_data = data[:size]  # This creates a copy
-            frames.append({
-                'data': frame_data,
-                'timestamp': timestamp,
-                'flags': flags,
-                'block_sequence': block_sequence,
-                'metadata': metadata
-            })
-        
-        # Store callback in a place where the C code can find it
-        cdef object callback_ref = callback
-        
-        # For now, we'll use the simpler iterator approach
-        # The callback approach requires more complex Cython code
+
+        # We walk via the iterator (which already implements composite
+        # find()). End-of-range is a composite check.
         cdef Iterator iterator = Iterator(self._filename, stream_tag)
-        iterator.find(start_timestamp)
-        
+        iterator.find(start_timestamp, start_secondary_key)
+
         while iterator.valid():
             frame = iterator.get_current_frame()
-            if frame['timestamp'] > end_timestamp:
+            ts = frame['timestamp']
+            sk = frame['secondary_key']
+            if ts > end_timestamp or (ts == end_timestamp and sk > end_secondary_key):
                 break
             frames.append(frame)
             iterator.next()
-        
+
         return frames
-    
-    def query_contiguous_segments(self, str stream_tag, int64_t start_timestamp, int64_t end_timestamp):
-        """Query contiguous segments in a time range."""
+
+    def query_contiguous_segments(self, str stream_tag,
+                                  int64_t start_timestamp, int64_t end_timestamp,
+                                  int64_t start_secondary_key=SEC_KEY_UNSET,
+                                  int64_t end_secondary_key=SEC_KEY_MAX):
+        """Query contiguous block runs within the composite window. Default
+        sec_key bounds ignore the sec_key axis."""
         cdef bytes stream_tag_bytes = stream_tag.encode('utf-8')
         cdef nanots_contiguous_segment_t* segments = NULL
         cdef size_t count = 0
-        
+
         cdef nanots_ec_t result = nanots_reader_query_contiguous_segments(
-            self._reader, stream_tag_bytes, start_timestamp, end_timestamp, &segments, &count)
+            self._reader, stream_tag_bytes,
+            start_timestamp, start_secondary_key,
+            end_timestamp, end_secondary_key,
+            &segments, &count)
         _check_result(result)
-        
+
         # Convert to Python list
         segment_list = []
         for i in range(count):
             segment_list.append({
                 'segment_id': segments[i].segment_id,
                 'start_timestamp': segments[i].start_timestamp,
-                'end_timestamp': segments[i].end_timestamp
+                'start_secondary_key': segments[i].start_secondary_key,
+                'end_timestamp': segments[i].end_timestamp,
+                'end_secondary_key': segments[i].end_secondary_key
             })
-        
+
         # Free the C memory
         nanots_free_contiguous_segments(segments)
         return segment_list
-    
-    def query_stream_tags(self, int64_t start_timestamp, int64_t end_timestamp):
-        """Query all stream tags that exist in the given time range."""
+
+    def query_stream_tags(self, int64_t start_timestamp, int64_t end_timestamp,
+                          int64_t start_secondary_key=SEC_KEY_UNSET,
+                          int64_t end_secondary_key=SEC_KEY_MAX):
+        """Query distinct stream tags that overlap the composite window.
+        Default sec_key bounds ignore the sec_key axis."""
         cdef nanots_ec_t result = nanots_reader_query_stream_tags_start(
-            self._reader, start_timestamp, end_timestamp)
+            self._reader,
+            start_timestamp, start_secondary_key,
+            end_timestamp, end_secondary_key)
         _check_result(result)
         
         # Collect all stream tags

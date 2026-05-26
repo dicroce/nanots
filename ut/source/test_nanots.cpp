@@ -240,7 +240,7 @@ void test_nanots::test_nanots_reader_time_range() {
   std::vector<std::pair<uint64_t, std::string>> frames_read;
 
   // Read middle portion (1500 to 2200)
-  reader.read("test_stream", 1500, 2200,
+  reader.read("test_stream", 1500, NANOTS_SEC_KEY_UNSET, 2200, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t timestamp, int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) {
@@ -257,7 +257,7 @@ void test_nanots::test_nanots_reader_time_range() {
 
   // Test reading from beginning
   frames_read.clear();
-  reader.read("test_stream", 0, 1200,
+  reader.read("test_stream", 0, NANOTS_SEC_KEY_UNSET, 1200, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t timestamp, int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) {
@@ -702,7 +702,7 @@ void test_nanots::test_nanots_metadata_integrity() {
   // Note: This test assumes metadata is accessible during read operations
   // You may need to modify based on your actual metadata access API
 
-  reader.read("video", 0, 2000,
+  reader.read("video", 0, NANOTS_SEC_KEY_UNSET, 2000, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t timestamp, int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) {
@@ -713,7 +713,7 @@ void test_nanots::test_nanots_metadata_integrity() {
               });
 
   reader.read(
-      "audio", 0, 2000,
+      "audio", 0, NANOTS_SEC_KEY_UNSET, 2000, INT64_MAX,
       [&](const uint8_t* data, size_t size, uint32_t flags, int64_t timestamp,
           int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) { 
@@ -1229,7 +1229,7 @@ void test_nanots::test_nanots_reader_callback_exceptions() {
   bool exception_caught = false;
 
   try {
-    reader.read("exception_stream", 0, 20000,
+    reader.read("exception_stream", 0, NANOTS_SEC_KEY_UNSET, 20000, INT64_MAX,
                 [&](const uint8_t* data, size_t size, uint32_t flags,
                     int64_t timestamp, int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) {
@@ -1440,7 +1440,7 @@ void test_nanots::test_nanots_free_blocks() {
 
   // Delete blocks in the middle time range (5000 to 15000)
   // This should delete frames with timestamps 5000, 6000, 7000, ..., 15000
-  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "delete_stream", 250, 500);
+  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "delete_stream", 250, NANOTS_SEC_KEY_UNSET, 500, INT64_MAX);
 
   // Debug: Check what blocks exist after deletion
   debug_result = debug_conn.exec(
@@ -1461,7 +1461,7 @@ void test_nanots::test_nanots_free_blocks() {
   nanots_reader reader("nanots_test_2048_4k_blocks.nts");
   std::vector<uint64_t> remaining_timestamps;
 
-  reader.read("delete_stream", 1, 1024,
+  reader.read("delete_stream", 1, NANOTS_SEC_KEY_UNSET, 1024, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t timestamp, int64_t /*secondary_key*/,
                   int64_t block_sequence, const std::string& metadata) {
@@ -1503,10 +1503,10 @@ void test_nanots::test_nanots_query_contiguous_segments() {
     }
   }
 
-  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "test_stream", 250, 500);
+  nanots_writer::free_blocks("nanots_test_2048_4k_blocks.nts", "test_stream", 250, NANOTS_SEC_KEY_UNSET, 500, INT64_MAX);
 
   nanots_reader reader("nanots_test_2048_4k_blocks.nts");
-  auto segments = reader.query_contiguous_segments("test_stream", 1, 1024);
+  auto segments = reader.query_contiguous_segments("test_stream", 1, NANOTS_SEC_KEY_UNSET, 1024, INT64_MAX);
 
   RTF_ASSERT(segments.size() == 2);
   RTF_ASSERT(segments[0].start_timestamp == 1);
@@ -1549,7 +1549,7 @@ void test_nanots::test_nanots_query_stream_tags() {
   // Test query_stream_tags for different time ranges
   
   // Query range that includes all streams (1000-12000)
-  auto all_tags = reader.query_stream_tags(1000, 12000);
+  auto all_tags = reader.query_stream_tags(1000, NANOTS_SEC_KEY_UNSET, 12000, INT64_MAX);
   std::set<std::string> all_tags_set(all_tags.begin(), all_tags.end());
   RTF_ASSERT(all_tags_set.size() == 3);
   RTF_ASSERT(all_tags_set.count("video") == 1);
@@ -1557,7 +1557,7 @@ void test_nanots::test_nanots_query_stream_tags() {
   RTF_ASSERT(all_tags_set.count("metadata") == 1);
 
   // Query range that includes only video and audio (2000-6000)
-  auto video_audio_tags = reader.query_stream_tags(2000, 6000);
+  auto video_audio_tags = reader.query_stream_tags(2000, NANOTS_SEC_KEY_UNSET, 6000, INT64_MAX);
   std::set<std::string> video_audio_set(video_audio_tags.begin(), video_audio_tags.end());
   RTF_ASSERT(video_audio_set.size() == 2);
   RTF_ASSERT(video_audio_set.count("video") == 1);
@@ -1565,7 +1565,7 @@ void test_nanots::test_nanots_query_stream_tags() {
   RTF_ASSERT(video_audio_set.count("metadata") == 0);
 
   // Query range that includes only metadata (8000-12000)
-  auto metadata_tags = reader.query_stream_tags(8000, 12000);
+  auto metadata_tags = reader.query_stream_tags(8000, NANOTS_SEC_KEY_UNSET, 12000, INT64_MAX);
   std::set<std::string> metadata_set(metadata_tags.begin(), metadata_tags.end());
   RTF_ASSERT(metadata_set.size() == 1);
   RTF_ASSERT(metadata_set.count("metadata") == 1);
@@ -1573,11 +1573,11 @@ void test_nanots::test_nanots_query_stream_tags() {
   RTF_ASSERT(metadata_set.count("audio") == 0);
 
   // Query range with no data (20000-25000)
-  auto empty_tags = reader.query_stream_tags(20000, 25000);
+  auto empty_tags = reader.query_stream_tags(20000, NANOTS_SEC_KEY_UNSET, 25000, INT64_MAX);
   RTF_ASSERT(empty_tags.empty());
 
   // Query range that includes only video (1000-1500)
-  auto video_only_tags = reader.query_stream_tags(1000, 1500);
+  auto video_only_tags = reader.query_stream_tags(1000, NANOTS_SEC_KEY_UNSET, 1500, INT64_MAX);
   std::set<std::string> video_only_set(video_only_tags.begin(), video_only_tags.end());
   RTF_ASSERT(video_only_set.size() == 1);
   RTF_ASSERT(video_only_set.count("video") == 1);
@@ -1616,7 +1616,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   // Verify initial state - should have 1 contiguous segment
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
-    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
     
     RTF_ASSERT(segments.size() == 1);
     RTF_ASSERT(segments[0].start_timestamp == start_timestamp);
@@ -1633,12 +1633,12 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing large window: [%" PRIu64 ", %" PRIu64 "]\n", 
          first_delete_start, first_delete_end);
-  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", first_delete_start, first_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", first_delete_start, NANOTS_SEC_KEY_UNSET, first_delete_end, INT64_MAX);
   
   // Should now have 2 contiguous segments
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
-    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
     
     RTF_ASSERT(segments.size() == 2);
     RTF_ASSERT(segments[0].start_timestamp == start_timestamp);
@@ -1657,11 +1657,11 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing second window: [%" PRIu64 ", %" PRIu64 "]\n", 
          second_delete_start, second_delete_end);
-  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", second_delete_start, second_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", second_delete_start, NANOTS_SEC_KEY_UNSET, second_delete_end, INT64_MAX);
   
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
-    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
     
     // Should have at least 2 segments, possibly 3 if the windows don't overlap
     RTF_ASSERT(segments.size() >= 2);
@@ -1679,11 +1679,11 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   printf("\nFreeing third window: [%" PRIu64 ", %" PRIu64 "]\n", 
          third_delete_start, third_delete_end);
-  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", third_delete_start, third_delete_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", third_delete_start, NANOTS_SEC_KEY_UNSET, third_delete_end, INT64_MAX);
   
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
-    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+    auto segments = reader.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
     
     // Should have multiple segments now
     RTF_ASSERT(segments.size() >= 2);
@@ -1705,14 +1705,14 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   
   // Get current segment count
   nanots_reader reader_before("nanots_test_progressive_deletion.nts");
-  auto segments_before = reader_before.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+  auto segments_before = reader_before.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
   size_t count_before = segments_before.size();
   
-  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", tiny_start, tiny_end);
+  nanots_writer::free_blocks("nanots_test_progressive_deletion.nts", "test_stream", tiny_start, NANOTS_SEC_KEY_UNSET, tiny_end, INT64_MAX);
   
   // Check that segment count hasn't changed
   nanots_reader reader_after("nanots_test_progressive_deletion.nts");
-  auto segments_after = reader_after.query_contiguous_segments("test_stream", start_timestamp, end_timestamp);
+  auto segments_after = reader_after.query_contiguous_segments("test_stream", start_timestamp, NANOTS_SEC_KEY_UNSET, end_timestamp, INT64_MAX);
   
   RTF_ASSERT(segments_after.size() == count_before);
   printf("After tiny range free attempt: still %zu contiguous segment(s) (unchanged)\n", segments_after.size());
@@ -1720,7 +1720,7 @@ void test_nanots::test_nanots_progressive_block_deletion() {
   // Test querying a deleted range
   {
     nanots_reader reader("nanots_test_progressive_deletion.nts");
-    auto segments = reader.query_contiguous_segments("test_stream", first_delete_start, first_delete_end);
+    auto segments = reader.query_contiguous_segments("test_stream", first_delete_start, NANOTS_SEC_KEY_UNSET, first_delete_end, INT64_MAX);
     
     // Should return empty or very few segments since most of this range was deleted
     printf("\nQuery in first deleted range [%" PRIu64 ", %" PRIu64 "]: %zu segment(s)\n", 
@@ -2210,7 +2210,7 @@ void test_nanots::test_nanots_secondary_key_basic() {
   // Reader callback round-trip.
   nanots_reader reader("nanots_test_4mb.nts");
   int j = 0;
-  reader.read("sk_stream", 0, 100000,
+  reader.read("sk_stream", 0, NANOTS_SEC_KEY_UNSET, 100000, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t timestamp, int64_t sec_key,
                   int64_t block_seq, const std::string& meta) {
@@ -2671,7 +2671,7 @@ void test_nanots::test_nanots_secondary_key_reader_callback() {
 
   // Keyed: every callback should see the right sec_key.
   std::vector<int64_t> seen_keyed;
-  reader.read("rk_keyed", 0, 100000,
+  reader.read("rk_keyed", 0, NANOTS_SEC_KEY_UNSET, 100000, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t ts, int64_t sk,
                   int64_t block_seq, const std::string& meta) {
@@ -2684,7 +2684,7 @@ void test_nanots::test_nanots_secondary_key_reader_callback() {
 
   // Unkeyed: every callback should see NANOTS_SEC_KEY_UNSET.
   std::vector<int64_t> seen_unkeyed;
-  reader.read("rk_unkeyed", 0, 100000,
+  reader.read("rk_unkeyed", 0, NANOTS_SEC_KEY_UNSET, 100000, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t flags,
                   int64_t ts, int64_t sk,
                   int64_t block_seq, const std::string& meta) {

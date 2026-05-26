@@ -282,6 +282,31 @@ iter.find(1000, 2);
 iter.find(1000, 4);
 ```
 
+**Range queries.** All four range-style APIs — `reader.read`,
+`reader.query_contiguous_segments`, `reader.query_stream_tags`, and
+`nanots_writer::free_blocks` — take a composite window
+`(start_ts, start_sk, end_ts, end_sk)`:
+
+```cpp
+// All trades between (1000, 5) and (2000, INT64_MAX) inclusive.
+reader.read("trades", 1000, /*start_sk=*/5,
+                      2000, /*end_sk=*/INT64_MAX,
+            [&](const uint8_t* data, size_t size, uint32_t flags,
+                int64_t ts, int64_t sk,
+                int64_t block_seq, const std::string& meta) {
+                // ...
+            });
+
+// Delete blocks fully inside [(1000, MIN), (2000, MAX)] — i.e. the whole
+// timestamp window 1000..2000 regardless of sec_key.
+nanots_writer::free_blocks("data.nts", "trades",
+                           1000, NANOTS_SEC_KEY_UNSET,
+                           2000, INT64_MAX);
+```
+
+Pass `NANOTS_SEC_KEY_UNSET` for `start_sk` and `INT64_MAX` for `end_sk` to
+ignore the sec_key axis (i.e. classic timestamp-only behavior).
+
 Typical use cases: financial origin timestamps + exchange sequence ID;
 sensor readings + per-source sequence counter; any feed where the natural
 timestamp isn't unique but a stable tiebreaker is.

@@ -335,11 +335,18 @@ class NANOTS_API nanots_writer {
         int64_t secondary_key = NANOTS_SEC_KEY_UNSET
     );
 
+    // Free every block in this stream that falls entirely within the
+    // composite window [(start_ts, start_sk), (end_ts, end_sk)]. Pass
+    // NANOTS_SEC_KEY_UNSET for start_secondary_key and INT64_MAX for
+    // end_secondary_key to ignore the sec_key axis (the classic
+    // timestamp-only deletion).
     static void free_blocks(
         const std::string& file_name,
         const std::string& stream_tag,
         int64_t start_timestamp,
-        int64_t end_timestamp
+        int64_t start_secondary_key,
+        int64_t end_timestamp,
+        int64_t end_secondary_key
     );
 
     // Preallocated: fixed-size file with n_blocks slots, never grows.
@@ -416,7 +423,9 @@ class NANOTS_API nanots_writer {
 struct contiguous_segment {
     int64_t segment_id{0};
     int64_t start_timestamp{0};
+    int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
     int64_t end_timestamp{0};
+    int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
 };
 
 class NANOTS_API nanots_reader {
@@ -428,6 +437,11 @@ class NANOTS_API nanots_reader {
     nanots_reader& operator=(nanots_reader&&) = default;
     ~nanots_reader() = default;
 
+    // Stream all frames whose composite (timestamp, secondary_key) falls
+    // within [(start_ts, start_sk), (end_ts, end_sk)] inclusive. Pass
+    // NANOTS_SEC_KEY_UNSET for start_secondary_key and INT64_MAX for
+    // end_secondary_key to ignore the sec_key axis.
+    //
     // Callback signature is:
     //   (data, size, flags, timestamp, secondary_key, block_sequence, metadata)
     // `secondary_key` is NANOTS_SEC_KEY_UNSET for frames whose writer didn't
@@ -435,20 +449,32 @@ class NANOTS_API nanots_reader {
     void read(
         const std::string& stream_tag,
         int64_t start_timestamp,
+        int64_t start_secondary_key,
         int64_t end_timestamp,
+        int64_t end_secondary_key,
         const std::function<
             void(const uint8_t*, size_t, uint32_t, int64_t, int64_t, int64_t, const std::string&)>& callback
     );
 
+    // Distinct stream tags that have any block overlapping the composite
+    // window. Use NANOTS_SEC_KEY_UNSET / INT64_MAX for sec_key bounds to
+    // ignore that axis.
     std::vector<std::string> query_stream_tags(
         int64_t start_timestamp,
-        int64_t end_timestamp
+        int64_t start_secondary_key,
+        int64_t end_timestamp,
+        int64_t end_secondary_key
     );
 
+    // Contiguous runs of blocks for this stream within the composite window.
+    // Use NANOTS_SEC_KEY_UNSET / INT64_MAX for sec_key bounds to ignore
+    // that axis.
     std::vector<contiguous_segment> query_contiguous_segments(
         const std::string& stream_tag,
         int64_t start_timestamp,
-        int64_t end_timestamp
+        int64_t start_secondary_key,
+        int64_t end_timestamp,
+        int64_t end_secondary_key
     );
 
  private:
@@ -636,7 +662,9 @@ typedef struct nanots_iterator_handle* nanots_iterator_t;
 typedef struct {
   int64_t segment_id;
   int64_t start_timestamp;
+  int64_t start_secondary_key;
   int64_t end_timestamp;
+  int64_t end_secondary_key;
 } nanots_contiguous_segment_t;
 
 typedef struct {
@@ -688,11 +716,11 @@ NANOTS_API nanots_write_context_t nanots_writer_create_context(
 NANOTS_API void nanots_write_context_destroy(nanots_write_context_t context);
 
 // Pass NANOTS_SEC_KEY_UNSET (INT64_MIN) for `secondary_key` to write into
-// a stream without a secondary key. The first write to a stream fixes the
-// choice; mixing yields NANOTS_EC_SECONDARY_KEY_MISMATCH.
+// a stream that doesn't use a tiebreaker. Frames are ordered by the
+// composite (timestamp, secondary_key) which must be strictly monotonic.
 //
 // Argument order mirrors the C++ method: flags, then timestamp, then the
-// optional secondary key. The C ABI has no defaults — pass all 7 args.
+// secondary key. The C ABI has no defaults — pass all 7 args.
 NANOTS_API nanots_ec_t nanots_writer_write(
     nanots_writer_t writer,
     nanots_write_context_t context,
@@ -703,11 +731,16 @@ NANOTS_API nanots_ec_t nanots_writer_write(
     int64_t secondary_key
 );
 
+// Free blocks fully contained in the composite window
+// [(start_ts, start_sk), (end_ts, end_sk)]. Use NANOTS_SEC_KEY_UNSET and
+// INT64_MAX for the sec_key bounds to ignore that axis.
 NANOTS_API nanots_ec_t nanots_writer_free_blocks(
     const char* file_name,
     const char* stream_tag,
     int64_t start_timestamp,
-    int64_t end_timestamp
+    int64_t start_secondary_key,
+    int64_t end_timestamp,
+    int64_t end_secondary_key
 );
 
 // reader
@@ -715,11 +748,16 @@ NANOTS_API nanots_reader_t nanots_reader_create(const char* file_name);
 
 NANOTS_API void nanots_reader_destroy(nanots_reader_t reader);
 
+// Stream frames whose composite (timestamp, secondary_key) lies within
+// [(start_ts, start_sk), (end_ts, end_sk)]. Use NANOTS_SEC_KEY_UNSET and
+// INT64_MAX for the sec_key bounds to ignore that axis.
 NANOTS_API nanots_ec_t nanots_reader_read(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
+    int64_t start_secondary_key,
     int64_t end_timestamp,
+    int64_t end_secondary_key,
     nanots_read_callback_t callback,
     void* user_data
 );
@@ -728,7 +766,9 @@ NANOTS_API nanots_ec_t nanots_reader_query_contiguous_segments(
     nanots_reader_t reader,
     const char* stream_tag,
     int64_t start_timestamp,
+    int64_t start_secondary_key,
     int64_t end_timestamp,
+    int64_t end_secondary_key,
     nanots_contiguous_segment_t** segments,
     size_t* count
 );
@@ -738,7 +778,9 @@ NANOTS_API void nanots_free_contiguous_segments(nanots_contiguous_segment_t* seg
 NANOTS_API nanots_ec_t nanots_reader_query_stream_tags_start(
     nanots_reader_t reader,
     int64_t start_timestamp,
-    int64_t end_timestamp
+    int64_t start_secondary_key,
+    int64_t end_timestamp,
+    int64_t end_secondary_key
 );
 
 NANOTS_API const char* nanots_reader_query_stream_tags_next(nanots_reader_t reader);

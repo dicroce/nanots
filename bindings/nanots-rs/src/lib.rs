@@ -33,9 +33,13 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
 
-/// Sentinel for "frame has no secondary key" (matches the C-level
-/// `NANOTS_SEC_KEY_UNSET = INT64_MIN`).
+/// Sentinel for "no secondary key" (matches the C-level
+/// `NANOTS_SEC_KEY_UNSET = INT64_MIN`). Smallest possible secondary key.
 pub const SEC_KEY_UNSET: i64 = i64::MIN;
+
+/// Largest possible secondary key. Default upper bound for range queries
+/// that don't want to constrain on sec_key.
+pub const SEC_KEY_MAX: i64 = i64::MAX;
 
 /// Error codes matching the C enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +121,9 @@ pub type Result<T> = std::result::Result<T, ErrorCode>;
 pub struct ContiguousSegment {
     pub segment_id: i64,
     pub start_timestamp: i64,
+    pub start_secondary_key: i64,
     pub end_timestamp: i64,
+    pub end_secondary_key: i64,
 }
 
 #[repr(C)]
@@ -190,7 +196,9 @@ extern "C" {
         file_name: *const c_char,
         stream_tag: *const c_char,
         start_timestamp: i64,
+        start_secondary_key: i64,
         end_timestamp: i64,
+        end_secondary_key: i64,
     ) -> u32;
 
     fn nanots_reader_create(file_name: *const c_char) -> ReaderPtr;
@@ -199,7 +207,9 @@ extern "C" {
         reader: ReaderPtr,
         stream_tag: *const c_char,
         start_timestamp: i64,
+        start_secondary_key: i64,
         end_timestamp: i64,
+        end_secondary_key: i64,
         callback: ReadCallback,
         user_data: *mut c_void,
     ) -> u32;
@@ -207,7 +217,9 @@ extern "C" {
         reader: ReaderPtr,
         stream_tag: *const c_char,
         start_timestamp: i64,
+        start_secondary_key: i64,
         end_timestamp: i64,
+        end_secondary_key: i64,
         segments: *mut *mut ContiguousSegment,
         count: *mut usize,
     ) -> u32;
@@ -216,7 +228,9 @@ extern "C" {
     fn nanots_reader_query_stream_tags_start(
         reader: ReaderPtr,
         start_timestamp: i64,
+        start_secondary_key: i64,
         end_timestamp: i64,
+        end_secondary_key: i64,
     ) -> u32;
     fn nanots_reader_query_stream_tags_next(reader: ReaderPtr) -> *const c_char;
 
@@ -324,12 +338,32 @@ impl Writer {
         }
     }
 
-    /// Free blocks in a time range for a stream
+    /// Free blocks in a time range for a stream (no sec_key tiebreaker).
+    /// Equivalent to [`free_blocks_with_secondary_keys`](Self::free_blocks_with_secondary_keys)
+    /// with `start_secondary_key = SEC_KEY_UNSET` and
+    /// `end_secondary_key = SEC_KEY_MAX`.
     pub fn free_blocks(
         &self,
         stream_tag: &str,
         start_timestamp: i64,
         end_timestamp: i64,
+    ) -> Result<()> {
+        self.free_blocks_with_secondary_keys(
+            stream_tag,
+            start_timestamp, SEC_KEY_UNSET,
+            end_timestamp, SEC_KEY_MAX,
+        )
+    }
+
+    /// Free blocks fully contained in the composite window
+    /// `[(start_ts, start_sk), (end_ts, end_sk)]`.
+    pub fn free_blocks_with_secondary_keys(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        start_secondary_key: i64,
+        end_timestamp: i64,
+        end_secondary_key: i64,
     ) -> Result<()> {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
         let result = unsafe {
@@ -337,7 +371,9 @@ impl Writer {
                 self.file_name.as_ptr(),
                 c_stream_tag.as_ptr(),
                 start_timestamp,
+                start_secondary_key,
                 end_timestamp,
+                end_secondary_key,
             )
         };
         let error_code = ErrorCode::from_c(result);
@@ -409,12 +445,31 @@ impl Drop for WriteContext {
     }
 }
 
-/// Free blocks in a time range for a stream (standalone function)
+/// Free blocks in a time range for a stream (standalone function, no
+/// sec_key tiebreaker). See also
+/// [`free_blocks_with_secondary_keys`](free_blocks_with_secondary_keys).
 pub fn free_blocks(
     file_name: &str,
     stream_tag: &str,
     start_timestamp: i64,
     end_timestamp: i64,
+) -> Result<()> {
+    free_blocks_with_secondary_keys(
+        file_name, stream_tag,
+        start_timestamp, SEC_KEY_UNSET,
+        end_timestamp, SEC_KEY_MAX,
+    )
+}
+
+/// Free blocks fully contained in the composite window
+/// `[(start_ts, start_sk), (end_ts, end_sk)]` (standalone function).
+pub fn free_blocks_with_secondary_keys(
+    file_name: &str,
+    stream_tag: &str,
+    start_timestamp: i64,
+    start_secondary_key: i64,
+    end_timestamp: i64,
+    end_secondary_key: i64,
 ) -> Result<()> {
     let c_file_name = CString::new(file_name).map_err(|_| ErrorCode::InvalidArgument)?;
     let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
@@ -423,7 +478,9 @@ pub fn free_blocks(
             c_file_name.as_ptr(),
             c_stream_tag.as_ptr(),
             start_timestamp,
+            start_secondary_key,
             end_timestamp,
+            end_secondary_key,
         )
     };
     let error_code = ErrorCode::from_c(result);
@@ -451,16 +508,41 @@ impl Reader {
         }
     }
 
-    /// Read data from a stream in a time range
-    ///
-    /// The callback receives: data slice, flags, timestamp, secondary_key,
-    /// block_sequence, and metadata. `secondary_key` will be `SEC_KEY_UNSET`
-    /// for streams that don't store one.
+    /// Read data from a stream in a time range (no sec_key tiebreaker).
+    /// Equivalent to [`read_with_secondary_keys`](Self::read_with_secondary_keys)
+    /// with `start_secondary_key = SEC_KEY_UNSET` and
+    /// `end_secondary_key = SEC_KEY_MAX`.
     pub fn read<F>(
         &self,
         stream_tag: &str,
         start_timestamp: i64,
         end_timestamp: i64,
+        callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], u32, i64, i64, i64, &str),
+    {
+        self.read_with_secondary_keys(
+            stream_tag,
+            start_timestamp, SEC_KEY_UNSET,
+            end_timestamp, SEC_KEY_MAX,
+            callback,
+        )
+    }
+
+    /// Read frames whose composite `(timestamp, secondary_key)` lies in
+    /// `[(start_ts, start_sk), (end_ts, end_sk)]`.
+    ///
+    /// The callback receives: data slice, flags, timestamp, secondary_key,
+    /// block_sequence, and metadata. `secondary_key` will be `SEC_KEY_UNSET`
+    /// for frames whose writer didn't supply one.
+    pub fn read_with_secondary_keys<F>(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        start_secondary_key: i64,
+        end_timestamp: i64,
+        end_secondary_key: i64,
         mut callback: F,
     ) -> Result<()>
     where
@@ -501,7 +583,9 @@ impl Reader {
                 self.ptr,
                 c_stream_tag.as_ptr(),
                 start_timestamp,
+                start_secondary_key,
                 end_timestamp,
+                end_secondary_key,
                 c_callback,
                 user_data,
             )
@@ -515,12 +599,28 @@ impl Reader {
         }
     }
 
-    /// Query contiguous segments in a time range
+    /// Query contiguous segments in a time range (no sec_key tiebreaker).
     pub fn query_contiguous_segments(
         &self,
         stream_tag: &str,
         start_timestamp: i64,
         end_timestamp: i64,
+    ) -> Result<Vec<ContiguousSegment>> {
+        self.query_contiguous_segments_with_secondary_keys(
+            stream_tag,
+            start_timestamp, SEC_KEY_UNSET,
+            end_timestamp, SEC_KEY_MAX,
+        )
+    }
+
+    /// Query contiguous block runs within the composite window.
+    pub fn query_contiguous_segments_with_secondary_keys(
+        &self,
+        stream_tag: &str,
+        start_timestamp: i64,
+        start_secondary_key: i64,
+        end_timestamp: i64,
+        end_secondary_key: i64,
     ) -> Result<Vec<ContiguousSegment>> {
         let c_stream_tag = CString::new(stream_tag).map_err(|_| ErrorCode::InvalidArgument)?;
         let mut segments_ptr: *mut ContiguousSegment = ptr::null_mut();
@@ -531,7 +631,9 @@ impl Reader {
                 self.ptr,
                 c_stream_tag.as_ptr(),
                 start_timestamp,
+                start_secondary_key,
                 end_timestamp,
+                end_secondary_key,
                 &mut segments_ptr,
                 &mut count,
             )
@@ -551,14 +653,33 @@ impl Reader {
         Ok(segments)
     }
 
-    /// Query stream tags in a time range
+    /// Query stream tags in a time range (no sec_key tiebreaker).
     pub fn query_stream_tags(
         &self,
         start_timestamp: i64,
         end_timestamp: i64,
     ) -> Result<Vec<String>> {
-        let result =
-            unsafe { nanots_reader_query_stream_tags_start(self.ptr, start_timestamp, end_timestamp) };
+        self.query_stream_tags_with_secondary_keys(
+            start_timestamp, SEC_KEY_UNSET,
+            end_timestamp, SEC_KEY_MAX,
+        )
+    }
+
+    /// Distinct stream tags whose blocks overlap the composite window.
+    pub fn query_stream_tags_with_secondary_keys(
+        &self,
+        start_timestamp: i64,
+        start_secondary_key: i64,
+        end_timestamp: i64,
+        end_secondary_key: i64,
+    ) -> Result<Vec<String>> {
+        let result = unsafe {
+            nanots_reader_query_stream_tags_start(
+                self.ptr,
+                start_timestamp, start_secondary_key,
+                end_timestamp, end_secondary_key,
+            )
+        };
 
         let error_code = ErrorCode::from_c(result);
         if error_code != ErrorCode::Ok {

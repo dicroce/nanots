@@ -90,7 +90,7 @@ void test_nanots_c_api::test_c_api_basic_write_read() {
   // Read data back - use a smaller end timestamp to avoid potential UINT64_MAX
   // binding issues
   result =
-      nanots_reader_read(reader, "test_stream", 0, 10000, callback, &cb_data);
+      nanots_reader_read(reader, "test_stream", 0, NANOTS_SEC_KEY_UNSET, 10000, INT64_MAX, callback, &cb_data);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   // Verify read data
@@ -247,7 +247,7 @@ void test_nanots_c_api::test_c_api_contiguous_segments() {
   size_t count = 0;
 
   nanots_ec_t result = nanots_reader_query_contiguous_segments(
-      reader, "segment_stream", 0, 10000, &segments, &count);
+      reader, "segment_stream", 0, NANOTS_SEC_KEY_UNSET, 10000, INT64_MAX, &segments, &count);
   RTF_ASSERT(result == NANOTS_EC_OK);
   RTF_ASSERT(count > 0);
   RTF_ASSERT(segments != nullptr);
@@ -276,7 +276,7 @@ void test_nanots_c_api::test_c_api_error_handling() {
   // Test null pointer parameters
   nanots_contiguous_segment_t* segments = nullptr;
   size_t count = 0;
-  RTF_ASSERT(nanots_reader_query_contiguous_segments(nullptr, "test", 0, 100,
+  RTF_ASSERT(nanots_reader_query_contiguous_segments(nullptr, "test", 0, NANOTS_SEC_KEY_UNSET, 100, INT64_MAX,
                                                      &segments, &count) ==
              NANOTS_EC_INVALID_ARGUMENT);
 
@@ -351,7 +351,7 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
   };
 
   result =
-      nanots_reader_read(reader, "stream1", 0, 10000, callback1, &stream1_data);
+      nanots_reader_read(reader, "stream1", 0, NANOTS_SEC_KEY_UNSET, 10000, INT64_MAX, callback1, &stream1_data);
   RTF_ASSERT(result == NANOTS_EC_OK);
   RTF_ASSERT(stream1_data.size() == 1);
   RTF_ASSERT(stream1_data[0] == "Stream 1 data");
@@ -359,7 +359,7 @@ void test_nanots_c_api::test_c_api_multiple_streams() {
   // Test stream2
   vector<string> stream2_data;
   result =
-      nanots_reader_read(reader, "stream2", 0, 10000, callback1, &stream2_data);
+      nanots_reader_read(reader, "stream2", 0, NANOTS_SEC_KEY_UNSET, 10000, INT64_MAX, callback1, &stream2_data);
   RTF_ASSERT(result == NANOTS_EC_OK);
   RTF_ASSERT(stream2_data.size() == 1);
   RTF_ASSERT(stream2_data[0] == "Stream 2 data");
@@ -426,7 +426,7 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
   RTF_ASSERT(reader != nullptr);
 
   // Test 1: Query time range that includes all streams (0-3000)
-  result = nanots_reader_query_stream_tags_start(reader, 0, 3000);
+  result = nanots_reader_query_stream_tags_start(reader, 0, NANOTS_SEC_KEY_UNSET, 3000, INT64_MAX);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   vector<string> all_streams;
@@ -441,7 +441,7 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
   RTF_ASSERT(find(all_streams.begin(), all_streams.end(), "stream_gamma") != all_streams.end());
 
   // Test 2: Query time range that includes only stream_alpha and stream_beta (1000-1800)
-  result = nanots_reader_query_stream_tags_start(reader, 1000, 1800);
+  result = nanots_reader_query_stream_tags_start(reader, 1000, NANOTS_SEC_KEY_UNSET, 1800, INT64_MAX);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   vector<string> partial_streams;
@@ -455,7 +455,7 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
   RTF_ASSERT(find(partial_streams.begin(), partial_streams.end(), "stream_gamma") == partial_streams.end());
 
   // Test 3: Query time range that includes no streams (3000-4000)
-  result = nanots_reader_query_stream_tags_start(reader, 3000, 4000);
+  result = nanots_reader_query_stream_tags_start(reader, 3000, NANOTS_SEC_KEY_UNSET, 4000, INT64_MAX);
   RTF_ASSERT(result == NANOTS_EC_OK);
 
   vector<string> no_streams;
@@ -470,7 +470,7 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
   RTF_ASSERT(stream_tag == nullptr);
 
   // Test 5: Test error handling with invalid reader
-  result = nanots_reader_query_stream_tags_start(nullptr, 0, 1000);
+  result = nanots_reader_query_stream_tags_start(nullptr, 0, NANOTS_SEC_KEY_UNSET, 1000, INT64_MAX);
   RTF_ASSERT(result == NANOTS_EC_INVALID_ARGUMENT);
   
   stream_tag = nanots_reader_query_stream_tags_next(nullptr);

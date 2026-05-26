@@ -286,7 +286,7 @@ void test_nanots_ebr::test_stress_concurrent_writer_readers() {
         }
         int64_t lo = hi > 100000 ? hi - 100000 : 1000;
         try {
-          reader.read("stream_a", lo, hi,
+          reader.read("stream_a", lo, NANOTS_SEC_KEY_UNSET, hi, INT64_MAX,
               [&](const uint8_t* data, size_t size, uint32_t /*flags*/,
                   int64_t ts, int64_t /*sec_key*/,
                   int64_t /*block_seq*/,

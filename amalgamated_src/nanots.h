@@ -392,9 +392,11 @@ enum nanots_ec_t {
   NANOTS_EC_UNKNOWN = 12,
   NANOTS_EC_NOT_FOUND = 13,
   NANOTS_EC_BAD_MAGIC = 14,
-  NANOTS_EC_BAD_VERSION = 15,
-  NANOTS_EC_SECONDARY_KEY_MISMATCH = 16,
-  NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY = 17
+  NANOTS_EC_BAD_VERSION = 15
+  // Reserved 16-17 (previously SECONDARY_KEY_MISMATCH and
+  // NON_MONOTONIC_SECONDARY_KEY). Composite-key semantics fold both into
+  // NANOTS_EC_NON_MONOTONIC_TIMESTAMP, which now means "composite (ts,
+  // sec_key) is not strictly greater than the previous frame's composite."
 };
 
 }
@@ -504,10 +506,6 @@ struct segment {
   std::string stream_tag;
   std::string metadata;
   int64_t sequence{0};
-  // True if every write into this segment must include a secondary key.
-  // Locked at segment creation time and (for the stream as a whole) recorded
-  // on the first segment created for that stream tag — see _db_create_segment.
-  bool has_secondary_key{false};
 };
 
 struct segment_block {
@@ -681,15 +679,14 @@ class NANOTS_API nanots_writer {
   write_context create_write_context(const std::string& stream_tag,
                                      const std::string& metadata);
 
-  // `secondary_key` defaults to NANOTS_SEC_KEY_UNSET — pass any other int64
-  // to write into a *keyed* stream. The choice is fixed by the first write to
-  // a given stream tag; mixing keyed and unkeyed writes on the same stream is
-  // rejected with NANOTS_EC_SECONDARY_KEY_MISMATCH. Keys are strictly
-  // monotonic within a stream.
-  //
-  // Argument order: (timestamp, secondary_key) are grouped at the end as the
-  // frame's ordering keys, with flags before them so the unkeyed call shape
-  // is just write(wctx, data, size, flags, timestamp).
+  // Frames are ordered by the COMPOSITE (timestamp, secondary_key) — that
+  // pair must be strictly greater than the previous frame's composite. So:
+  //   - timestamp may repeat; secondary_key must then strictly increase
+  //   - if timestamp strictly increases, secondary_key may be anything
+  // Default secondary_key = NANOTS_SEC_KEY_UNSET (= INT64_MIN) — the smallest
+  // possible value, equivalent to "no tiebreaker." A stream that always
+  // writes with the default gets the classic "timestamp strictly monotonic"
+  // behavior because (t, MIN) > (last_t, MIN) iff t > last_t.
   void write(write_context& wctx,
              const uint8_t* data,
              size_t size,
@@ -786,7 +783,8 @@ class NANOTS_API nanots_reader {
 
   // Callback signature is:
   //   (data, size, flags, timestamp, secondary_key, block_sequence, metadata)
-  // `secondary_key` is NANOTS_SEC_KEY_UNSET for streams that don't use one.
+  // `secondary_key` is NANOTS_SEC_KEY_UNSET for frames whose writer didn't
+  // supply one.
   void read(
       const std::string& stream_tag,
       int64_t start_timestamp,
@@ -832,7 +830,6 @@ struct block_info {
   int64_t end_timestamp{0};
   int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
   int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
-  bool has_secondary_key{false};
 
   // Loaded block data
   nts_memory_map mm;
@@ -859,18 +856,21 @@ class NANOTS_API nanots_iterator {
   // Navigation
   nanots_iterator& operator++();  // Move to next frame
   nanots_iterator& operator--();  // Move to previous frame
-  bool find(int64_t timestamp);  // Find first frame >= timestamp
-  // Find first frame with secondary_key >= sec_key. Only valid on streams
-  // whose has_secondary_key == true; returns false otherwise.
-  bool find_by_secondary_key(int64_t sec_key);
+
+  // Find the first frame whose composite (timestamp, secondary_key) is >=
+  // the requested composite. Pass `secondary_key` to seek to a specific
+  // tiebroken position; omit it (defaults to NANOTS_SEC_KEY_UNSET) to land
+  // on the first frame at the requested timestamp regardless of sec_key —
+  // because INT64_MIN is the smallest possible sec_key.
+  bool find(int64_t timestamp,
+            int64_t secondary_key = NANOTS_SEC_KEY_UNSET);
+
   bool seek_end();               // Go to last frame
   void reset();                   // Go to first frame
 
   // Utility
   int64_t current_block_sequence() const { return _current_block_sequence; }
   const std::string& current_metadata() const;
-  // True if this stream stores a secondary key on every frame.
-  bool has_secondary_key();
 
  private:
   // In-memory index of all blocks in this stream, sorted by start_ts
@@ -893,8 +893,7 @@ class NANOTS_API nanots_iterator {
   block_info* _get_last_block();
   block_info* _get_next_block();
   block_info* _get_prev_block();
-  block_info* _find_block_for_timestamp(int64_t timestamp);
-  block_info* _find_block_for_secondary_key(int64_t sec_key);
+  block_info* _find_block_for_composite(int64_t timestamp, int64_t sec_key);
 
   // Build (or rebuild) the timestamp index from SQL. _ensure_ts_index is the
   // lazy entry point used by navigation methods.
@@ -905,11 +904,9 @@ class NANOTS_API nanots_iterator {
   // _ts_index.size() if none. Matches the old SQL semantics: first prefers a
   // block that covers ts (start_ts <= ts <= end_ts, or end_ts == 0); otherwise
   // returns the first block with start_ts >= ts.
-  size_t _ts_index_find(int64_t ts) const;
-
-  // Same as _ts_index_find but searches by secondary key. Only meaningful for
-  // streams whose has_secondary_key is true.
-  size_t _ts_index_find_by_sk(int64_t sk) const;
+  // Composite lower_bound: returns the position of the first block whose
+  // (start_ts, start_sk) is >= (ts, sk), or the block that covers it.
+  size_t _ts_index_find(int64_t ts, int64_t sk) const;
 
   // True if _ts_index_pos matches (current_segment_id, current_block_sequence).
   bool   _ts_index_pos_is_valid() const;
@@ -925,9 +922,6 @@ class NANOTS_API nanots_iterator {
   std::string _stream_tag;
   nts_file _file;
   uint32_t _block_size;
-  // Cached from the segments row for this stream. -1 = not yet known;
-  // 0 = no, 1 = yes.
-  int _has_secondary_key_cache{-1};
 
   // Current position
   int64_t _current_block_sequence;
@@ -1084,16 +1078,12 @@ NANOTS_API nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator);
 
 NANOTS_API nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator);
 
+// Find the first frame whose composite (timestamp, secondary_key) is >= the
+// requested composite. Pass NANOTS_SEC_KEY_UNSET for `secondary_key` to land
+// on the first frame at the requested timestamp.
 NANOTS_API nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
-                                     int64_t timestamp);
-
-// Returns NANOTS_EC_INVALID_ARGUMENT if the stream has no secondary key.
-NANOTS_API nanots_ec_t nanots_iterator_find_by_secondary_key(
-    nanots_iterator_t iterator,
-    int64_t secondary_key);
-
-// 1 if this iterator's stream stores secondary keys, 0 otherwise.
-NANOTS_API int nanots_iterator_has_secondary_key(nanots_iterator_t iterator);
+                                            int64_t timestamp,
+                                            int64_t secondary_key);
 
 NANOTS_API nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator);
 

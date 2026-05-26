@@ -210,7 +210,7 @@ func TestFindFunctionality(t *testing.T) {
 		defer iter.Close()
 
 		// Find timestamp that exists
-		err = iter.Find(3000)
+		err = iter.Find(3000, SecKeyUnset)
 		if err != nil {
 			t.Fatalf("Failed to find timestamp 3000: %v", err)
 		}
@@ -229,7 +229,7 @@ func TestFindFunctionality(t *testing.T) {
 		}
 
 		// Find timestamp between existing ones (should find next)
-		err = iter.Find(4000)
+		err = iter.Find(4000, SecKeyUnset)
 		if err != nil {
 			t.Fatalf("Failed to find timestamp 4000: %v", err)
 		}
@@ -248,7 +248,7 @@ func TestFindFunctionality(t *testing.T) {
 		}
 
 		// Find timestamp before any data
-		err = iter.Find(500)
+		err = iter.Find(500, SecKeyUnset)
 		if err != nil {
 			t.Fatalf("Failed to find timestamp 500: %v", err)
 		}

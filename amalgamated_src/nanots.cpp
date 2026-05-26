@@ -1352,35 +1352,18 @@ static std::optional<block> _db_get_free_block(const nts_sqlite_conn& conn) {
 //  which composes _db_get_free_block / _grow_blocks / _db_reclaim_oldest_used_block
 //  with the EBR limbo/ready machinery.)
 
-// Look up whether any existing segment for this stream tag uses the secondary
-// key. Returns nullopt if no segment exists yet for this stream (caller's
-// choice will become the canonical one), or the 0/1 value otherwise.
-static std::optional<int> _db_lookup_stream_has_secondary_key(
-    const nts_sqlite_conn& conn, const std::string& stream_tag) {
-  auto stmt = conn.prepare(
-      "SELECT has_secondary_key FROM segments WHERE stream_tag = ? LIMIT 1");
-  auto rows = stmt.bind(1, stream_tag).exec();
-  if (rows.empty()) return std::nullopt;
-  return std::stoi(rows.front()["has_secondary_key"].value());
-}
-
 static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
                                                  const std::string& stream_tag,
-                                                 const std::string& metadata,
-                                                 bool has_secondary_key) {
+                                                 const std::string& metadata) {
   auto stmt = conn.prepare(
-      "INSERT INTO segments (stream_tag, metadata, has_secondary_key) VALUES (?, ?, ?)");
-  stmt.bind(1, stream_tag)
-      .bind(2, metadata)
-      .bind(3, has_secondary_key ? 1 : 0)
-      .exec_no_result();
+      "INSERT INTO segments (stream_tag, metadata) VALUES (?, ?)");
+  stmt.bind(1, stream_tag).bind(2, metadata).exec_no_result();
 
   segment s;
   s.id = std::stoll(conn.last_insert_id());
   s.stream_tag = stream_tag;
   s.metadata = metadata;
   s.sequence = 0;
-  s.has_secondary_key = has_secondary_key;
   return s;
 }
 
@@ -1720,55 +1703,38 @@ void nanots_writer::write(write_context& wctx,
                           uint32_t flags,
                           int64_t timestamp,
                           int64_t secondary_key) {
-  if (wctx.last_timestamp && timestamp <= wctx.last_timestamp.value())
-    throw nanots_exception(NANOTS_EC_NON_MONOTONIC_TIMESTAMP, "Timestamp is not monotonic.", __FILE__, __LINE__);
+  // Composite (timestamp, secondary_key) must be strictly greater than the
+  // previous frame's composite. When the caller doesn't pass a sec_key, the
+  // default is NANOTS_SEC_KEY_UNSET (= INT64_MIN); for a stream that never
+  // passes one this degenerates to "timestamp must strictly increase."
+  if (wctx.last_timestamp) {
+    int64_t last_ts = wctx.last_timestamp.value();
+    int64_t last_sk = wctx.last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
+    bool composite_greater =
+        (timestamp > last_ts) ||
+        (timestamp == last_ts && secondary_key > last_sk);
+    if (!composite_greater) {
+      throw nanots_exception(
+          NANOTS_EC_NON_MONOTONIC_TIMESTAMP,
+          "Composite (timestamp, secondary_key) is not strictly greater than "
+          "the previous frame's composite.",
+          __FILE__, __LINE__);
+    }
+  }
 
   if (size >
       _block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE))
     throw nanots_exception(NANOTS_EC_ROW_SIZE_TOO_BIG, "Frame size is too large. Use a much larger block size.", __FILE__, __LINE__);
 
-  // First write to this context: lazily create (or attach to) the segment
-  // row. The very first write to a brand-new stream tag fixes the choice of
-  // whether the stream stores a secondary key on every frame.
+  // First write to this context: lazily create the segment row.
   if (!wctx.current_segment) {
-    bool wants_sec_key = (secondary_key != NANOTS_SEC_KEY_UNSET);
-
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
     nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      auto existing = _db_lookup_stream_has_secondary_key(conn, wctx.stream_tag);
-      if (existing.has_value()) {
-        bool existing_yes = (*existing != 0);
-        if (existing_yes != wants_sec_key) {
-          throw nanots_exception(
-              NANOTS_EC_SECONDARY_KEY_MISMATCH,
-              "Stream's secondary-key mode is fixed by its first write and "
-              "this write does not match.", __FILE__, __LINE__);
-        }
-      }
       wctx.current_segment = _db_create_segment(
-          conn, wctx.stream_tag, wctx.metadata, wants_sec_key);
+          conn, wctx.stream_tag, wctx.metadata);
       if (!wctx.current_segment)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
     });
-  } else {
-    // Subsequent writes: enforce the per-stream choice that was locked in
-    // on the first write.
-    bool stream_wants = wctx.current_segment->has_secondary_key;
-    bool this_write_provides = (secondary_key != NANOTS_SEC_KEY_UNSET);
-    if (stream_wants != this_write_provides) {
-      throw nanots_exception(
-          NANOTS_EC_SECONDARY_KEY_MISMATCH,
-          "Stream's secondary-key mode is fixed and this write does not match.",
-          __FILE__, __LINE__);
-    }
-  }
-
-  if (secondary_key != NANOTS_SEC_KEY_UNSET &&
-      wctx.last_secondary_key.has_value() &&
-      secondary_key <= wctx.last_secondary_key.value()) {
-    throw nanots_exception(NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY,
-                           "Secondary key is not monotonic.",
-                           __FILE__, __LINE__);
   }
 
   if (!wctx.current_block) {
@@ -1872,8 +1838,9 @@ void nanots_writer::write(write_context& wctx,
 #endif
 
   wctx.last_timestamp = timestamp;
-  if (secondary_key != NANOTS_SEC_KEY_UNSET)
-    wctx.last_secondary_key = secondary_key;
+  // Track the secondary key unconditionally so the composite monotonicity
+  // check on the next write has the right "last" value (including UNSET).
+  wctx.last_secondary_key = secondary_key;
 }
 
 void nanots_writer::free_blocks(const std::string& file_name,
@@ -1993,8 +1960,7 @@ void nanots_writer::allocate(const std::string& file_name,
       "CREATE TABLE segments ("
       "id INTEGER PRIMARY KEY AUTOINCREMENT, "
       "stream_tag STRING, "
-      "metadata STRING, "
-      "has_secondary_key INTEGER NOT NULL DEFAULT 0"
+      "metadata STRING"
       ");";
   db.exec(query);
 
@@ -2086,27 +2052,18 @@ nanots_reader::nanots_reader(const std::string& file_name)
   _n_blocks   = *(uint32_t*)(header_p + FILE_HEADER_N_BLOCKS_OFFSET);
 }
 
-static int _compare_index_entry_timestamp(uint8_t* index_entry_p,
-                                          uint8_t* target_timestamp_p) {
-  int64_t entry_timestamp = *(int64_t*)(index_entry_p + INDEX_ENTRY_TS_OFFSET);
-  int64_t target_timestamp = *(int64_t*)target_timestamp_p;
+// Lexicographic compare on (timestamp, secondary_key). Target is a 16-byte
+// buffer containing [target_ts (int64), target_sk (int64)]. Used for the
+// composite binary search inside a block.
+static int _compare_index_entry_composite(uint8_t* index_entry_p,
+                                          uint8_t* target_p) {
+  int64_t entry_ts = *(int64_t*)(index_entry_p + INDEX_ENTRY_TS_OFFSET);
+  int64_t target_ts = *(int64_t*)(target_p + 0);
+  if (entry_ts != target_ts) return entry_ts < target_ts ? -1 : 1;
 
-  if (entry_timestamp < target_timestamp)
-    return -1;
-  if (entry_timestamp > target_timestamp)
-    return 1;
-  return 0;
-}
-
-static int _compare_index_entry_secondary_key(uint8_t* index_entry_p,
-                                              uint8_t* target_sk_p) {
   int64_t entry_sk = *(int64_t*)(index_entry_p + INDEX_ENTRY_SECKEY_OFFSET);
-  int64_t target_sk = *(int64_t*)target_sk_p;
-
-  if (entry_sk < target_sk)
-    return -1;
-  if (entry_sk > target_sk)
-    return 1;
+  int64_t target_sk = *(int64_t*)(target_p + sizeof(int64_t));
+  if (entry_sk != target_sk) return entry_sk < target_sk ? -1 : 1;
   return 0;
 }
 
@@ -2172,9 +2129,12 @@ void nanots_reader::read(
     int64_t start_index = 0;
 
     if (need_binary_search) {
+      // Composite lower_bound at (start_timestamp, INT64_MIN) — i.e. the
+      // first frame at start_timestamp regardless of sec_key.
+      int64_t target[2] = {start_timestamp, NANOTS_SEC_KEY_UNSET};
       uint8_t* first_entry =
-          lower_bound_bytes(index_start, index_end, (uint8_t*)&start_timestamp,
-                            INDEX_ENTRY_SIZE, _compare_index_entry_timestamp);
+          lower_bound_bytes(index_start, index_end, (uint8_t*)target,
+                            INDEX_ENTRY_SIZE, _compare_index_entry_composite);
 
       start_index = (first_entry - index_start) / INDEX_ENTRY_SIZE;
       need_binary_search = false;
@@ -2325,21 +2285,6 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
   reset();
 }
 
-bool nanots_iterator::has_secondary_key() {
-  if (_has_secondary_key_cache >= 0) return _has_secondary_key_cache != 0;
-  auto& db = _ensure_db_connection();
-  auto stmt = db.prepare(
-      "SELECT has_secondary_key FROM segments WHERE stream_tag = ? LIMIT 1");
-  auto rows = stmt.bind(1, _stream_tag).exec();
-  int v = 0;
-  if (!rows.empty()) {
-    auto& cell = rows.front()["has_secondary_key"];
-    if (cell.has_value()) v = std::stoi(cell.value());
-  }
-  _has_secondary_key_cache = v;
-  return v != 0;
-}
-
 nts_sqlite_conn& nanots_iterator::_ensure_db_connection() {
   if (!_db_conn.has_value()) {
     auto db_name = _database_name(_file_name);
@@ -2360,7 +2305,6 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
     _stmt_get_block_by_id.emplace(_ensure_db_connection().prepare(
         "SELECT "
         "s.metadata as metadata, "
-        "s.has_secondary_key as has_secondary_key, "
         "sb.segment_id as segment_id, "
         "sb.sequence as block_sequence, "
         "sb.block_idx as block_idx, "
@@ -2392,8 +2336,6 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   block.uuid_hex = row["uuid"].value();
   block.start_timestamp = std::stoll(row["start_timestamp"].value());
   block.end_timestamp = std::stoll(row["end_timestamp"].value());
-  auto& hsk = row["has_secondary_key"];
-  block.has_secondary_key = hsk.has_value() && std::stoi(hsk.value()) != 0;
   auto& sk_start = row["start_secondary_key"];
   block.start_secondary_key = sk_start.has_value()
       ? std::stoll(sk_start.value()) : NANOTS_SEC_KEY_UNSET;
@@ -2448,35 +2390,37 @@ void nanots_iterator::_refresh_ts_index() {
   _ts_index_filled = true;
 }
 
-size_t nanots_iterator::_ts_index_find_by_sk(int64_t sk) const {
-  // Prefer a block that covers sk.
-  auto it = std::upper_bound(_ts_index.begin(), _ts_index.end(), sk,
-      [](int64_t k, const BlockRange& br) { return k < br.start_sk; });
-  if (it != _ts_index.begin()) {
-    auto prev = std::prev(it);
-    if (sk >= prev->start_sk &&
-        (prev->end_sk == 0 || sk <= prev->end_sk)) {
-      return static_cast<size_t>(std::distance(_ts_index.begin(), prev));
-    }
-  }
-  if (it != _ts_index.end()) {
-    return static_cast<size_t>(std::distance(_ts_index.begin(), it));
-  }
-  return _ts_index.size();
-}
 
-size_t nanots_iterator::_ts_index_find(int64_t ts) const {
-  // Prefer a block that covers ts.
-  auto it = std::upper_bound(_ts_index.begin(), _ts_index.end(), ts,
-      [](int64_t t, const BlockRange& br) { return t < br.start_ts; });
+size_t nanots_iterator::_ts_index_find(int64_t ts, int64_t sk) const {
+  // Composite-key search across blocks. Each block holds a sorted run of
+  // (ts, sk) tuples; the block's lex range is [(start_ts, start_sk),
+  // (end_ts, end_sk)]. We want the block whose range covers the target
+  // composite, or — failing that — the first block whose start composite
+  // is >= the target.
+  using P = std::pair<int64_t, int64_t>;
+  auto br_start = [](const BlockRange& br) { return P{br.start_ts, br.start_sk}; };
+  auto cmp_lt = [](P a, P b) {
+    return a.first != b.first ? a.first < b.first : a.second < b.second;
+  };
+
+  P target{ts, sk};
+  // First block whose start composite > target.
+  auto it = std::upper_bound(_ts_index.begin(), _ts_index.end(), target,
+      [&](P t, const BlockRange& br) { return cmp_lt(t, br_start(br)); });
+
   if (it != _ts_index.begin()) {
     auto prev = std::prev(it);
-    if (ts >= prev->start_ts &&
-        (prev->end_ts == 0 || ts <= prev->end_ts)) {
+    P prev_start = br_start(*prev);
+    bool ge_start = !cmp_lt(target, prev_start);  // target >= prev_start
+    bool open_block = (prev->end_ts == 0);
+    P prev_end{prev->end_ts, prev->end_sk};
+    bool le_end = open_block || !cmp_lt(prev_end, target);  // target <= prev_end
+    if (ge_start && le_end) {
       return static_cast<size_t>(std::distance(_ts_index.begin(), prev));
     }
   }
-  // Fallback: first block with start_ts >= ts (matches old SQL semantics).
+
+  // Fallback: first block whose start composite >= target.
   if (it != _ts_index.end()) {
     return static_cast<size_t>(std::distance(_ts_index.begin(), it));
   }
@@ -2574,7 +2518,8 @@ block_info* nanots_iterator::_get_prev_block() {
   return block;
 }
 
-block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
+block_info* nanots_iterator::_find_block_for_composite(int64_t timestamp,
+                                                       int64_t sec_key) {
   _ensure_ts_index();
 
   // Helper: given a position in _ts_index, look up its block_info. Returns
@@ -2588,7 +2533,7 @@ block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
   };
 
   // First attempt: snapshot we already have.
-  size_t pos = _ts_index_find(timestamp);
+  size_t pos = _ts_index_find(timestamp, sec_key);
   if (auto* b = try_at(pos)) return b;
 
   // Miss or stale: refresh and try once more. This catches:
@@ -2596,75 +2541,8 @@ block_info* nanots_iterator::_find_block_for_timestamp(int64_t timestamp) {
   //   (b) writer reclaimed the block we matched and the new (segment, sequence)
   //       at that idx isn't in our cache
   _refresh_ts_index();
-  pos = _ts_index_find(timestamp);
+  pos = _ts_index_find(timestamp, sec_key);
   return try_at(pos);
-}
-
-block_info* nanots_iterator::_find_block_for_secondary_key(int64_t sec_key) {
-  _ensure_ts_index();
-
-  auto try_at = [&](size_t pos) -> block_info* {
-    if (pos >= _ts_index.size()) return nullptr;
-    const auto& br = _ts_index[pos];
-    auto* b = _get_block_by_segment_and_sequence(br.segment_id, br.sequence);
-    if (b) _ts_index_pos = pos;
-    return b;
-  };
-
-  size_t pos = _ts_index_find_by_sk(sec_key);
-  if (auto* b = try_at(pos)) return b;
-
-  _refresh_ts_index();
-  pos = _ts_index_find_by_sk(sec_key);
-  return try_at(pos);
-}
-
-bool nanots_iterator::find_by_secondary_key(int64_t sec_key) {
-  nanots_op_scope _op(_slot_guard);
-
-  if (!has_secondary_key()) {
-    _valid = false;
-    return false;
-  }
-
-  block_info* block = _find_block_for_secondary_key(sec_key);
-  if (!block) {
-    _valid = false;
-    return false;
-  }
-
-  if (!_load_block_data(*block)) {
-    _valid = false;
-    return false;
-  }
-
-  _current_block_start_ts = block->start_timestamp;
-  _current_block_end_ts   = block->end_timestamp;
-  _current_segment_id     = block->segment_id;
-  _current_block_sequence = block->block_sequence;
-
-  uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
-  uint8_t* index_end   = index_start + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
-
-  uint8_t* found_entry =
-      lower_bound_bytes(index_start, index_end, (uint8_t*)&sec_key,
-                        INDEX_ENTRY_SIZE,
-                        _compare_index_entry_secondary_key);
-
-  _current_frame_idx = (found_entry - index_start) / INDEX_ENTRY_SIZE;
-
-  if (_current_frame_idx >= block->n_valid_indexes) {
-    auto* next_block = _get_next_block();
-    if (!next_block) {
-      _valid = false;
-      return false;
-    }
-    _current_segment_id = next_block->segment_id;
-    _current_block_sequence = next_block->block_sequence;
-    _current_frame_idx = 0;
-  }
-
-  return _load_current_frame();
 }
 
 bool nanots_iterator::_load_block_data(block_info& block) {
@@ -2799,19 +2677,20 @@ nanots_iterator& nanots_iterator::operator--() {
   return *this;
 }
 
-bool nanots_iterator::find(int64_t timestamp) {
+bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
   nanots_op_scope _op(_slot_guard);
   block_info* block = nullptr;
 
-  // Fast path: if the target is within the already-loaded block's range, skip
-  // the SQL lookup entirely and go straight to the binary search.
+  // Fast path: if the target is within the already-loaded block's range
+  // (composite), skip the SQL lookup entirely.
   if (_valid && _current_block_end_ts != 0 &&
-      timestamp >= _current_block_start_ts && timestamp <= _current_block_end_ts) {
+      timestamp >= _current_block_start_ts &&
+      timestamp <= _current_block_end_ts) {
     block = _get_block_by_segment_and_sequence(_current_segment_id, _current_block_sequence);
   }
 
   if (!block)
-    block = _find_block_for_timestamp(timestamp);
+    block = _find_block_for_composite(timestamp, secondary_key);
 
   if (!block) {
     _valid = false;
@@ -2829,14 +2708,15 @@ bool nanots_iterator::find(int64_t timestamp) {
   _current_segment_id = block->segment_id;
   _current_block_sequence = block->block_sequence;
 
-  // Binary search within the block
+  // Composite lower_bound within the block.
   uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
   uint8_t* index_end =
       index_start + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
 
+  int64_t target[2] = {timestamp, secondary_key};
   uint8_t* found_entry =
-      lower_bound_bytes(index_start, index_end, (uint8_t*)&timestamp,
-                        INDEX_ENTRY_SIZE, _compare_index_entry_timestamp);
+      lower_bound_bytes(index_start, index_end, (uint8_t*)target,
+                        INDEX_ENTRY_SIZE, _compare_index_entry_composite);
 
   _current_frame_idx = (found_entry - index_start) / INDEX_ENTRY_SIZE;
 
@@ -2853,32 +2733,7 @@ bool nanots_iterator::find(int64_t timestamp) {
     _current_frame_idx = 0;
   }
 
-  // Get frame info from index
-  uint8_t* index_p = block->block_p + BLOCK_HEADER_SIZE +
-                     (_current_frame_idx * INDEX_ENTRY_SIZE);
-  int64_t found_timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
-  uint64_t offset = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
-
-  // Validate frame header
-  uint32_t flags;
-  uint32_t frame_size;
-  int64_t sec_key;
-  if (!_validate_frame_header(block->block_p + offset, block->uuid, &flags,
-                              &frame_size, &sec_key)) {
-    _valid = false;
-    return false;
-  }
-
-  // Set up current frame
-  _current_frame.data = block->block_p + offset + FRAME_HEADER_SIZE;
-  _current_frame.size = frame_size;
-  _current_frame.flags = flags;
-  _current_frame.timestamp = found_timestamp;
-  _current_frame.secondary_key = sec_key;
-  _current_frame.block_sequence = block->block_sequence;
-
-  _valid = true;
-  return true;
+  return _load_current_frame();
 }
 
 void nanots_iterator::reset() {
@@ -3328,13 +3183,14 @@ nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator) {
 }
 
 nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
-                                     int64_t timestamp) {
+                                 int64_t timestamp,
+                                 int64_t secondary_key) {
   if (!iterator || !iterator->iterator) {
     return NANOTS_EC_INVALID_ARGUMENT;
   }
 
   try {
-    bool found = iterator->iterator->find(timestamp);
+    bool found = iterator->iterator->find(timestamp, secondary_key);
     return found ? NANOTS_EC_OK : NANOTS_EC_INVALID_ARGUMENT;
   } catch (const nanots_exception& e) {
     return e.get_ec();
@@ -3344,37 +3200,6 @@ nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
   } catch (...) {
     fprintf(stderr,"Exception in nanots_iterator_find\n");
     return NANOTS_EC_UNKNOWN;
-  }
-}
-
-nanots_ec_t nanots_iterator_find_by_secondary_key(nanots_iterator_t iterator,
-                                                  int64_t secondary_key) {
-  if (!iterator || !iterator->iterator) {
-    return NANOTS_EC_INVALID_ARGUMENT;
-  }
-
-  try {
-    bool found = iterator->iterator->find_by_secondary_key(secondary_key);
-    return found ? NANOTS_EC_OK : NANOTS_EC_INVALID_ARGUMENT;
-  } catch (const nanots_exception& e) {
-    return e.get_ec();
-  } catch (const std::exception& e) {
-    fprintf(stderr,"Exception in nanots_iterator_find_by_secondary_key: %s\n", e.what());
-    return NANOTS_EC_UNKNOWN;
-  } catch (...) {
-    fprintf(stderr,"Exception in nanots_iterator_find_by_secondary_key\n");
-    return NANOTS_EC_UNKNOWN;
-  }
-}
-
-int nanots_iterator_has_secondary_key(nanots_iterator_t iterator) {
-  if (!iterator || !iterator->iterator) {
-    return 0;
-  }
-  try {
-    return iterator->iterator->has_secondary_key() ? 1 : 0;
-  } catch (...) {
-    return 0;
   }
 }
 

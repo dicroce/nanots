@@ -193,7 +193,7 @@ void test_nanots_c_api::test_c_api_iterator_functionality() {
   }
 
   // Test find functionality
-  nanots_ec_t result = nanots_iterator_find(iterator, 1200);
+  nanots_ec_t result = nanots_iterator_find(iterator, 1200, NANOTS_SEC_KEY_UNSET);
   RTF_ASSERT(result == NANOTS_EC_OK);
   RTF_ASSERT(nanots_iterator_valid(iterator) == 1);
 
@@ -270,7 +270,7 @@ void test_nanots_c_api::test_c_api_error_handling() {
              NANOTS_EC_INVALID_ARGUMENT);
   RTF_ASSERT(nanots_iterator_next(nullptr) == NANOTS_EC_INVALID_ARGUMENT);
   RTF_ASSERT(nanots_iterator_prev(nullptr) == NANOTS_EC_INVALID_ARGUMENT);
-  RTF_ASSERT(nanots_iterator_find(nullptr, 1000) == NANOTS_EC_INVALID_ARGUMENT);
+  RTF_ASSERT(nanots_iterator_find(nullptr, 1000, NANOTS_SEC_KEY_UNSET) == NANOTS_EC_INVALID_ARGUMENT);
   RTF_ASSERT(nanots_iterator_reset(nullptr) == NANOTS_EC_INVALID_ARGUMENT);
 
   // Test null pointer parameters

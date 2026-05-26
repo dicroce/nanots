@@ -57,8 +57,6 @@ pub enum ErrorCode {
     NotFound = 13,
     BadMagic = 14,
     BadVersion = 15,
-    SecondaryKeyMismatch = 16,
-    NonMonotonicSecondaryKey = 17,
 }
 
 impl ErrorCode {
@@ -79,8 +77,6 @@ impl ErrorCode {
             13 => ErrorCode::NotFound,
             14 => ErrorCode::BadMagic,
             15 => ErrorCode::BadVersion,
-            16 => ErrorCode::SecondaryKeyMismatch,
-            17 => ErrorCode::NonMonotonicSecondaryKey,
             _ => ErrorCode::Unknown,
         }
     }
@@ -105,8 +101,6 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::NotFound => "Not found",
             ErrorCode::BadMagic => "Not a nanots v2 file (bad magic)",
             ErrorCode::BadVersion => "Unsupported nanots format version",
-            ErrorCode::SecondaryKeyMismatch => "Stream secondary-key mode mismatch",
-            ErrorCode::NonMonotonicSecondaryKey => "Secondary key must be monotonic",
         };
         write!(f, "{}", msg)
     }
@@ -238,12 +232,9 @@ extern "C" {
     ) -> u32;
     fn nanots_iterator_next(iterator: IteratorPtr) -> u32;
     fn nanots_iterator_prev(iterator: IteratorPtr) -> u32;
-    fn nanots_iterator_find(iterator: IteratorPtr, timestamp: i64) -> u32;
-    fn nanots_iterator_find_by_secondary_key(
-        iterator: IteratorPtr,
-        secondary_key: i64,
-    ) -> u32;
-    fn nanots_iterator_has_secondary_key(iterator: IteratorPtr) -> c_int;
+    fn nanots_iterator_find(iterator: IteratorPtr,
+                            timestamp: i64,
+                            secondary_key: i64) -> u32;
     fn nanots_iterator_reset(iterator: IteratorPtr) -> u32;
     fn nanots_iterator_current_block_sequence(iterator: IteratorPtr) -> i64;
     fn nanots_iterator_current_metadata(iterator: IteratorPtr) -> *const c_char;
@@ -284,12 +275,11 @@ impl Writer {
         }
     }
 
-    /// Write data to an *unkeyed* stream.
+    /// Write a frame with no secondary key.
     ///
-    /// The first write to a stream tag fixes the stream as either keyed or
-    /// unkeyed; this method always passes `SEC_KEY_UNSET`, so use it only on
-    /// streams that have no secondary key. For keyed streams use
-    /// [`write_with_secondary_key`](Self::write_with_secondary_key).
+    /// Equivalent to `write_with_secondary_key` with `secondary_key =
+    /// SEC_KEY_UNSET`. Composite ordering degenerates to "timestamp strictly
+    /// increasing" for streams that always call `write`.
     pub fn write(
         &self,
         context: &WriteContext,
@@ -300,12 +290,13 @@ impl Writer {
         self.write_with_secondary_key(context, data, flags, timestamp, SEC_KEY_UNSET)
     }
 
-    /// Write data with an explicit secondary key.
+    /// Write a frame with an explicit secondary key.
     ///
-    /// Pass any `i64` *except* `i64::MIN` (= [`SEC_KEY_UNSET`]) to write into
-    /// a keyed stream. Mixing keyed and unkeyed writes on the same stream
-    /// returns [`ErrorCode::SecondaryKeyMismatch`]; non-monotonic keys
-    /// return [`ErrorCode::NonMonotonicSecondaryKey`].
+    /// Frames are ordered by the composite `(timestamp, secondary_key)`,
+    /// which must strictly increase across writes. Pass any `i64` *except*
+    /// `i64::MIN` (= [`SEC_KEY_UNSET`]) as a real key — use it to
+    /// disambiguate frames at the same timestamp. Violating the composite
+    /// ordering returns [`ErrorCode::NonMonotonicTimestamp`].
     pub fn write_with_secondary_key(
         &self,
         context: &WriteContext,
@@ -692,25 +683,16 @@ impl Iterator {
         }
     }
 
-    /// Find the first frame at or after the given timestamp
-    pub fn find(&mut self, timestamp: i64) -> Result<bool> {
-        let result = unsafe { nanots_iterator_find(self.ptr, timestamp) };
+    /// Find the first frame whose composite `(timestamp, secondary_key)`
+    /// is `>=` the requested composite.
+    ///
+    /// Pass `secondary_key = SEC_KEY_UNSET` to land on the first frame at
+    /// the requested timestamp regardless of sec_key (since `SEC_KEY_UNSET`
+    /// is the smallest possible sec_key in lex order).
+    pub fn find(&mut self, timestamp: i64, secondary_key: i64) -> Result<bool> {
+        let result = unsafe { nanots_iterator_find(self.ptr, timestamp, secondary_key) };
         let error_code = ErrorCode::from_c(result);
         Ok(error_code == ErrorCode::Ok)
-    }
-
-    /// Find the first frame at or after the given secondary key. Only valid
-    /// on streams whose [`has_secondary_key`](Self::has_secondary_key) is true.
-    pub fn find_by_secondary_key(&mut self, secondary_key: i64) -> Result<bool> {
-        let result =
-            unsafe { nanots_iterator_find_by_secondary_key(self.ptr, secondary_key) };
-        let error_code = ErrorCode::from_c(result);
-        Ok(error_code == ErrorCode::Ok)
-    }
-
-    /// True if this stream stores a secondary key on every frame.
-    pub fn has_secondary_key(&self) -> bool {
-        unsafe { nanots_iterator_has_secondary_key(self.ptr) != 0 }
     }
 
     /// Reset to the first frame

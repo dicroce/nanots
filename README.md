@@ -14,8 +14,8 @@ A lightweight, high-performance, embedded (like sqlite) time-series database opt
 - **Crash recovery**: Automatic detection and recovery from unexpected shutdowns
 - **Two storage modes**: *Preallocated* (fixed-size files, no surprises on disk usage — ideal for surveillance/embedded) or *Growable* (file extends on demand using BoltDB-style doubling, capped at 1 GiB per grow).
 - **Multiple streams**: Store different data streams in the same database file
-- **Iterator interface**: Efficient navigation with bidirectional iteration and seeking by timestamp or secondary key
-- **Optional secondary key**: Each stream can store a strictly-monotonic `int64` *secondary key* alongside the timestamp (e.g. an external sequence number or exchange-supplied trade ID) and be binary-searched on it
+- **Iterator interface**: Efficient navigation with bidirectional iteration and composite-key seeking
+- **Composite (timestamp, secondary_key) ordering**: Timestamps may repeat; an optional `int64` *secondary key* serves as the tiebreaker so the composite is strictly monotonic. Perfect for financial origin timestamps (exchange tick + sequence number) where the timestamp alone isn't unique.
 - **Cross Platform**: Currently works on Linux, Windows and MacOS.
 
 ## Performance
@@ -45,7 +45,7 @@ Block size is configurable and tunable for different applications.
 
 Each block contains:
 - **Block header**: Metadata and frame count
-- **Frame index**: Timestamp → offset mappings for fast seeks (and an optional secondary key per entry for direct seek-by-key)
+- **Frame index**: `(timestamp, secondary_key)` → offset mappings for fast composite seeks
 - **Frame data**: Variable-size frames with headers and payload
 
 ### On-Disk Format Version
@@ -88,19 +88,20 @@ nanots_writer db("video.nts", true);
 // Create write context for a stream
 auto wctx = db.create_write_context("camera_1", "stream metadata");
 
-// Every write() takes (flags, timestamp[, secondary_key]). The secondary
-// key is optional per stream and defaults to NANOTS_SEC_KEY_UNSET — i.e.
-// "this stream has no secondary key." The first write to any given stream
-// tag locks the stream as either "keyed" or "unkeyed"; subsequent writes
-// must match.
+// Every write() takes (flags, timestamp[, secondary_key]). Frames are
+// ordered by the composite (timestamp, secondary_key), which must be
+// strictly monotonic across writes. The secondary_key defaults to
+// NANOTS_SEC_KEY_UNSET — for callers that don't need a tiebreaker the
+// rule degenerates to "timestamp strictly increasing" (the classic case).
 uint8_t frame_data[] = {/* video frame bytes */};
 db.write(wctx, frame_data, sizeof(frame_data), flags, timestamp_us);
 
-// Or — for a keyed stream — pass any strictly-increasing int64 as the
-// secondary key (any value except INT64_MIN, which is the "unset" sentinel):
+// When timestamps can repeat (e.g. exchange origin timestamps that aren't
+// unique), supply a secondary key as the tiebreaker. Any int64 except
+// INT64_MIN (the "unset" sentinel) is a valid key:
 auto trade_ctx = db.create_write_context("trades", "BTC-USD ticks");
-db.write(trade_ctx, frame_data, sizeof(frame_data),
-         flags, timestamp_us, /*sequence_no=*/exchange_trade_id);
+db.write(trade_ctx, frame_data, sizeof(frame_data), flags,
+         exchange_ts, /*sequence_no=*/exchange_trade_id);
 
 ```
 
@@ -113,8 +114,8 @@ db.write(trade_ctx, frame_data, sizeof(frame_data),
 nanots_iterator iter("video.nts", "camera_1");
 
 // Iterate through all frames. Every frame exposes `timestamp`, `flags`,
-// `secondary_key` (NANOTS_SEC_KEY_UNSET on unkeyed streams), and
-// `block_sequence`.
+// `secondary_key` (NANOTS_SEC_KEY_UNSET when the writer didn't supply
+// one), and `block_sequence`.
 while (iter.valid()) {
     auto& frame = *iter;
     process_frame(frame.data, frame.size,
@@ -122,16 +123,19 @@ while (iter.valid()) {
     ++iter;
 }
 
-// Seek by timestamp (works on any stream):
+// Seek by timestamp. find(ts) lands on the FIRST frame at that timestamp
+// (smallest secondary_key, since the default is NANOTS_SEC_KEY_UNSET =
+// INT64_MIN, which is the smallest possible value).
 if (iter.find(target_timestamp)) {
     auto& frame = *iter;
     // ... process frame
 }
 
-// Or — on keyed streams — seek by the secondary key:
-if (iter.has_secondary_key() && iter.find_by_secondary_key(target_sequence)) {
+// Seek to an exact composite (timestamp + tiebreaker):
+if (iter.find(target_timestamp, target_sequence)) {
     auto& frame = *iter;
-    // frame.secondary_key >= target_sequence
+    // frame.timestamp == target_timestamp && frame.secondary_key == target_sequence
+    // (or the next-greater composite, if there's no exact match)
 }
 ```
 
@@ -212,7 +216,7 @@ Existing preallocated files are unaffected and continue to open as before.
 - Trade tick data with microsecond precision
 - Market data replay systems
 - Low-latency historical queries
-- Seek by exchange-supplied trade/sequence ID via the [secondary key](#secondary-key), independent of timestamp
+- Handle non-unique origin timestamps cleanly via the [composite (timestamp, secondary_key) ordering](#composite-timestamp-secondary_key-ordering)
 
 ## Advanced Features
 
@@ -226,51 +230,61 @@ nanots_writer db("data.nts");
 // Database is automatically validated and ready to use
 ```
 
-### Secondary Key
+### Composite (timestamp, secondary_key) Ordering
 
-Each stream can optionally store an `int64` *secondary key* alongside the
-timestamp on every frame. Typical use cases: an external monotonic sequence
-number, an exchange-supplied trade ID, or any second ordering you'd like to
-seek by without redundantly encoding it in the timestamp.
+Frames are ordered by the **composite** `(timestamp, secondary_key)` —
+that pair must be strictly greater than the previous frame's composite.
+This collapses both "timestamp strictly monotonic" (the classic case) and
+"timestamp non-unique with a tiebreaker" (origin-timestamped feeds) into
+one rule:
 
-**Stream-level choice (locked on first write).** The first write to a stream
-tag fixes that stream as either *keyed* or *unkeyed*. Mixing yields
-`NANOTS_EC_SECONDARY_KEY_MISMATCH`:
+- If the new `timestamp` is greater than the previous one, the
+  `secondary_key` can be anything.
+- If the new `timestamp` *equals* the previous one, the `secondary_key`
+  must strictly increase.
+- Smaller `timestamp` is rejected with `NANOTS_EC_NON_MONOTONIC_TIMESTAMP`.
+
+`secondary_key` defaults to `NANOTS_SEC_KEY_UNSET` (= `INT64_MIN`, the
+smallest possible `int64`). Streams that always default get the classic
+strict-timestamp-monotonic behavior at no extra cost.
 
 ```cpp
 auto wctx = db.create_write_context("trades", "BTC-USD");
 
-// First write picks the mode: this one's keyed.
-db.write(wctx, data, len, /*flags=*/0, ts1, /*sec_key=*/100);
+// Multiple frames at the same origin timestamp, disambiguated by an
+// exchange-supplied sequence number.
+db.write(wctx, data, len, /*flags=*/0, 1000, /*seq=*/1);
+db.write(wctx, data, len, 0, 1000, /*seq=*/2);
+db.write(wctx, data, len, 0, 1000, /*seq=*/3);
 
-// OK — same mode, strictly-greater key.
-db.write(wctx, data, len, 0, ts2, /*sec_key=*/101);
+// Timestamp moves forward — seq can reset (it just has to keep the
+// composite strictly increasing, which it does because ts increased).
+db.write(wctx, data, len, 0, 2000, /*seq=*/1);
 
-// Throws NANOTS_EC_SECONDARY_KEY_MISMATCH — stream is keyed.
-db.write(wctx, data, len, 0, ts3);  // omitted sec_key defaults to UNSET
-
-// Throws NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY — key must strictly increase.
-db.write(wctx, data, len, 0, ts4, /*sec_key=*/50);
+// Rejected: composite (2000, 1) is not > (2000, 1).
+db.write(wctx, data, len, 0, 2000, /*seq=*/1);
 ```
 
-For an *unkeyed* stream, just omit the `secondary_key` argument — it defaults
-to `NANOTS_SEC_KEY_UNSET` (which is `INT64_MIN`). Passing any other value —
-including `0` — counts as a real secondary key and will lock the stream as
-keyed.
-
-**Reading.** Iterators on keyed streams can binary-search by secondary key:
+**Reading.** `find(ts)` lands on the first frame at that timestamp;
+`find(ts, sk)` lands on the exact composite (or the next greater one):
 
 ```cpp
 nanots_iterator iter("data.nts", "trades");
-if (iter.has_secondary_key()) {
-    iter.find_by_secondary_key(target_sequence_number);
-    while (iter.valid()) {
-        auto& frame = *iter;
-        // frame.secondary_key is the value the writer passed
-        ++iter;
-    }
-}
+
+// First frame at timestamp 1000 (any seq).
+iter.find(1000);
+
+// Exact composite — the second tick at ts=1000, seq=2.
+iter.find(1000, 2);
+
+// Between composites — lands on the next-greater. Here (1000, 3.5)
+// rounds up to whatever follows seq=3 lexicographically.
+iter.find(1000, 4);
 ```
+
+Typical use cases: financial origin timestamps + exchange sequence ID;
+sensor readings + per-source sequence counter; any feed where the natural
+timestamp isn't unique but a stable tiebreaker is.
 
 ### Multiple Streams
 

@@ -49,8 +49,6 @@ const (
 	ErrNotFound                   ErrorCode = C.NANOTS_EC_NOT_FOUND
 	ErrBadMagic                   ErrorCode = C.NANOTS_EC_BAD_MAGIC
 	ErrBadVersion                 ErrorCode = C.NANOTS_EC_BAD_VERSION
-	ErrSecondaryKeyMismatch       ErrorCode = C.NANOTS_EC_SECONDARY_KEY_MISMATCH
-	ErrNonMonotonicSecondaryKey   ErrorCode = C.NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY
 )
 
 // SecKeyUnset is the sentinel for "this frame has no secondary key". Mirrors
@@ -102,10 +100,6 @@ func newError(code ErrorCode) error {
 		msg = "not a nanots v2 file (bad magic)"
 	case ErrBadVersion:
 		msg = "unsupported nanots format version"
-	case ErrSecondaryKeyMismatch:
-		msg = "stream secondary-key mode mismatch"
-	case ErrNonMonotonicSecondaryKey:
-		msg = "secondary key must be monotonic"
 	default:
 		msg = "unknown error"
 	}
@@ -213,18 +207,21 @@ func (wc *WriteContext) Close() error {
 	return nil
 }
 
-// Write writes data to an *unkeyed* stream. Equivalent to
-// WriteWithSecondaryKey with secondaryKey = SecKeyUnset. For keyed streams
-// use WriteWithSecondaryKey instead.
+// Write writes a frame with no secondary key. Equivalent to
+// WriteWithSecondaryKey with secondaryKey = SecKeyUnset. Composite ordering
+// degenerates to "timestamp strictly increasing" for streams that always
+// call Write.
 func (w *Writer) Write(ctx *WriteContext, data []byte, flags uint32,
 	timestamp int64) error {
 	return w.WriteWithSecondaryKey(ctx, data, flags, timestamp, SecKeyUnset)
 }
 
-// WriteWithSecondaryKey writes data to the database, including an explicit
-// secondary key. Pass any int64 except math.MinInt64 (= SecKeyUnset) to
-// write into a keyed stream. The first write to a stream tag fixes the
-// stream as keyed or unkeyed; mixing returns ErrSecondaryKeyMismatch.
+// WriteWithSecondaryKey writes a frame with an explicit secondary key.
+//
+// Frames are ordered by the composite (timestamp, secondaryKey), which must
+// strictly increase across writes. Pass any int64 except math.MinInt64 (=
+// SecKeyUnset) to disambiguate frames at the same timestamp. Violating the
+// composite ordering returns ErrNonMonotonicTimestamp.
 func (w *Writer) WriteWithSecondaryKey(ctx *WriteContext, data []byte,
 	flags uint32, timestamp int64, secondaryKey int64) error {
 	w.mu.Lock()
@@ -547,8 +544,10 @@ func (it *Iterator) Prev() error {
 	return newError(ErrorCode(ec))
 }
 
-// Find seeks to the first frame with timestamp >= the specified timestamp
-func (it *Iterator) Find(timestamp int64) error {
+// Find seeks to the first frame whose composite (timestamp, secondaryKey)
+// is >= the requested composite. Pass SecKeyUnset for secondaryKey to land
+// on the first frame at the requested timestamp regardless of sec_key.
+func (it *Iterator) Find(timestamp int64, secondaryKey int64) error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
@@ -556,34 +555,9 @@ func (it *Iterator) Find(timestamp int64) error {
 		return errors.New("iterator is closed")
 	}
 
-	ec := C.nanots_iterator_find(it.handle, C.int64_t(timestamp))
+	ec := C.nanots_iterator_find(it.handle, C.int64_t(timestamp),
+		C.int64_t(secondaryKey))
 	return newError(ErrorCode(ec))
-}
-
-// FindBySecondaryKey seeks to the first frame whose secondary key is >=
-// the specified value. Only valid on streams that store a secondary key.
-func (it *Iterator) FindBySecondaryKey(secondaryKey int64) error {
-	it.mu.Lock()
-	defer it.mu.Unlock()
-
-	if it.handle == nil {
-		return errors.New("iterator is closed")
-	}
-
-	ec := C.nanots_iterator_find_by_secondary_key(it.handle, C.int64_t(secondaryKey))
-	return newError(ErrorCode(ec))
-}
-
-// HasSecondaryKey reports whether this stream stores a secondary key on
-// every frame.
-func (it *Iterator) HasSecondaryKey() bool {
-	it.mu.Lock()
-	defer it.mu.Unlock()
-
-	if it.handle == nil {
-		return false
-	}
-	return C.nanots_iterator_has_secondary_key(it.handle) != 0
 }
 
 // Reset moves the iterator to the first frame

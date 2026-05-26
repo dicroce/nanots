@@ -36,8 +36,6 @@ cdef extern from "nanots.h":
         NANOTS_EC_NOT_FOUND = 13
         NANOTS_EC_BAD_MAGIC = 14
         NANOTS_EC_BAD_VERSION = 15
-        NANOTS_EC_SECONDARY_KEY_MISMATCH = 16
-        NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY = 17
 
     ctypedef struct nanots_contiguous_segment_t:
         int segment_id
@@ -119,10 +117,8 @@ cdef extern from "nanots.h":
     nanots_ec_t nanots_iterator_next(nanots_iterator_t iterator)
     nanots_ec_t nanots_iterator_prev(nanots_iterator_t iterator)
     nanots_ec_t nanots_iterator_find(nanots_iterator_t iterator,
-                                     int64_t timestamp)
-    nanots_ec_t nanots_iterator_find_by_secondary_key(nanots_iterator_t iterator,
-                                                     int64_t secondary_key)
-    int nanots_iterator_has_secondary_key(nanots_iterator_t iterator)
+                                     int64_t timestamp,
+                                     int64_t secondary_key)
     nanots_ec_t nanots_iterator_reset(nanots_iterator_t iterator)
     int64_t nanots_iterator_current_block_sequence(nanots_iterator_t iterator)
     const char* nanots_iterator_current_metadata(nanots_iterator_t iterator)
@@ -177,12 +173,6 @@ class BadMagicError(NanoTSError):
 class BadVersionError(NanoTSError):
     pass
 
-class SecondaryKeyMismatchError(NanoTSError):
-    pass
-
-class NonMonotonicSecondaryKeyError(NanoTSError):
-    pass
-
 # Helper function to check results and raise appropriate exceptions
 cdef void _check_result(nanots_ec_t result):
     if result == NANOTS_EC_OK:
@@ -215,10 +205,6 @@ cdef void _check_result(nanots_ec_t result):
         raise BadMagicError("Not a nanots v2 file (bad magic)")
     elif result == NANOTS_EC_BAD_VERSION:
         raise BadVersionError("Unsupported nanots format version")
-    elif result == NANOTS_EC_SECONDARY_KEY_MISMATCH:
-        raise SecondaryKeyMismatchError("Stream secondary-key mode mismatch")
-    elif result == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY:
-        raise NonMonotonicSecondaryKeyError("Secondary key must be monotonic")
     else:
         raise NanoTSError(f"Unknown error: {result}")
 
@@ -294,11 +280,13 @@ cdef class Writer:
               int64_t secondary_key=SEC_KEY_UNSET):
         """Write data to the database.
 
-        Pass ``secondary_key`` to write into a stream that uses a secondary
-        key (the choice is fixed by the first write to that stream tag).
-        Default ``SEC_KEY_UNSET`` writes into an unkeyed stream. Any other
-        value — including 0 — counts as a real key and locks the stream as
-        keyed.
+        Frames are ordered by the composite ``(timestamp, secondary_key)``,
+        which must strictly increase across writes. Default
+        ``secondary_key=SEC_KEY_UNSET`` (= INT64_MIN) makes the composite
+        check degenerate to "timestamp strictly increasing", so callers who
+        don't need a tiebreaker don't have to think about it. Pass any
+        other ``int64`` to disambiguate frames at the same timestamp — the
+        ``int64`` sequence per timestamp must strictly increase.
         """
         cdef nanots_ec_t result = nanots_writer_write(
             self._writer, context._context, data, len(data),
@@ -459,24 +447,18 @@ cdef class Iterator:
         cdef nanots_ec_t result = nanots_iterator_prev(self._iterator)
         _check_result(result)
     
-    def find(self, int64_t timestamp):
-        """Find frame at or after given timestamp."""
-        cdef nanots_ec_t result = nanots_iterator_find(self._iterator, timestamp)
-        _check_result(result)
+    def find(self, int64_t timestamp,
+             int64_t secondary_key=SEC_KEY_UNSET):
+        """Find the first frame whose composite (timestamp, secondary_key)
+        is >= the requested composite.
 
-    def find_by_secondary_key(self, int64_t secondary_key):
-        """Find first frame at or after the given secondary key.
-
-        Only valid on streams that store a secondary key. Returns False if
-        no such frame exists (and invalidates the iterator).
+        Pass ``secondary_key`` to seek to a specific tiebroken position
+        within a timestamp; omit it (defaults to ``SEC_KEY_UNSET``) to land
+        on the first frame at the requested timestamp regardless of sec_key.
         """
-        cdef nanots_ec_t result = nanots_iterator_find_by_secondary_key(
-            self._iterator, secondary_key)
-        return result == NANOTS_EC_OK
-
-    def has_secondary_key(self):
-        """True if this stream stores a secondary key on every frame."""
-        return nanots_iterator_has_secondary_key(self._iterator) != 0
+        cdef nanots_ec_t result = nanots_iterator_find(
+            self._iterator, timestamp, secondary_key)
+        _check_result(result)
     
     def reset(self):
         """Reset iterator to beginning."""

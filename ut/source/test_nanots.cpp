@@ -2198,7 +2198,6 @@ void test_nanots::test_nanots_secondary_key_basic() {
 
   // Iterator round-trip.
   nanots_iterator iter("nanots_test_4mb.nts", "sk_stream");
-  RTF_ASSERT(iter.has_secondary_key());
   int i = 0;
   while (iter.valid()) {
     RTF_ASSERT(iter->timestamp == 1000 + i * 100);
@@ -2222,12 +2221,13 @@ void test_nanots::test_nanots_secondary_key_basic() {
   RTF_ASSERT(j == 10);
 }
 
-// Verify find_by_secondary_key works the same way find(timestamp) does:
-// exact match, between-keys lands on next-higher, before-first lands on
-// first, after-last invalidates.
+// Composite find() with both args: exact composite match, between-key lands
+// on next-higher composite, etc.
 void test_nanots::test_nanots_secondary_key_find() {
   nanots_writer db("nanots_test_4mb.nts", false);
 
+  // Write 10 frames with strictly-increasing timestamps and sec_keys.
+  // Composite is just lex on (ts, sk).
   {
     auto wctx = db.create_write_context("sk_find", "");
     for (int i = 0; i < 10; i++) {
@@ -2238,117 +2238,81 @@ void test_nanots::test_nanots_secondary_key_find() {
   }
 
   nanots_iterator iter("nanots_test_4mb.nts", "sk_find");
-  RTF_ASSERT(iter.has_secondary_key());
 
-  // Exact match.
-  RTF_ASSERT(iter.find_by_secondary_key(2000));
+  // Exact composite match: (1200, 2000) is frame 2.
+  RTF_ASSERT(iter.find(1200, 2000));
+  RTF_ASSERT(iter->timestamp == 1200);
   RTF_ASSERT(iter->secondary_key == 2000);
 
-  // Between keys → next higher.
-  RTF_ASSERT(iter.find_by_secondary_key(2250));
+  // Between composites: (1200, 2001) → next composite (1300, 2500).
+  RTF_ASSERT(iter.find(1200, 2001));
+  RTF_ASSERT(iter->timestamp == 1300);
   RTF_ASSERT(iter->secondary_key == 2500);
 
-  // Before first.
-  RTF_ASSERT(iter.find_by_secondary_key(0));
+  // Before first composite.
+  RTF_ASSERT(iter.find(0, NANOTS_SEC_KEY_UNSET));
+  RTF_ASSERT(iter->timestamp == 1000);
   RTF_ASSERT(iter->secondary_key == 1000);
 
-  // Past last.
-  RTF_ASSERT(!iter.find_by_secondary_key(100000));
+  // Past last composite.
+  RTF_ASSERT(!iter.find(99999, 99999));
   RTF_ASSERT(!iter.valid());
+
+  // Find with default sec_key (= UNSET): lands on first frame at the given
+  // timestamp (smallest sec_key wins).
+  RTF_ASSERT(iter.find(1500));  // = find(1500, NANOTS_SEC_KEY_UNSET)
+  RTF_ASSERT(iter->timestamp == 1500);
 }
 
-// Mixing keyed and unkeyed writes on the same stream is rejected.
-void test_nanots::test_nanots_secondary_key_mismatch() {
-  nanots_writer db("nanots_test_4mb.nts", false);
-
-  // Case 1: stream is locked as "keyed" on first write; later unkeyed write
-  // throws.
-  {
-    auto wctx = db.create_write_context("sk_mismatch_a", "");
-    db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/42);
-
-    bool threw = false;
-    nanots_ec_t ec = NANOTS_EC_OK;
-    try {
-      db.write(wctx, (uint8_t*)"b", 1, 0, 1100);
-    } catch (const nanots_exception& e) {
-      threw = true;
-      ec = e.get_ec();
-    }
-    RTF_ASSERT(threw);
-    RTF_ASSERT(ec == NANOTS_EC_SECONDARY_KEY_MISMATCH);
-  }
-
-  // Case 2: stream locked as "unkeyed"; later keyed write throws.
-  {
-    auto wctx = db.create_write_context("sk_mismatch_b", "");
-    db.write(wctx, (uint8_t*)"a", 1, 0, 1000);
-
-    bool threw = false;
-    nanots_ec_t ec = NANOTS_EC_OK;
-    try {
-      db.write(wctx, (uint8_t*)"b", 1, 0, 1100, /*sec_key=*/99);
-    } catch (const nanots_exception& e) {
-      threw = true;
-      ec = e.get_ec();
-    }
-    RTF_ASSERT(threw);
-    RTF_ASSERT(ec == NANOTS_EC_SECONDARY_KEY_MISMATCH);
-  }
-
-  // Case 3: a new write_context on a previously-keyed stream must continue
-  // to be keyed; passing UNSET in the first write of the new context throws.
-  {
-    {
-      auto wctx = db.create_write_context("sk_mismatch_c", "");
-      db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/1);
-    }
-    auto wctx2 = db.create_write_context("sk_mismatch_c", "");
-    bool threw = false;
-    try {
-      db.write(wctx2, (uint8_t*)"b", 1, 0, 2000);
-    } catch (const nanots_exception& e) {
-      threw = true;
-      RTF_ASSERT(e.get_ec() == NANOTS_EC_SECONDARY_KEY_MISMATCH);
-    }
-    RTF_ASSERT(threw);
-  }
-}
-
-// Secondary key must be monotonic within a write context, same rule as
-// timestamps.
+// Composite monotonicity: (ts, sk) must strictly increase across writes.
+// Ties on ts are fine if sk strictly increases; ts may jump as long as the
+// composite still moves forward.
 void test_nanots::test_nanots_secondary_key_monotonic() {
   nanots_writer db("nanots_test_4mb.nts", false);
   auto wctx = db.create_write_context("sk_mono", "");
 
   db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sec_key=*/100);
-  db.write(wctx, (uint8_t*)"b", 1, 0, 2000, /*sec_key=*/200);
+  // Same ts, greater sk: allowed.
+  db.write(wctx, (uint8_t*)"b", 1, 0, 1000, /*sec_key=*/200);
+  // Greater ts, smaller sk: allowed (ts wins in lex order).
+  db.write(wctx, (uint8_t*)"c", 1, 0, 2000, /*sec_key=*/50);
 
+  // Smaller ts: rejected.
   bool threw = false;
   nanots_ec_t ec = NANOTS_EC_OK;
   try {
-    // Lower sec_key than previous; must throw even though ts is higher.
-    db.write(wctx, (uint8_t*)"c", 1, 0, 3000, /*sec_key=*/150);
+    db.write(wctx, (uint8_t*)"d", 1, 0, 1500, /*sec_key=*/999);
   } catch (const nanots_exception& e) {
     threw = true;
     ec = e.get_ec();
   }
   RTF_ASSERT(threw);
-  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY);
+  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_TIMESTAMP);
 
-  // Equal sec_key also rejected (strict monotonic).
+  // Same composite (ts, sk) — rejected (strict).
   threw = false;
   try {
-    db.write(wctx, (uint8_t*)"d", 1, 0, 3000, /*sec_key=*/200);
+    db.write(wctx, (uint8_t*)"e", 1, 0, 2000, /*sec_key=*/50);
   } catch (const nanots_exception& e) {
     threw = true;
     ec = e.get_ec();
   }
   RTF_ASSERT(threw);
-  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_SECONDARY_KEY);
+  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_TIMESTAMP);
 
-  // Strictly greater sec_key succeeds.
-  db.write(wctx, (uint8_t*)"e", 1, 0, 3000, /*sec_key=*/300);
+  // Same ts, equal sk — rejected (strict on the composite).
+  threw = false;
+  try {
+    db.write(wctx, (uint8_t*)"f", 1, 0, 2000, /*sec_key=*/50);
+  } catch (const nanots_exception& e) {
+    threw = true;
+    ec = e.get_ec();
+  }
+  RTF_ASSERT(threw);
+  RTF_ASSERT(ec == NANOTS_EC_NON_MONOTONIC_TIMESTAMP);
+
+  // Same ts, larger sk — OK.
+  db.write(wctx, (uint8_t*)"g", 1, 0, 2000, /*sec_key=*/51);
 }
 
 // A file with no v2 magic at offset 0 must be rejected on open. We synthesise
@@ -2404,8 +2368,8 @@ void test_nanots::test_nanots_v1_file_rejected() {
 }
 
 // Force many frames so the stream spans multiple blocks, then exercise
-// find_by_secondary_key across block boundaries (the SQL-backed _ts_index
-// lookup) and verify ++/-- around the boundary.
+// composite find() across block boundaries and verify ++/-- around the
+// boundary.
 void test_nanots::test_nanots_secondary_key_cross_blocks() {
   // 4 KB blocks → ~3 frames per block at 1 KB rows; 64 frames = ~22 blocks.
   nanots_writer db("nanots_test_2048_4k_blocks.nts", false);
@@ -2415,8 +2379,7 @@ void test_nanots::test_nanots_secondary_key_cross_blocks() {
     auto wctx = db.create_write_context("sk_cross", "");
     std::vector<uint8_t> row(1024, 0xCC);
     for (int i = 0; i < N; i++) {
-      // Distinctive: timestamp and sec_key advance at *different* rates so
-      // the two indexes can't accidentally substitute for each other.
+      // Distinctive: timestamp and sec_key advance at *different* rates.
       db.write(wctx, row.data(), row.size(), 0,
                /*ts=*/1000 + i * 10,
                /*sec_key=*/500 + i * 73);
@@ -2424,10 +2387,8 @@ void test_nanots::test_nanots_secondary_key_cross_blocks() {
   }
 
   nanots_iterator iter("nanots_test_2048_4k_blocks.nts", "sk_cross");
-  RTF_ASSERT(iter.has_secondary_key());
 
-  // Confirm we actually filled multiple blocks (otherwise this test isn't
-  // doing what it claims).
+  // Confirm we actually filled multiple blocks.
   std::set<int64_t> blocks_seen;
   iter.reset();
   while (iter.valid()) {
@@ -2437,22 +2398,24 @@ void test_nanots::test_nanots_secondary_key_cross_blocks() {
   printf("sk_cross blocks: %zu\n", blocks_seen.size());
   RTF_ASSERT(blocks_seen.size() > 1);
 
-  // Walk every frame via find_by_secondary_key and verify we land on the
-  // right one. Frame i has sec_key = 500 + i*73.
+  // Walk every frame via composite find() and verify we land on the right one.
   for (int i = 0; i < N; i++) {
-    int64_t target = 500 + i * 73;
-    RTF_ASSERT(iter.find_by_secondary_key(target));
-    RTF_ASSERT(iter->secondary_key == target);
-    RTF_ASSERT(iter->timestamp == 1000 + i * 10);
+    int64_t ts = 1000 + i * 10;
+    int64_t sk = 500 + i * 73;
+    RTF_ASSERT(iter.find(ts, sk));
+    RTF_ASSERT(iter->secondary_key == sk);
+    RTF_ASSERT(iter->timestamp == ts);
   }
 
-  // Find between two keys → next higher.
-  RTF_ASSERT(iter.find_by_secondary_key(500 + 5 * 73 + 1));
-  RTF_ASSERT(iter->secondary_key == 500 + 6 * 73);
+  // Find between two composites → next higher composite. Frame 5 is
+  // (1050, 865); frame 6 is (1060, 938). (1050, 866) is between them in
+  // lex order.
+  RTF_ASSERT(iter.find(1050, 866));
+  RTF_ASSERT(iter->timestamp == 1060);
+  RTF_ASSERT(iter->secondary_key == 938);
 }
 
-// After a find_by_secondary_key, ++ and -- must walk by physical order
-// (which for monotonic streams is the same as sec-key order).
+// After a composite find(), ++ and -- must walk by physical order.
 void test_nanots::test_nanots_secondary_key_bidirectional() {
   nanots_writer db("nanots_test_4mb.nts", false);
 
@@ -2468,9 +2431,10 @@ void test_nanots::test_nanots_secondary_key_bidirectional() {
 
   nanots_iterator iter("nanots_test_4mb.nts", "sk_bidi");
 
-  // Land in the middle by sec key.
-  RTF_ASSERT(iter.find_by_secondary_key(100 + 10 * 11));
+  // Land in the middle by composite.
+  RTF_ASSERT(iter.find(1010, 100 + 10 * 11));
   RTF_ASSERT(iter->secondary_key == 100 + 10 * 11);
+  RTF_ASSERT(iter->timestamp == 1010);
 
   // Walk forward.
   for (int i = 11; i < N; i++) {
@@ -2482,7 +2446,7 @@ void test_nanots::test_nanots_secondary_key_bidirectional() {
   RTF_ASSERT(!iter.valid());
 
   // Reseek and walk backward.
-  RTF_ASSERT(iter.find_by_secondary_key(100 + 5 * 11));
+  RTF_ASSERT(iter.find(1005, 100 + 5 * 11));
   for (int i = 4; i >= 0; i--) {
     --iter;
     RTF_ASSERT(iter.valid());
@@ -2492,9 +2456,8 @@ void test_nanots::test_nanots_secondary_key_bidirectional() {
   RTF_ASSERT(!iter.valid());
 }
 
-// Multiple write contexts (= multiple segments) on the same stream. All must
-// be keyed (locked by the first segment), and find/iterate must cross
-// segment boundaries cleanly.
+// Multiple write contexts (= multiple segments) on the same stream. find()
+// and iteration must cross segment boundaries cleanly.
 void test_nanots::test_nanots_secondary_key_multi_segment() {
   nanots_writer db("nanots_test_4mb.nts", false);
 
@@ -2507,7 +2470,6 @@ void test_nanots::test_nanots_secondary_key_multi_segment() {
                1000 + i, /*sec_key=*/100 + i);
     }
   }
-  // Segment 2 (must remain keyed).
   {
     auto wctx = db.create_write_context("sk_segs", "s2");
     for (int i = 0; i < 5; i++) {
@@ -2516,7 +2478,6 @@ void test_nanots::test_nanots_secondary_key_multi_segment() {
                2000 + i, /*sec_key=*/200 + i);
     }
   }
-  // Segment 3.
   {
     auto wctx = db.create_write_context("sk_segs", "s3");
     for (int i = 0; i < 5; i++) {
@@ -2527,70 +2488,40 @@ void test_nanots::test_nanots_secondary_key_multi_segment() {
   }
 
   nanots_iterator iter("nanots_test_4mb.nts", "sk_segs");
-  RTF_ASSERT(iter.has_secondary_key());
 
   // Find in segment 1.
-  RTF_ASSERT(iter.find_by_secondary_key(102));
+  RTF_ASSERT(iter.find(1002, 102));
   RTF_ASSERT(iter->secondary_key == 102);
   RTF_ASSERT(iter.current_metadata() == "s1");
 
   // Find in segment 2.
-  RTF_ASSERT(iter.find_by_secondary_key(201));
+  RTF_ASSERT(iter.find(2001, 201));
   RTF_ASSERT(iter->secondary_key == 201);
   RTF_ASSERT(iter.current_metadata() == "s2");
 
   // Find in segment 3.
-  RTF_ASSERT(iter.find_by_secondary_key(304));
+  RTF_ASSERT(iter.find(3004, 304));
   RTF_ASSERT(iter->secondary_key == 304);
   RTF_ASSERT(iter.current_metadata() == "s3");
 
-  // Find between segments — should land on first frame of next segment.
-  RTF_ASSERT(iter.find_by_secondary_key(150));
+  // Find between segments — composite (1500, 0) lands on first frame of
+  // segment 2 (the first composite >= (1500, 0)).
+  RTF_ASSERT(iter.find(1500, 0));
   RTF_ASSERT(iter->secondary_key == 200);
   RTF_ASSERT(iter.current_metadata() == "s2");
 
-  // Walk all 15 frames in order by repeatedly stepping forward from the
-  // very first key.
-  RTF_ASSERT(iter.find_by_secondary_key(0));
+  // Walk all 15 frames in composite order from before-the-first.
+  RTF_ASSERT(iter.find(0));
   int seen = 0;
-  int64_t last_sk = -1;
   while (iter.valid()) {
-    RTF_ASSERT(iter->secondary_key > last_sk);
-    last_sk = iter->secondary_key;
     seen++;
     ++iter;
   }
   RTF_ASSERT(seen == 15);
 }
 
-// On an unkeyed stream, find_by_secondary_key must fail cleanly.
-void test_nanots::test_nanots_secondary_key_unkeyed_stream_rejects_find() {
-  nanots_writer db("nanots_test_4mb.nts", false);
-  {
-    auto wctx = db.create_write_context("plain", "");
-    for (int i = 0; i < 5; i++) {
-      db.write(wctx, (uint8_t*)"x", 1, 0, 1000 + i);
-    }
-  }
-
-  nanots_iterator iter("nanots_test_4mb.nts", "plain");
-  RTF_ASSERT(!iter.has_secondary_key());
-
-  // The iterator is valid (pointing at the first frame).
-  RTF_ASSERT(iter.valid());
-
-  // find_by_secondary_key returns false and invalidates the iterator.
-  RTF_ASSERT(!iter.find_by_secondary_key(123));
-  RTF_ASSERT(!iter.valid());
-
-  // Iterator can be recovered with reset().
-  iter.reset();
-  RTF_ASSERT(iter.valid());
-  RTF_ASSERT(iter->secondary_key == NANOTS_SEC_KEY_UNSET);
-}
-
-// Two streams in the same file: one keyed, one unkeyed. They must not
-// interfere with each other.
+// Two streams in the same file: one keyed, one unkeyed (always passes UNSET
+// for sec_key, so composite degenerates to ts-monotonic).
 void test_nanots::test_nanots_secondary_key_mixed_streams_same_file() {
   nanots_writer db("nanots_test_4mb.nts", false);
   {
@@ -2602,34 +2533,30 @@ void test_nanots::test_nanots_secondary_key_mixed_streams_same_file() {
     }
   }
 
-  // Keyed stream: has_secondary_key true, find_by_secondary_key works.
+  // Keyed stream: composite find works.
   {
     nanots_iterator it("nanots_test_4mb.nts", "keyed");
-    RTF_ASSERT(it.has_secondary_key());
-    RTF_ASSERT(it.find_by_secondary_key(12));
+    RTF_ASSERT(it.find(1002, 12));
     RTF_ASSERT(it->secondary_key == 12);
     RTF_ASSERT(it->timestamp == 1002);
   }
 
-  // Unkeyed stream: has_secondary_key false, find_by_secondary_key fails.
+  // Unkeyed stream: every frame's sec_key reads as UNSET; find by ts works
+  // normally (sec_key defaults to UNSET so composite = (ts, UNSET)).
   {
     nanots_iterator it("nanots_test_4mb.nts", "unkeyed");
-    RTF_ASSERT(!it.has_secondary_key());
     RTF_ASSERT(it.valid());
     RTF_ASSERT(it->secondary_key == NANOTS_SEC_KEY_UNSET);
-    RTF_ASSERT(!it.find_by_secondary_key(0));
-    // Normal timestamp seeking on the unkeyed stream still works.
-    it.reset();
     RTF_ASSERT(it.find(2003));
     RTF_ASSERT(it->timestamp == 2003);
+    RTF_ASSERT(it->secondary_key == NANOTS_SEC_KEY_UNSET);
   }
 }
 
-// Sparse keys: huge gaps must still binary-search correctly.
+// Sparse composites: huge gaps must still binary-search correctly.
 void test_nanots::test_nanots_secondary_key_sparse() {
   nanots_writer db("nanots_test_4mb.nts", false);
 
-  // Keys span 0 .. 10^15 in geometric-ish steps.
   std::vector<int64_t> keys = {
       1, 100, 10000, 1000000, 100000000, 10000000000LL,
       1000000000000LL, 100000000000000LL, 1000000000000000LL,
@@ -2644,40 +2571,44 @@ void test_nanots::test_nanots_secondary_key_sparse() {
   }
 
   nanots_iterator iter("nanots_test_4mb.nts", "sk_sparse");
-  RTF_ASSERT(iter.has_secondary_key());
 
-  // Exact matches.
+  // Exact composite matches.
   for (size_t i = 0; i < keys.size(); i++) {
-    RTF_ASSERT(iter.find_by_secondary_key(keys[i]));
+    int64_t ts = 1000 + (int64_t)i;
+    RTF_ASSERT(iter.find(ts, keys[i]));
     RTF_ASSERT(iter->secondary_key == keys[i]);
+    RTF_ASSERT(iter->timestamp == ts);
   }
 
-  // Between-key seeks land on next higher.
-  RTF_ASSERT(iter.find_by_secondary_key(50));
+  // Between-composite seeks: (ts=1000, sk=50) is between frame 0 (1000,1)
+  // and frame 1 (1001,100). Next higher composite is frame 1.
+  RTF_ASSERT(iter.find(1000, 50));
   RTF_ASSERT(iter->secondary_key == 100);
-  RTF_ASSERT(iter.find_by_secondary_key(99999));
-  RTF_ASSERT(iter->secondary_key == 1000000);
-  RTF_ASSERT(iter.find_by_secondary_key(999999999999LL));
-  RTF_ASSERT(iter->secondary_key == 1000000000000LL);
 
-  // Below the smallest → first.
-  RTF_ASSERT(iter.find_by_secondary_key(0));
+  // (ts=1003, sk=999999): frame 3 is (1003, 1000000), so lower_bound is
+  // frame 3.
+  RTF_ASSERT(iter.find(1003, 999999));
+  RTF_ASSERT(iter->secondary_key == 1000000);
+
+  // Below the smallest composite → first frame.
+  RTF_ASSERT(iter.find(0));
   RTF_ASSERT(iter->secondary_key == 1);
 
-  // Above the largest → invalid.
-  RTF_ASSERT(!iter.find_by_secondary_key(9999999999999999LL));
+  // Above the largest composite → invalid.
+  RTF_ASSERT(!iter.find(99999, 9999999999999999LL));
   RTF_ASSERT(!iter.valid());
 }
 
 // Secondary keys are int64, signed. Negative keys and values close to
 // INT64_MAX must work. INT64_MIN is reserved as the "unset" sentinel and is
-// implicitly off-limits for keyed streams.
+// off-limits as a real key.
 void test_nanots::test_nanots_secondary_key_extreme_values() {
   nanots_writer db("nanots_test_4mb.nts", false);
 
-  // Strictly increasing sequence of "interesting" int64 values.
+  // Each frame gets a unique timestamp AND a wildly-varying sec_key. The
+  // composite is strictly increasing because ts is.
   std::vector<int64_t> keys = {
-      INT64_MIN + 1,        // smallest legal key (INT64_MIN is the sentinel)
+      INT64_MIN + 1,        // smallest legal sec_key
       -1000000000000LL,
       -1,
       0,
@@ -2696,29 +2627,27 @@ void test_nanots::test_nanots_secondary_key_extreme_values() {
   }
 
   nanots_iterator iter("nanots_test_4mb.nts", "sk_extreme");
-  RTF_ASSERT(iter.has_secondary_key());
 
-  // Round-trip each value.
+  // Round-trip each composite.
   for (size_t i = 0; i < keys.size(); i++) {
-    RTF_ASSERT(iter.find_by_secondary_key(keys[i]));
+    int64_t ts = 1000 + (int64_t)i;
+    RTF_ASSERT(iter.find(ts, keys[i]));
     RTF_ASSERT(iter->secondary_key == keys[i]);
+    RTF_ASSERT(iter->timestamp == ts);
   }
 
-  // Boundary: searching for INT64_MIN (= sentinel) on a keyed stream should
-  // land on the smallest real key (INT64_MIN + 1).
-  RTF_ASSERT(iter.find_by_secondary_key(INT64_MIN));
+  // find(ts) with no sec_key argument defaults to UNSET (= INT64_MIN). For
+  // frame 0 at ts=1000, the composite is (1000, INT64_MIN+1); lower_bound
+  // for (1000, INT64_MIN) finds frame 0.
+  RTF_ASSERT(iter.find(1000));
   RTF_ASSERT(iter->secondary_key == INT64_MIN + 1);
 
-  // Going below INT64_MIN + 1 lands on the first real key (already the
-  // smallest, but exercise the lower-bound path).
-  RTF_ASSERT(iter.find_by_secondary_key(INT64_MIN + 1));
-  RTF_ASSERT(iter->secondary_key == INT64_MIN + 1);
-  // Step backwards from there → invalid.
+  // Backward from first frame → invalid.
   --iter;
   RTF_ASSERT(!iter.valid());
 
-  // Step forward from INT64_MAX (the last frame) → invalid.
-  RTF_ASSERT(iter.find_by_secondary_key(INT64_MAX));
+  // Forward from last frame → invalid.
+  RTF_ASSERT(iter.find(1007, INT64_MAX));
   ++iter;
   RTF_ASSERT(!iter.valid());
 }
@@ -2765,4 +2694,96 @@ void test_nanots::test_nanots_secondary_key_reader_callback() {
   for (auto sk : seen_unkeyed) {
     RTF_ASSERT(sk == NANOTS_SEC_KEY_UNSET);
   }
+}
+
+// Composite semantics: timestamps may repeat as long as sec_key strictly
+// increases within the repeat. Matches the financial-data scenario where
+// the exchange-supplied timestamp isn't unique but a sequence number is.
+void test_nanots::test_nanots_composite_duplicate_timestamps() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  {
+    auto wctx = db.create_write_context("dup_ts", "");
+    // 3 frames at ts=1000 with strictly-increasing sec_keys, then a few at
+    // ts=2000 with their own monotonic sec_keys.
+    db.write(wctx, (uint8_t*)"a", 1, 0, 1000, /*sk=*/1);
+    db.write(wctx, (uint8_t*)"b", 1, 0, 1000, /*sk=*/2);
+    db.write(wctx, (uint8_t*)"c", 1, 0, 1000, /*sk=*/3);
+    db.write(wctx, (uint8_t*)"d", 1, 0, 2000, /*sk=*/10);
+    db.write(wctx, (uint8_t*)"e", 1, 0, 2000, /*sk=*/20);
+  }
+
+  // Iterate and verify all 5 frames come back in composite order.
+  nanots_iterator iter("nanots_test_4mb.nts", "dup_ts");
+  struct expected { int64_t ts; int64_t sk; char ch; };
+  std::vector<expected> want = {
+      {1000, 1, 'a'}, {1000, 2, 'b'}, {1000, 3, 'c'},
+      {2000, 10, 'd'}, {2000, 20, 'e'},
+  };
+  size_t i = 0;
+  while (iter.valid()) {
+    RTF_ASSERT(i < want.size());
+    RTF_ASSERT(iter->timestamp == want[i].ts);
+    RTF_ASSERT(iter->secondary_key == want[i].sk);
+    RTF_ASSERT(iter->size == 1);
+    RTF_ASSERT(*iter->data == (uint8_t)want[i].ch);
+    ++iter;
+    i++;
+  }
+  RTF_ASSERT(i == 5);
+
+  // Composite find lands exactly: (1000, 2) → frame 'b'.
+  RTF_ASSERT(iter.find(1000, 2));
+  RTF_ASSERT(*iter->data == 'b');
+
+  // Within a ts run, find() with default sec_key lands on the first of the
+  // run — frame 'a' for ts=1000.
+  RTF_ASSERT(iter.find(1000));
+  RTF_ASSERT(*iter->data == 'a');
+  RTF_ASSERT(iter->secondary_key == 1);
+}
+
+// find(ts) with default sec_key (=UNSET=INT64_MIN) lands on the first frame
+// at that timestamp regardless of sec_key, because UNSET is the smallest
+// possible sec_key in lex order.
+void test_nanots::test_nanots_composite_find_lands_on_first_at_ts() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  {
+    auto wctx = db.create_write_context("first_at_ts", "");
+    db.write(wctx, (uint8_t*)"x", 1, 0, 100, /*sk=*/-50);
+    db.write(wctx, (uint8_t*)"y", 1, 0, 100, /*sk=*/0);
+    db.write(wctx, (uint8_t*)"z", 1, 0, 100, /*sk=*/50);
+    db.write(wctx, (uint8_t*)"q", 1, 0, 200, /*sk=*/-100);
+  }
+
+  nanots_iterator iter("nanots_test_4mb.nts", "first_at_ts");
+
+  // find(100) lands on the first frame at ts=100 (which has the smallest
+  // sk=-50).
+  RTF_ASSERT(iter.find(100));
+  RTF_ASSERT(iter->timestamp == 100);
+  RTF_ASSERT(iter->secondary_key == -50);
+
+  // find(150) — no frame at ts=150 — lands on first frame with ts >= 150.
+  RTF_ASSERT(iter.find(150));
+  RTF_ASSERT(iter->timestamp == 200);
+  RTF_ASSERT(iter->secondary_key == -100);
+
+  // find(100, -50) is the same as find(100) here: exact match on the first
+  // frame.
+  RTF_ASSERT(iter.find(100, -50));
+  RTF_ASSERT(iter->secondary_key == -50);
+
+  // find(100, 0) lands on the middle frame.
+  RTF_ASSERT(iter.find(100, 0));
+  RTF_ASSERT(iter->secondary_key == 0);
+
+  // find(100, 1) lands on the next-greater composite — (100, 50).
+  RTF_ASSERT(iter.find(100, 1));
+  RTF_ASSERT(iter->secondary_key == 50);
+
+  // find(100, 51) skips past the ts=100 run entirely to (200, -100).
+  RTF_ASSERT(iter.find(100, 51));
+  RTF_ASSERT(iter->timestamp == 200);
+  RTF_ASSERT(iter->secondary_key == -100);
 }

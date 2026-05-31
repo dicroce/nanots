@@ -10,6 +10,9 @@ _nanots_*
 *nanots_reader*
 *nanots_iterator*
 *nanots_exception*
+*nanots_epoch_registry*
+*nanots_slot_guard*
+*nanots_op_scope*
 *write_context*
 
 # Export utility classes if needed

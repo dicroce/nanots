@@ -9,6 +9,9 @@
     *nanots_reader*;
     *nanots_iterator*;
     *nanots_exception*;
+    *nanots_epoch_registry*;
+    *nanots_slot_guard*;
+    *nanots_op_scope*;
     *nts_sqlite_conn*;
     *nts_sqlite_stmt*;
     *nts_file*;

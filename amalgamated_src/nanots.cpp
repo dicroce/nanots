@@ -1264,6 +1264,29 @@ static void _validate_blocks(const std::string& file_name) {
   }
 }
 
+static void _recover_orphaned_blocks(const nts_sqlite_conn& conn) {
+  // Startup recovery. A block is "orphaned" when it is marked 'used' or
+  // 'reserved' in the catalog but no segment_block references it. This happens
+  // when an auto-reclaim recycle is interrupted: _db_reclaim_oldest_used_block()
+  // deletes the segment_block and marks the block 'reserved' for reuse through
+  // EBR, but the in-memory limbo/ready lists that would return it to 'free' are
+  // lost on a crash or restart (and the 10s maintenance task may have since
+  // flipped it to 'used'). The block is then stranded forever: it has no
+  // segment_block, so it can never be selected for reclaim again, and it is not
+  // 'free', so it can never be handed to a writer. Eventually every block ends
+  // up stranded and writes fail with NANOTS_EC_NO_FREE_BLOCKS.
+  //
+  // The writer constructor runs before any block is handed out, so at this
+  // point any non-'free' block lacking a segment_block is genuinely orphaned
+  // and safe to reclaim. Blocks with a segment_block (finalized or the
+  // currently-open one, already validated by _validate_blocks) are preserved.
+  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    conn.exec(
+        "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE "
+        "status != 'free' AND id NOT IN (SELECT block_id FROM segment_blocks);");
+  });
+}
+
 static int _get_db_version(const nts_sqlite_conn& conn) {
   auto result = conn.exec("PRAGMA user_version;");
   if (result.empty())
@@ -1433,12 +1456,29 @@ static void _db_finalize_block(const nts_sqlite_conn& conn,
 }
 
 static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
-  // Set status to 'used' for all blocks whose status is 'reserved' and
-  // reserved_at is older than 10 seconds.
-  auto query =
+  // Promote aged 'reserved' blocks, but distinguish the two ways a block can
+  // be reserved:
+  //
+  //   1. A live writer slot — it has a segment_block row. After the grace
+  //      window it becomes 'used' (the block now holds committed data).
+  //
+  //   2. An auto-reclaim victim — _db_reclaim_oldest_used_block() deleted its
+  //      segment_block and marked it 'reserved' to recycle it through EBR. If
+  //      that recycle never completed (readers slow to advance, or the process
+  //      restarted and lost the in-memory limbo/ready lists), the block is
+  //      stranded. Blindly flipping it to 'used' would orphan it forever: it
+  //      has no segment_block, so _db_reclaim_oldest_used_block() can never see
+  //      it again and it becomes permanently unreclaimable. Once the grace
+  //      window has passed any pinning reader has released, so return it to
+  //      'free' for reuse instead.
+  conn.exec(
       "UPDATE blocks SET status = 'used' WHERE status = 'reserved' AND "
-      "reserved_at < datetime('now', '-10 seconds');";
-  conn.exec(query);
+      "reserved_at < datetime('now', '-10 seconds') AND "
+      "id IN (SELECT block_id FROM segment_blocks);");
+  conn.exec(
+      "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE "
+      "status = 'reserved' AND reserved_at < datetime('now', '-10 seconds') AND "
+      "id NOT IN (SELECT block_id FROM segment_blocks);");
 }
 
 static void _recycle_block(write_context& wctx, int64_t timestamp) {
@@ -1532,6 +1572,7 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   nts_sqlite_conn db(db_name, true, true);
   _upgrade_db(db);
   _validate_blocks(_file_name);
+  _recover_orphaned_blocks(db);
 }
 
 std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {

@@ -1270,16 +1270,34 @@ static void _recover_orphaned_blocks(const nts_sqlite_conn& conn) {
   // when an auto-reclaim recycle is interrupted: _db_reclaim_oldest_used_block()
   // deletes the segment_block and marks the block 'reserved' for reuse through
   // EBR, but the in-memory limbo/ready lists that would return it to 'free' are
-  // lost on a crash or restart (and the 10s maintenance task may have since
-  // flipped it to 'used'). The block is then stranded forever: it has no
+  // lost on a crash or hard exit. The block is then stranded forever: it has no
   // segment_block, so it can never be selected for reclaim again, and it is not
   // 'free', so it can never be handed to a writer. Eventually every block ends
-  // up stranded and writes fail with NANOTS_EC_NO_FREE_BLOCKS.
+  // up stranded and writes fail with NANOTS_EC_NO_FREE_BLOCKS. (Files written
+  // by older builds may also hold 'used' orphans, from when the maintenance
+  // task still flipped aged reclaim victims to 'used'; those are recovered here
+  // too, hence the status != 'free' predicate rather than just 'reserved'.)
   //
   // The writer constructor runs before any block is handed out, so at this
   // point any non-'free' block lacking a segment_block is genuinely orphaned
   // and safe to reclaim. Blocks with a segment_block (finalized or the
   // currently-open one, already validated by _validate_blocks) are preserved.
+  //
+  // KNOWN LIMITATION (narrow, in-process only): this sweep frees orphans
+  // unconditionally, which is correct at a true process start (any prior-process
+  // orphan has no live reader pinning it — readers only ever pin blocks they
+  // located via a segment_block, and an orphan has none). The one unsafe case is
+  // reconstructing a writer *within a still-running process* that also has a live
+  // reader: if a now-destroyed writer retired a block (deleting its segment_block)
+  // while that reader was mid-read and still pinning the block's bytes, this sweep
+  // could free it and hand it to a writer to overwrite under the reader. A precise
+  // guard isn't possible here because the per-block retired_epoch died with the
+  // previous writer's in-memory limbo. Closing it would require parking retired
+  // victims in the shared (per-file) epoch registry so they survive writer churn
+  // and can be drained through can_recycle(); the ~nanots_writer drain already
+  // narrows the window to blocks under active read at the exact destroy/construct
+  // boundary. The supported lifecycle — one writer opened at process start — never
+  // hits this.
   nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
     conn.exec(
         "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE "

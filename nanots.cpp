@@ -329,6 +329,47 @@ static void _validate_blocks(const std::string& file_name) {
   }
 }
 
+static void _recover_orphaned_blocks(const nts_sqlite_conn& conn) {
+  // Startup recovery. A block is "orphaned" when it is marked 'used' or
+  // 'reserved' in the catalog but no segment_block references it. This happens
+  // when an auto-reclaim recycle is interrupted: _db_reclaim_oldest_used_block()
+  // deletes the segment_block and marks the block 'reserved' for reuse through
+  // EBR, but the in-memory limbo/ready lists that would return it to 'free' are
+  // lost on a crash or hard exit. The block is then stranded forever: it has no
+  // segment_block, so it can never be selected for reclaim again, and it is not
+  // 'free', so it can never be handed to a writer. Eventually every block ends
+  // up stranded and writes fail with NANOTS_EC_NO_FREE_BLOCKS. (Files written
+  // by older builds may also hold 'used' orphans, from when the maintenance
+  // task still flipped aged reclaim victims to 'used'; those are recovered here
+  // too, hence the status != 'free' predicate rather than just 'reserved'.)
+  //
+  // The writer constructor runs before any block is handed out, so at this
+  // point any non-'free' block lacking a segment_block is genuinely orphaned
+  // and safe to reclaim. Blocks with a segment_block (finalized or the
+  // currently-open one, already validated by _validate_blocks) are preserved.
+  //
+  // KNOWN LIMITATION (narrow, in-process only): this sweep frees orphans
+  // unconditionally, which is correct at a true process start (any prior-process
+  // orphan has no live reader pinning it — readers only ever pin blocks they
+  // located via a segment_block, and an orphan has none). The one unsafe case is
+  // reconstructing a writer *within a still-running process* that also has a live
+  // reader: if a now-destroyed writer retired a block (deleting its segment_block)
+  // while that reader was mid-read and still pinning the block's bytes, this sweep
+  // could free it and hand it to a writer to overwrite under the reader. A precise
+  // guard isn't possible here because the per-block retired_epoch died with the
+  // previous writer's in-memory limbo. Closing it would require parking retired
+  // victims in the shared (per-file) epoch registry so they survive writer churn
+  // and can be drained through can_recycle(); the ~nanots_writer drain already
+  // narrows the window to blocks under active read at the exact destroy/construct
+  // boundary. The supported lifecycle — one writer opened at process start — never
+  // hits this.
+  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    conn.exec(
+        "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE "
+        "status != 'free' AND id NOT IN (SELECT block_id FROM segment_blocks);");
+  });
+}
+
 static int _get_db_version(const nts_sqlite_conn& conn) {
   auto result = conn.exec("PRAGMA user_version;");
   if (result.empty())
@@ -498,12 +539,42 @@ static void _db_finalize_block(const nts_sqlite_conn& conn,
 }
 
 static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
-  // Set status to 'used' for all blocks whose status is 'reserved' and
-  // reserved_at is older than 10 seconds.
-  auto query =
+  // Promote aged 'reserved' writer slots to 'used'. A block can be 'reserved'
+  // for two distinct reasons, and only one of them may be finalized here:
+  //
+  //   1. A live writer slot — it has a segment_block row. After the grace
+  //      window it becomes 'used' (the block now holds committed data). This
+  //      is the only transition this maintenance task performs.
+  //
+  //   2. An auto-reclaim victim — _db_reclaim_oldest_used_block() deleted its
+  //      segment_block and marked it 'reserved' to recycle it through EBR, then
+  //      parked it in the in-memory limbo/ready lists. Such a block has no
+  //      segment_block row, and this task deliberately leaves it untouched:
+  //
+  //        - Flipping it to 'used' would orphan it forever — with no
+  //          segment_block, _db_reclaim_oldest_used_block() can never select it
+  //          again and it is never 'free' to hand out. That is the wedge bug
+  //          (NANOTS_EC_NO_FREE_BLOCKS) this code path used to cause.
+  //        - Flipping it to 'free' is unsafe: the victim may still be pinned by
+  //          a live reader. EBR treats a reader as live for up to
+  //          NANOTS_HEARTBEAT_TIMEOUT_US (60s) — far longer than this 10s grace
+  //          window — and a reader that pinned the block before its
+  //          segment_block was deleted is still dereferencing its bytes. A
+  //          later _db_get_free_block() would then hand the block to a writer
+  //          that overwrites it under the reader, breaking the core
+  //          reads-disconnected-from-writes guarantee.
+  //
+  //   Reclaim victims are recycled the safe way instead: while the process
+  //   lives, _scan_limbo() promotes a victim to the ready list only once
+  //   can_recycle() confirms no reader can still be pinning it, and the next
+  //   acquire hands the block back to a writer (which re-creates its
+  //   segment_block). Victims still parked in limbo/ready when the process
+  //   exits are returned to 'free' at the next open by
+  //   _recover_orphaned_blocks(), which runs in the writer constructor.
+  conn.exec(
       "UPDATE blocks SET status = 'used' WHERE status = 'reserved' AND "
-      "reserved_at < datetime('now', '-10 seconds');";
-  conn.exec(query);
+      "reserved_at < datetime('now', '-10 seconds') AND "
+      "id IN (SELECT block_id FROM segment_blocks);");
 }
 
 static void _recycle_block(write_context& wctx, int64_t timestamp) {
@@ -597,6 +668,59 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   nts_sqlite_conn db(db_name, true, true);
   _upgrade_db(db);
   _validate_blocks(_file_name);
+  _recover_orphaned_blocks(db);
+}
+
+nanots_writer::~nanots_writer() {
+  // Drain the EBR limbo/ready lists back to the free pool before this writer
+  // disappears. These lists are in-memory only; anything still parked in them
+  // when we go away is a block we retired (its segment_block deleted, status
+  // 'reserved') but never got to hand back to a writer. Without this drain such
+  // blocks survive as orphaned 'reserved' rows and are only reclaimed on the
+  // next open by _recover_orphaned_blocks() — a leak for the lifetime of the
+  // process. Draining here returns the EBR-cleared ones to 'free' immediately.
+  //
+  // Safety: we free ONLY blocks that have cleared EBR (migrated into _ready by
+  // _scan_limbo, i.e. can_recycle() is true — no reader can still be pinning
+  // their bytes). Entries still sitting in _limbo are pinned by a live reader;
+  // we deliberately leave those 'reserved' and let _recover_orphaned_blocks()
+  // reclaim them at the next open, once those readers are gone.
+  if (!_auto_reclaim)
+    return;
+
+  std::vector<int64_t> freeable;
+  {
+    _scan_limbo();  // migrate any now-clear limbo entries into _ready
+    std::lock_guard<std::mutex> g(_limbo_mu);
+    for (const auto& e : _ready)
+      freeable.push_back(e.block_id);
+    _ready.clear();
+    // Whatever remains in _limbo is still reader-pinned; leave it 'reserved'.
+  }
+
+  if (freeable.empty())
+    return;
+
+  // A destructor must not throw. If the catalog is momentarily unavailable at
+  // shutdown the blocks simply stay 'reserved' and are recovered on next open.
+  try {
+    nts_sqlite_conn conn(_database_name(_file_name), true, true);
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+      // The predicate mirrors _recover_orphaned_blocks: only flip a block that
+      // is genuinely a retired victim (reserved, no segment_block). Belt and
+      // suspenders — a _ready entry is always exactly that.
+      auto stmt = conn.prepare(
+          "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE id = ? "
+          "AND status = 'reserved' AND id NOT IN "
+          "(SELECT block_id FROM segment_blocks);");
+      for (int64_t id : freeable) {
+        stmt.reset();
+        stmt.bind(1, id).exec_no_result();
+      }
+    });
+  } catch (...) {
+    // Swallow: see note above.
+  }
 }
 
 std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {

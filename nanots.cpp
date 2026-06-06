@@ -521,29 +521,42 @@ static void _db_finalize_block(const nts_sqlite_conn& conn,
 }
 
 static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
-  // Promote aged 'reserved' blocks, but distinguish the two ways a block can
-  // be reserved:
+  // Promote aged 'reserved' writer slots to 'used'. A block can be 'reserved'
+  // for two distinct reasons, and only one of them may be finalized here:
   //
   //   1. A live writer slot — it has a segment_block row. After the grace
-  //      window it becomes 'used' (the block now holds committed data).
+  //      window it becomes 'used' (the block now holds committed data). This
+  //      is the only transition this maintenance task performs.
   //
   //   2. An auto-reclaim victim — _db_reclaim_oldest_used_block() deleted its
-  //      segment_block and marked it 'reserved' to recycle it through EBR. If
-  //      that recycle never completed (readers slow to advance, or the process
-  //      restarted and lost the in-memory limbo/ready lists), the block is
-  //      stranded. Blindly flipping it to 'used' would orphan it forever: it
-  //      has no segment_block, so _db_reclaim_oldest_used_block() can never see
-  //      it again and it becomes permanently unreclaimable. Once the grace
-  //      window has passed any pinning reader has released, so return it to
-  //      'free' for reuse instead.
+  //      segment_block and marked it 'reserved' to recycle it through EBR, then
+  //      parked it in the in-memory limbo/ready lists. Such a block has no
+  //      segment_block row, and this task deliberately leaves it untouched:
+  //
+  //        - Flipping it to 'used' would orphan it forever — with no
+  //          segment_block, _db_reclaim_oldest_used_block() can never select it
+  //          again and it is never 'free' to hand out. That is the wedge bug
+  //          (NANOTS_EC_NO_FREE_BLOCKS) this code path used to cause.
+  //        - Flipping it to 'free' is unsafe: the victim may still be pinned by
+  //          a live reader. EBR treats a reader as live for up to
+  //          NANOTS_HEARTBEAT_TIMEOUT_US (60s) — far longer than this 10s grace
+  //          window — and a reader that pinned the block before its
+  //          segment_block was deleted is still dereferencing its bytes. A
+  //          later _db_get_free_block() would then hand the block to a writer
+  //          that overwrites it under the reader, breaking the core
+  //          reads-disconnected-from-writes guarantee.
+  //
+  //   Reclaim victims are recycled the safe way instead: while the process
+  //   lives, _scan_limbo() promotes a victim to the ready list only once
+  //   can_recycle() confirms no reader can still be pinning it, and the next
+  //   acquire hands the block back to a writer (which re-creates its
+  //   segment_block). Victims still parked in limbo/ready when the process
+  //   exits are returned to 'free' at the next open by
+  //   _recover_orphaned_blocks(), which runs in the writer constructor.
   conn.exec(
       "UPDATE blocks SET status = 'used' WHERE status = 'reserved' AND "
       "reserved_at < datetime('now', '-10 seconds') AND "
       "id IN (SELECT block_id FROM segment_blocks);");
-  conn.exec(
-      "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE "
-      "status = 'reserved' AND reserved_at < datetime('now', '-10 seconds') AND "
-      "id NOT IN (SELECT block_id FROM segment_blocks);");
 }
 
 static void _recycle_block(write_context& wctx, int64_t timestamp) {

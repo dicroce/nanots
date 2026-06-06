@@ -681,7 +681,7 @@ class NANOTS_API nanots_writer {
     nanots_writer(nanots_writer&&) = default;
     nanots_writer& operator=(const nanots_writer&) = delete;
     nanots_writer& operator=(nanots_writer&&) = default;
-    ~nanots_writer() = default;
+    ~nanots_writer();
 
     write_context create_write_context(
         const std::string& stream_tag,

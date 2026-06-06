@@ -653,6 +653,58 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   _recover_orphaned_blocks(db);
 }
 
+nanots_writer::~nanots_writer() {
+  // Drain the EBR limbo/ready lists back to the free pool before this writer
+  // disappears. These lists are in-memory only; anything still parked in them
+  // when we go away is a block we retired (its segment_block deleted, status
+  // 'reserved') but never got to hand back to a writer. Without this drain such
+  // blocks survive as orphaned 'reserved' rows and are only reclaimed on the
+  // next open by _recover_orphaned_blocks() — a leak for the lifetime of the
+  // process. Draining here returns the EBR-cleared ones to 'free' immediately.
+  //
+  // Safety: we free ONLY blocks that have cleared EBR (migrated into _ready by
+  // _scan_limbo, i.e. can_recycle() is true — no reader can still be pinning
+  // their bytes). Entries still sitting in _limbo are pinned by a live reader;
+  // we deliberately leave those 'reserved' and let _recover_orphaned_blocks()
+  // reclaim them at the next open, once those readers are gone.
+  if (!_auto_reclaim)
+    return;
+
+  std::vector<int64_t> freeable;
+  {
+    _scan_limbo();  // migrate any now-clear limbo entries into _ready
+    std::lock_guard<std::mutex> g(_limbo_mu);
+    for (const auto& e : _ready)
+      freeable.push_back(e.block_id);
+    _ready.clear();
+    // Whatever remains in _limbo is still reader-pinned; leave it 'reserved'.
+  }
+
+  if (freeable.empty())
+    return;
+
+  // A destructor must not throw. If the catalog is momentarily unavailable at
+  // shutdown the blocks simply stay 'reserved' and are recovered on next open.
+  try {
+    nts_sqlite_conn conn(_database_name(_file_name), true, true);
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+      // The predicate mirrors _recover_orphaned_blocks: only flip a block that
+      // is genuinely a retired victim (reserved, no segment_block). Belt and
+      // suspenders — a _ready entry is always exactly that.
+      auto stmt = conn.prepare(
+          "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE id = ? "
+          "AND status = 'reserved' AND id NOT IN "
+          "(SELECT block_id FROM segment_blocks);");
+      for (int64_t id : freeable) {
+        stmt.reset();
+        stmt.bind(1, id).exec_no_result();
+      }
+    });
+  } catch (...) {
+    // Swallow: see note above.
+  }
+}
+
 std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {
   // Current physical block count comes from sqlite (authoritative).
   auto count_rows = conn.exec("SELECT COUNT(*) AS c FROM blocks;");

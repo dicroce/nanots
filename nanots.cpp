@@ -974,6 +974,7 @@ void nanots_writer::write(write_context& wctx,
   uint32_t padded_frame_size = (total_frame_size + 7) & ~7;  // Round up to multiple of 8
 
   uint64_t new_block_ofs = (uint64_t)(_block_size - padded_frame_size);
+  bool fits = (new_block_ofs >= index_end);
 
   if (n_valid_indexes > 0) {
     uint8_t* last_index_p = block_p + BLOCK_HEADER_SIZE +
@@ -981,13 +982,15 @@ void nanots_writer::write(write_context& wctx,
     uint64_t last_frame_offset = *(uint64_t*)(last_index_p + INDEX_ENTRY_OFFSET_OFFSET);
     if (last_frame_offset >= padded_frame_size) {
       uint64_t candidate_ofs = last_frame_offset - padded_frame_size;
-      new_block_ofs = (candidate_ofs >= index_end) ? candidate_ofs : index_end;
+      fits = (candidate_ofs >= index_end);
+      new_block_ofs = fits ? candidate_ofs : index_end;
     } else {
+      fits = false;
       new_block_ofs = index_end;  // Force rollover to new block
     }
   }
 
-  if (index_end >= new_block_ofs) {
+  if (!fits) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
     wctx.mm.flush(wctx.mm.map(), _block_size, true);

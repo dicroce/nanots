@@ -51,6 +51,8 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_secondary_key_reader_callback);
   TEST(test_nanots::test_nanots_composite_duplicate_timestamps);
   TEST(test_nanots::test_nanots_composite_find_lands_on_first_at_ts);
+  TEST(test_nanots::test_nanots_exact_max_size_frame);
+  TEST(test_nanots::test_nanots_unfinalized_block_with_max_frame_survives);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -106,4 +108,6 @@ class test_nanots : public test_fixture {
   void test_nanots_secondary_key_reader_callback();
   void test_nanots_composite_duplicate_timestamps();
   void test_nanots_composite_find_lands_on_first_at_ts();
+  void test_nanots_exact_max_size_frame();
+  void test_nanots_unfinalized_block_with_max_frame_survives();
 };

@@ -196,8 +196,17 @@ static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size,
     return false;
   }
 
-  // Check frame offset bounds
-  uint32_t index_region_end = BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
+  // Check frame offset bounds. The index region actually in use is exactly
+  // the n_valid_indexes committed entries: nanots_writer::write() places the
+  // frame at index i no lower than BLOCK_HEADER_SIZE + ((i + 1) *
+  // INDEX_ENTRY_SIZE) — the end of that frame's own slot — and the valid
+  // counter is only incremented once both the frame and its index entry are
+  // written. Reserving an extra (n_valid_indexes + 1)'th slot here rejected
+  // frames the writer legitimately placed flush against the index region,
+  // which cost the whole block on recovery. That is reachable whenever the
+  // last frame packs tightly, most easily with a max-size frame (its offset
+  // lands exactly on the region end).
+  uint32_t index_region_end = BLOCK_HEADER_SIZE + (n_valid_indexes * INDEX_ENTRY_SIZE);
   if (offset < index_region_end || offset > block_size - FRAME_HEADER_SIZE) {
     return false;
   }

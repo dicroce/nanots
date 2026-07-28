@@ -1131,8 +1131,17 @@ static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size,
     return false;
   }
 
-  // Check frame offset bounds
-  uint32_t index_region_end = BLOCK_HEADER_SIZE + ((n_valid_indexes + 1) * INDEX_ENTRY_SIZE);
+  // Check frame offset bounds. The index region actually in use is exactly
+  // the n_valid_indexes committed entries: nanots_writer::write() places the
+  // frame at index i no lower than BLOCK_HEADER_SIZE + ((i + 1) *
+  // INDEX_ENTRY_SIZE) — the end of that frame's own slot — and the valid
+  // counter is only incremented once both the frame and its index entry are
+  // written. Reserving an extra (n_valid_indexes + 1)'th slot here rejected
+  // frames the writer legitimately placed flush against the index region,
+  // which cost the whole block on recovery. That is reachable whenever the
+  // last frame packs tightly, most easily with a max-size frame (its offset
+  // lands exactly on the region end).
+  uint32_t index_region_end = BLOCK_HEADER_SIZE + (n_valid_indexes * INDEX_ENTRY_SIZE);
   if (offset < index_region_end || offset > block_size - FRAME_HEADER_SIZE) {
     return false;
   }
@@ -1909,6 +1918,7 @@ void nanots_writer::write(write_context& wctx,
   uint32_t padded_frame_size = (total_frame_size + 7) & ~7;  // Round up to multiple of 8
 
   uint64_t new_block_ofs = (uint64_t)(_block_size - padded_frame_size);
+  bool fits = (new_block_ofs >= index_end);
 
   if (n_valid_indexes > 0) {
     uint8_t* last_index_p = block_p + BLOCK_HEADER_SIZE +
@@ -1916,13 +1926,15 @@ void nanots_writer::write(write_context& wctx,
     uint64_t last_frame_offset = *(uint64_t*)(last_index_p + INDEX_ENTRY_OFFSET_OFFSET);
     if (last_frame_offset >= padded_frame_size) {
       uint64_t candidate_ofs = last_frame_offset - padded_frame_size;
-      new_block_ofs = (candidate_ofs >= index_end) ? candidate_ofs : index_end;
+      fits = (candidate_ofs >= index_end);
+      new_block_ofs = fits ? candidate_ofs : index_end;
     } else {
+      fits = false;
       new_block_ofs = index_end;  // Force rollover to new block
     }
   }
 
-  if (index_end >= new_block_ofs) {
+  if (!fits) {
     nts_sqlite_conn conn(_database_name(_file_name), true, true);
 
     wctx.mm.flush(wctx.mm.map(), _block_size, true);

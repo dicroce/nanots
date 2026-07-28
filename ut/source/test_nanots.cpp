@@ -2787,3 +2787,153 @@ void test_nanots::test_nanots_composite_find_lands_on_first_at_ts() {
   RTF_ASSERT(iter->timestamp == 200);
   RTF_ASSERT(iter->secondary_key == -100);
 }
+
+// A frame whose padded size exactly fills the space left in a block used to
+// throw std::bad_optional_access from nanots_writer::write(). The fit check
+// compared index_end against new_block_ofs, but new_block_ofs doubles as a
+// "no room, roll over" sentinel equal to index_end, so a legitimate exact fit
+// on the first write into an empty block was misread as "no room" and sent
+// into the finalize path -- which dereferences wctx.last_timestamp before any
+// write has set it. Padding rounds the frame up to 8 bytes, so the whole top
+// 8 payload sizes collapse onto that offset, not just the documented maximum.
+void test_nanots::test_nanots_exact_max_size_frame() {
+  // allocate() rounds the block size up to a 64k boundary; 1 MiB is already
+  // a multiple of 64k, so the effective block size is what we asked for.
+  const size_t block_size = 1024 * 1024;
+  const size_t max_size =
+      block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE);
+
+  nanots_writer db("nanots_test_16mb.nts", false);
+
+  // Every size in the padding window must be writable as the first frame of a
+  // fresh block, and must read back intact.
+  for (size_t k = 0; k < 8; k++) {
+    const size_t size = max_size - k;
+    const std::string tag = "exact_max_" + std::to_string(k);
+
+    std::vector<uint8_t> data(size);
+    for (size_t j = 0; j < size; j++)
+      data[j] = (uint8_t)((j + k) % 256);
+
+    {
+      auto wctx = db.create_write_context(tag, "exact max size");
+      RTF_ASSERT_NO_THROW(db.write(wctx, data.data(), size, 0, 1000));
+    }
+
+    nanots_iterator iter("nanots_test_16mb.nts", tag);
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->size == size);
+    RTF_ASSERT(iter->timestamp == 1000);
+    RTF_ASSERT(iter->data[0] == (uint8_t)(k % 256));
+    RTF_ASSERT(iter->data[size - 1] == (uint8_t)((size - 1 + k) % 256));
+    ++iter;
+    RTF_ASSERT(!iter.valid());
+  }
+
+  // An exact-fit frame leaves a block with zero usable space, so the next
+  // write must roll over to a new block rather than overlap the first frame.
+  {
+    std::vector<uint8_t> big(max_size, 0xAB);
+    std::vector<uint8_t> tiny(16, 0xCD);
+
+    {
+      auto wctx = db.create_write_context("exact_max_rollover", "rollover");
+      RTF_ASSERT_NO_THROW(db.write(wctx, big.data(), big.size(), 0, 1000));
+      RTF_ASSERT_NO_THROW(db.write(wctx, tiny.data(), tiny.size(), 0, 2000));
+    }
+
+    nanots_iterator iter("nanots_test_16mb.nts", "exact_max_rollover");
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->size == max_size);
+    RTF_ASSERT(iter->timestamp == 1000);
+    RTF_ASSERT(iter->data[0] == 0xAB);
+    RTF_ASSERT(iter->data[max_size - 1] == 0xAB);
+    const int64_t first_block_sequence = iter->block_sequence;
+
+    ++iter;
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->size == 16);
+    RTF_ASSERT(iter->timestamp == 2000);
+    RTF_ASSERT(iter->data[0] == 0xCD);
+    RTF_ASSERT(iter->data[15] == 0xCD);
+    // The two frames must live in different blocks -- an exact fit leaves no
+    // usable space, so overlapping the first frame is the failure to catch.
+    RTF_ASSERT(iter->block_sequence != first_block_sequence);
+
+    ++iter;
+    RTF_ASSERT(!iter.valid());
+  }
+
+  // Oversized frames are still rejected.
+  {
+    auto wctx = db.create_write_context("exact_max_toobig", "too big");
+    std::vector<uint8_t> toobig(max_size + 1, 0x11);
+    RTF_ASSERT_THROWS(db.write(wctx, toobig.data(), toobig.size(), 0, 1000),
+                      nanots_exception);
+  }
+}
+
+// _validate_blocks() reclaims blocks left unfinalized by a crash (end_timestamp
+// still 0), keeping them only if it can find a valid frame. Its bounds check
+// used to reserve an (n_valid_indexes + 1)'th index slot, one more than the
+// block actually occupies, so a frame packed flush against the index region was
+// judged invalid. When it was the only frame the entire block was freed, losing
+// committed data. A max-size frame lands exactly on that boundary.
+void test_nanots::test_nanots_unfinalized_block_with_max_frame_survives() {
+  const size_t block_size = 1024 * 1024;
+  const size_t max_size =
+      block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE);
+
+  auto db_name = _database_name("nanots_test_4mb.nts");
+
+  // A control frame (comfortably clear of the index region) and the max-size
+  // frame (flush against it) must both survive recovery.
+  struct { const char* tag; size_t size; } cases[] = {
+    {"unfinalized_small", 1000},
+    {"unfinalized_max", max_size},
+  };
+
+  for (const auto& c : cases) {
+    std::vector<uint8_t> data(c.size, 0x5A);
+    data[0] = 0x01;
+    data[c.size - 1] = 0x02;
+
+    {
+      nanots_writer db("nanots_test_4mb.nts", false);
+      auto wctx = db.create_write_context(c.tag, "unfinalized");
+      db.write(wctx, data.data(), data.size(), 0, 1000);
+    }
+
+    // Simulate dying before the block was finalized. A clean shutdown runs
+    // ~write_context(), which stamps end_timestamp; a crash does not.
+    {
+      nts_sqlite_conn conn(db_name, true, true);
+      auto stmt = conn.prepare(
+          "UPDATE segment_blocks SET end_timestamp = 0 WHERE segment_id IN "
+          "(SELECT id FROM segments WHERE stream_tag = ?);");
+      stmt.bind(1, std::string(c.tag)).exec_no_result();
+    }
+
+    // Opening a writer runs _validate_blocks() over every unfinalized block.
+    { nanots_writer recover("nanots_test_4mb.nts", false); }
+
+    int n = 0;
+    size_t got_size = 0;
+    uint8_t first = 0, last = 0;
+    nanots_reader reader("nanots_test_4mb.nts");
+    reader.read(c.tag, 0, NANOTS_SEC_KEY_UNSET, INT64_MAX, INT64_MAX,
+                [&](const uint8_t* d, size_t size, uint32_t /*flags*/,
+                    int64_t /*timestamp*/, int64_t /*secondary_key*/,
+                    int64_t /*block_sequence*/, const std::string& /*metadata*/) {
+                  n++;
+                  got_size = size;
+                  first = d[0];
+                  last = d[size - 1];
+                });
+
+    RTF_ASSERT(n == 1);
+    RTF_ASSERT(got_size == c.size);
+    RTF_ASSERT(first == 0x01);
+    RTF_ASSERT(last == 0x02);
+  }
+}

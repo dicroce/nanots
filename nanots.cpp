@@ -6,6 +6,11 @@
 std::mutex current_stream_tags_lok;
 std::set<std::string> current_stream_tags;
 
+// The SQLite catalog schema is versioned independently from the binary .nts
+// format. Version 3 makes an open segment_block explicit with SQL NULL instead
+// of overloading the valid timestamp value zero.
+static constexpr int NANOTS_CATALOG_VERSION = 3;
+
 // ---------------------------------------------------------------------------
 // Epoch-Based Reclamation registry implementation
 // ---------------------------------------------------------------------------
@@ -188,11 +193,11 @@ static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size,
                                      int index, uint32_t n_valid_indexes,
                                      const uint8_t* uuid) {
   uint8_t* index_p = block_p + BLOCK_HEADER_SIZE + (index * INDEX_ENTRY_SIZE);
-  int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
   uint64_t offset = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
-  // Skip zeroed entries
-  if (timestamp == 0 || offset == 0) {
+  // A zero offset identifies an unused/zeroed entry. Timestamp zero is valid;
+  // n_valid_indexes is the commit boundary for the index array.
+  if (offset == 0) {
     return false;
   }
 
@@ -260,7 +265,7 @@ static void _validate_blocks(const std::string& file_name) {
           "SELECT sb.id, sb.block_idx, sb.block_id, sb.uuid, s.stream_tag "
           "FROM segment_blocks sb "
           "JOIN segments s ON sb.segment_id = s.id "
-          "WHERE sb.end_timestamp = 0");
+          "WHERE sb.end_timestamp IS NULL");
       
       if(rowsToProcess.empty()) {
         doneValidating = true;
@@ -393,36 +398,81 @@ static void _set_db_version(const nts_sqlite_conn& conn, int version) {
   conn.exec("PRAGMA user_version=" + std::to_string(version) + ";");
 }
 
-static void _upgrade_db(const nts_sqlite_conn& conn) {
+static void _upgrade_db(const nts_sqlite_conn& conn,
+                        const std::string& file_name) {
   auto current_version = _get_db_version(conn);
 
-  // v2-only build: any pre-v2 database is rejected. (Fresh DBs created by
-  // allocate() are stamped to version 2 below.)
+  // The v2 binary format is still current, but pre-v2 catalog schemas remain
+  // unsupported. Fresh catalogs are stamped directly to the latest version.
   if (current_version != 0 && current_version < 2) {
     throw nanots_exception(NANOTS_EC_BAD_VERSION,
                            "Legacy nanots catalog (pre-v2) is not supported.",
                            __FILE__, __LINE__);
   }
 
+  if (current_version > NANOTS_CATALOG_VERSION) {
+    throw nanots_exception(NANOTS_EC_BAD_VERSION,
+                           "Nanots catalog is newer than this library.",
+                           __FILE__, __LINE__);
+  }
+
   switch (current_version) {
     case 0: {
       nts_sqlite_transaction(
-          conn, true, [&](const nts_sqlite_conn& conn) { _set_db_version(conn, 2); });
+          conn, true, [&](const nts_sqlite_conn& conn) {
+            _set_db_version(conn, NANOTS_CATALOG_VERSION);
+          });
     }
-      [[fallthrough]];
+      break;
+    case 2: {
+      // Version 2 used end_timestamp == 0 for both an open block and a
+      // finalized block whose last frame really occurred at timestamp zero.
+      // Convert every ambiguous row to the v3 open representation first, then
+      // let block recovery inspect the committed on-disk index and restore its
+      // actual end composite. Keep user_version at 2 until recovery succeeds:
+      // an interrupted migration is therefore idempotent on the next open.
+      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+        conn.exec(
+            "UPDATE segment_blocks "
+            "SET end_timestamp = NULL, end_secondary_key = NULL "
+            "WHERE end_timestamp = 0;");
+      });
+
+      _validate_blocks(file_name);
+
+      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+        _set_db_version(conn, NANOTS_CATALOG_VERSION);
+      });
+      break;
+    }
     default:
       break;
   };
 }
 
+// Readers normally keep the catalog read-only. They only reopen it writable
+// when an actual migration is required, so an already-current database remains
+// usable from a read-only deployment.
+static void _upgrade_db_for_reader(const std::string& file_name) {
+  auto db_name = _database_name(file_name);
+  {
+    nts_sqlite_conn conn(db_name, false, false);
+    if (_get_db_version(conn) == NANOTS_CATALOG_VERSION)
+      return;
+  }
+
+  nts_sqlite_conn conn(db_name, true, true);
+  _upgrade_db(conn, file_name);
+}
+
 static std::optional<block> _db_reclaim_oldest_used_block(
     const nts_sqlite_conn& conn) {
-  // Find oldest finalized segment_block (end_timestamp != 0)
+  // Find oldest finalized segment_block. Open blocks have a NULL end.
   auto result = conn.exec(
       "SELECT sb.block_id, b.idx, sb.id as segment_block_id, b.status "
       "FROM segment_blocks sb "
       "JOIN blocks b ON sb.block_id = b.id "
-      "WHERE sb.end_timestamp != 0 AND (b.status = 'used' OR b.status = 'reserved') "
+      "WHERE sb.end_timestamp IS NOT NULL AND (b.status = 'used' OR b.status = 'reserved') "
       "ORDER BY sb.end_timestamp ASC, b.reserved_at ASC "
       "LIMIT 1");
 
@@ -489,9 +539,7 @@ static std::optional<segment_block> _db_create_segment_block(
     int64_t block_id,
     int64_t block_idx,
     int64_t start_timestamp,
-    int64_t end_timestamp,
     int64_t start_secondary_key,
-    int64_t end_secondary_key,
     const uint8_t* uuid) {
   auto stmt = conn.prepare(
       "INSERT INTO segment_blocks ("
@@ -513,9 +561,9 @@ static std::optional<segment_block> _db_create_segment_block(
       .bind(3, block_id)
       .bind(4, block_idx)
       .bind(5, start_timestamp)
-      .bind(6, end_timestamp)
+      .bind_null(6)
       .bind(7, start_secondary_key)
-      .bind(8, end_secondary_key)
+      .bind_null(8)
       .bind(9, hex_uuid)
       .exec_no_result();
 
@@ -526,9 +574,7 @@ static std::optional<segment_block> _db_create_segment_block(
   sb.block_id = block_id;
   sb.block_idx = block_idx;
   sb.start_timestamp = start_timestamp;
-  sb.end_timestamp = end_timestamp;
   sb.start_secondary_key = start_secondary_key;
-  sb.end_secondary_key = end_secondary_key;
   memcpy(sb.uuid, uuid, 16);
 
   return sb;
@@ -675,7 +721,7 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
 
   auto db_name = _database_name(_file_name);
   nts_sqlite_conn db(db_name, true, true);
-  _upgrade_db(db);
+  _upgrade_db(db, _file_name);
   _validate_blocks(_file_name);
   _recover_orphaned_blocks(db);
 }
@@ -957,7 +1003,7 @@ void nanots_writer::write(write_context& wctx,
 
       wctx.current_block = _db_create_segment_block(
           conn, wctx.current_segment->id, wctx.current_segment->sequence,
-          phys.id, phys.idx, timestamp, 0, secondary_key, 0, uuid);
+          phys.id, phys.idx, timestamp, secondary_key, uuid);
 
       if (!wctx.current_block)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
@@ -1058,6 +1104,7 @@ void nanots_writer::free_blocks(const std::string& file_name,
                                 int64_t end_secondary_key) {
   auto db_name = _database_name(file_name);
   nts_sqlite_conn conn(db_name, true, true);
+  _upgrade_db(conn, file_name);
 
   nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
     // Find blocks fully contained in the composite window
@@ -1066,7 +1113,7 @@ void nanots_writer::free_blocks(const std::string& file_name,
     //     start_ts > ? OR (start_ts = ? AND start_sk >= ?)
     //   block_end <= window_end:
     //     end_ts < ? OR (end_ts = ? AND end_sk <= ?)
-    // Plus end_timestamp != 0 to skip the currently-open block.
+    // Plus end_timestamp IS NOT NULL to skip the currently-open block.
     auto stmt = conn.prepare(
         "SELECT sb.id as segment_block_id, sb.block_id "
         "FROM segment_blocks sb "
@@ -1076,7 +1123,7 @@ void nanots_writer::free_blocks(const std::string& file_name,
         "     (sb.start_timestamp = ? AND sb.start_secondary_key >= ?)) "
         "AND (sb.end_timestamp < ? OR "
         "     (sb.end_timestamp = ? AND sb.end_secondary_key <= ?)) "
-        "AND sb.end_timestamp != 0");
+        "AND sb.end_timestamp IS NOT NULL");
     auto blocks_to_delete =
         stmt.bind(1, stream_tag)
             .bind(2, start_timestamp).bind(3, start_timestamp).bind(4, start_secondary_key)
@@ -1242,7 +1289,7 @@ void nanots_writer::allocate(const std::string& file_name,
     }
   });
 
-  _upgrade_db(db);
+  _upgrade_db(db, file_name);
 }
 
 nanots_reader::nanots_reader(const std::string& file_name)
@@ -1270,6 +1317,8 @@ nanots_reader::nanots_reader(const std::string& file_name)
 
   _block_size = *(uint32_t*)(header_p + FILE_HEADER_BLOCK_SIZE_OFFSET);
   _n_blocks   = *(uint32_t*)(header_p + FILE_HEADER_N_BLOCKS_OFFSET);
+
+  _upgrade_db_for_reader(_file_name);
 }
 
 // Lexicographic compare on (timestamp, secondary_key). Target is a 16-byte
@@ -1306,8 +1355,8 @@ void nanots_reader::read(
   // window. Two lex comparisons:
   //   block_start <= window_end:
   //     start_ts < ?  OR  (start_ts = ? AND start_sk <= ?)
-  //   block_end >= window_start  (or open block end_ts == 0):
-  //     end_ts = 0 OR end_ts > ? OR (end_ts = ? AND end_sk >= ?)
+  //   block_end >= window_start (or the block is still open):
+  //     end_ts IS NULL OR end_ts > ? OR (end_ts = ? AND end_sk >= ?)
   auto stmt = db.prepare(
       "SELECT "
       "s.metadata as metadata, "
@@ -1321,7 +1370,7 @@ void nanots_reader::read(
       "WHERE s.stream_tag = ? "
       "AND (sb.start_timestamp < ? OR "
       "     (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
-      "AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "
+      "AND (sb.end_timestamp IS NULL OR sb.end_timestamp > ? OR "
       "     (sb.end_timestamp = ? AND sb.end_secondary_key >= ?)) "
       "ORDER BY sb.sequence ASC;");
   auto results =
@@ -1417,7 +1466,7 @@ std::vector<std::string> nanots_reader::query_stream_tags(
       "JOIN segment_blocks sb ON s.id = sb.segment_id "
       "WHERE (sb.start_timestamp < ? OR "
       "       (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
-      "AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "
+      "AND (sb.end_timestamp IS NULL OR sb.end_timestamp > ? OR "
       "     (sb.end_timestamp = ? AND sb.end_secondary_key >= ?));");
   auto results =
       stmt.bind(1, end_timestamp).bind(2, end_timestamp).bind(3, end_secondary_key)
@@ -1463,7 +1512,7 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
     "  WHERE s.stream_tag = ? "                       /* bind(1) */
     "    AND (sb.start_timestamp < ? OR "             /* bind(2,3,4) — end composite */
     "         (sb.start_timestamp = ? AND sb.start_secondary_key <= ?)) "
-    "    AND (sb.end_timestamp = 0 OR sb.end_timestamp > ? OR "  /* bind(5,6,7) — start composite */
+    "    AND (sb.end_timestamp IS NULL OR sb.end_timestamp > ? OR "  /* bind(5,6,7) — start composite */
     "         (sb.end_timestamp = ? AND sb.end_secondary_key >= ?)) "
     "), "
     "region_boundaries AS ( "
@@ -1507,7 +1556,10 @@ std::vector<contiguous_segment> nanots_reader::query_contiguous_segments(
     contiguous_segment segment;
     segment.segment_id = std::stoll(row["segment_id"].value());
     segment.start_timestamp = std::stoll(row["region_start_ts"].value());
-    segment.end_timestamp = std::stoll(row["region_end_ts"].value());
+    // Preserve the existing public API convention for a live/open region;
+    // internally and in SQLite the state is now represented explicitly.
+    segment.end_timestamp = row["region_end_ts"].has_value()
+        ? std::stoll(row["region_end_ts"].value()) : 0;
     auto& s_sk = row["region_start_sk"];
     auto& e_sk = row["region_end_sk"];
     segment.start_secondary_key = s_sk.has_value()
@@ -1529,7 +1581,7 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _current_segment_id(0),
       _current_frame_idx(0),
       _current_block_start_ts(0),
-      _current_block_end_ts(0),
+      _current_block_end_ts(std::nullopt),
       _valid(false),
       _initialized(false),
       _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
@@ -1552,6 +1604,8 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
                            __FILE__, __LINE__);
 
   _block_size = *(uint32_t*)(header_p + FILE_HEADER_BLOCK_SIZE_OFFSET);
+
+  _upgrade_db_for_reader(_file_name);
 
   // Initialize to first frame if stream exists
   reset();
@@ -1607,13 +1661,15 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   block.metadata = row["metadata"].has_value() ? row["metadata"].value() : std::string();
   block.uuid_hex = row["uuid"].value();
   block.start_timestamp = std::stoll(row["start_timestamp"].value());
-  block.end_timestamp = std::stoll(row["end_timestamp"].value());
+  auto& end_ts = row["end_timestamp"];
+  block.end_timestamp = end_ts.has_value()
+      ? std::optional<int64_t>(std::stoll(end_ts.value())) : std::nullopt;
   auto& sk_start = row["start_secondary_key"];
   block.start_secondary_key = sk_start.has_value()
       ? std::stoll(sk_start.value()) : NANOTS_SEC_KEY_UNSET;
   auto& sk_end = row["end_secondary_key"];
   block.end_secondary_key = sk_end.has_value()
-      ? std::stoll(sk_end.value()) : NANOTS_SEC_KEY_UNSET;
+      ? std::optional<int64_t>(std::stoll(sk_end.value())) : std::nullopt;
 
   auto result = _block_cache.emplace(cache_key, std::move(block));
   return &result.first->second;
@@ -1650,13 +1706,15 @@ void nanots_iterator::_refresh_ts_index() {
     br.segment_id = std::stoll(row["segment_id"].value());
     br.sequence   = std::stoll(row["sequence"].value());
     br.start_ts   = std::stoll(row["start_timestamp"].value());
-    br.end_ts     = std::stoll(row["end_timestamp"].value());
+    auto& e_ts = row["end_timestamp"];
+    br.end_ts = e_ts.has_value()
+        ? std::optional<int64_t>(std::stoll(e_ts.value())) : std::nullopt;
     auto& s_sk = row["start_secondary_key"];
     auto& e_sk = row["end_secondary_key"];
     br.start_sk = s_sk.has_value() ? std::stoll(s_sk.value())
                                    : NANOTS_SEC_KEY_UNSET;
-    br.end_sk   = e_sk.has_value() ? std::stoll(e_sk.value())
-                                   : NANOTS_SEC_KEY_UNSET;
+    br.end_sk = e_sk.has_value()
+        ? std::optional<int64_t>(std::stoll(e_sk.value())) : std::nullopt;
     _ts_index.push_back(br);
   }
   _ts_index_filled = true;
@@ -1684,8 +1742,9 @@ size_t nanots_iterator::_ts_index_find(int64_t ts, int64_t sk) const {
     auto prev = std::prev(it);
     P prev_start = br_start(*prev);
     bool ge_start = !cmp_lt(target, prev_start);  // target >= prev_start
-    bool open_block = (prev->end_ts == 0);
-    P prev_end{prev->end_ts, prev->end_sk};
+    bool open_block = !prev->end_ts.has_value();
+    P prev_end{prev->end_ts.value_or(0),
+               prev->end_sk.value_or(NANOTS_SEC_KEY_UNSET)};
     bool le_end = open_block || !cmp_lt(prev_end, target);  // target <= prev_end
     if (ge_start && le_end) {
       return static_cast<size_t>(std::distance(_ts_index.begin(), prev));
@@ -1955,9 +2014,9 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
 
   // Fast path: if the target is within the already-loaded block's range
   // (composite), skip the SQL lookup entirely.
-  if (_valid && _current_block_end_ts != 0 &&
+  if (_valid && _current_block_end_ts.has_value() &&
       timestamp >= _current_block_start_ts &&
-      timestamp <= _current_block_end_ts) {
+      timestamp <= _current_block_end_ts.value()) {
     block = _get_block_by_segment_and_sequence(_current_segment_id, _current_block_sequence);
   }
 

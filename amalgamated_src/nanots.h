@@ -520,9 +520,11 @@ struct segment_block {
     int64_t block_id{0};
     int64_t block_idx{0};
     int64_t start_timestamp{0};
-    int64_t end_timestamp{0};
+    // SQL NULL while the block is open. Timestamp zero is valid data and
+    // must not double as an occupancy/finalization sentinel.
+    std::optional<int64_t> end_timestamp;
     int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
-    int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
+    std::optional<int64_t> end_secondary_key;
     uint8_t uuid[16];
 };
 
@@ -875,9 +877,9 @@ struct block_info {
     std::string metadata;
     std::string uuid_hex;
     int64_t start_timestamp{0};
-    int64_t end_timestamp{0};
+    std::optional<int64_t> end_timestamp;
     int64_t start_secondary_key{NANOTS_SEC_KEY_UNSET};
-    int64_t end_secondary_key{NANOTS_SEC_KEY_UNSET};
+    std::optional<int64_t> end_secondary_key;
 
     // Loaded block data
     nts_memory_map mm;
@@ -933,11 +935,11 @@ class NANOTS_API nanots_iterator {
     // _get_first/last/next/prev_block with in-memory binary search.
     struct BlockRange {
       int64_t start_ts;
-      int64_t end_ts;       // 0 = open block (currently being written)
+      std::optional<int64_t> end_ts;  // nullopt = open block
       int64_t segment_id;
       int64_t sequence;
       int64_t start_sk;     // NANOTS_SEC_KEY_UNSET if stream has no sec key
-      int64_t end_sk;       // 0 boundary semantics same as end_ts
+      std::optional<int64_t> end_sk;
     };
 
     block_info* _get_block_by_segment_and_sequence(int64_t segment_id, int64_t sequence);
@@ -954,7 +956,7 @@ class NANOTS_API nanots_iterator {
 
     // Returns the position in _ts_index of the block matching ts, or
     // _ts_index.size() if none. Matches the old SQL semantics: first prefers a
-    // block that covers ts (start_ts <= ts <= end_ts, or end_ts == 0); otherwise
+    // block that covers ts (start_ts <= ts <= end_ts, or has no end); otherwise
     // returns the first block with start_ts >= ts.
     // Composite lower_bound: returns the position of the first block whose
     // (start_ts, start_sk) is >= (ts, sk), or the block that covers it.
@@ -980,7 +982,7 @@ class NANOTS_API nanots_iterator {
     int64_t _current_segment_id;
     size_t _current_frame_idx;
     int64_t _current_block_start_ts;
-    int64_t _current_block_end_ts;
+    std::optional<int64_t> _current_block_end_ts;
 
     // Cache of visited blocks (segment_id:sequence -> block_info)
     // Using string key for simplicity: "segment_id:sequence"

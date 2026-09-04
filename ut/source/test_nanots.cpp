@@ -2954,7 +2954,7 @@ void test_nanots::test_nanots_exact_max_size_frame() {
 }
 
 // _validate_blocks() reclaims blocks left unfinalized by a crash (end_timestamp
-// still 0), keeping them only if it can find a valid frame. Its bounds check
+// still NULL), keeping them only if it can find a valid frame. Its bounds check
 // used to reserve an (n_valid_indexes + 1)'th index slot, one more than the
 // block actually occupies, so a frame packed flush against the index region was
 // judged invalid. When it was the only frame the entire block was freed, losing
@@ -2989,7 +2989,8 @@ void test_nanots::test_nanots_unfinalized_block_with_max_frame_survives() {
     {
       nts_sqlite_conn conn(db_name, true, true);
       auto stmt = conn.prepare(
-          "UPDATE segment_blocks SET end_timestamp = 0 WHERE segment_id IN "
+          "UPDATE segment_blocks SET end_timestamp = NULL, "
+          "end_secondary_key = NULL WHERE segment_id IN "
           "(SELECT id FROM segments WHERE stream_tag = ?);");
       stmt.bind(1, std::string(c.tag)).exec_no_result();
     }
@@ -3016,4 +3017,183 @@ void test_nanots::test_nanots_unfinalized_block_with_max_frame_survives() {
     RTF_ASSERT(first == 0x01);
     RTF_ASSERT(last == 0x02);
   }
+}
+
+// Timestamp zero is real data. While a block is live its catalog end is NULL;
+// after finalization the same column may legitimately contain integer zero.
+void test_nanots::test_nanots_timestamp_zero_and_null_open_block() {
+  const char* file_name = "nanots_test_4mb.nts";
+  const std::string db_name = _database_name(file_name);
+
+  nanots_writer db(file_name, false);
+  {
+    auto wctx = db.create_write_context("zero_ts", "zero timestamp");
+    const std::string data = "epoch";
+    db.write(wctx, reinterpret_cast<const uint8_t*>(data.data()), data.size(),
+             0x42, 0);
+
+    nts_sqlite_conn conn(db_name, false, false);
+    auto rows = conn.exec(
+        "SELECT end_timestamp, end_secondary_key FROM segment_blocks sb "
+        "JOIN segments s ON s.id = sb.segment_id "
+        "WHERE s.stream_tag = 'zero_ts';");
+    RTF_ASSERT(rows.size() == 1);
+    RTF_ASSERT(!rows[0]["end_timestamp"].has_value());
+    RTF_ASSERT(!rows[0]["end_secondary_key"].has_value());
+
+    // Both read APIs must understand a live block with a NULL end.
+    nanots_iterator iter(file_name, "zero_ts");
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(iter->timestamp == 0);
+    RTF_ASSERT(iter->flags == 0x42);
+
+    nanots_reader reader(file_name);
+    int count = 0;
+    reader.read("zero_ts", 0, NANOTS_SEC_KEY_UNSET, 0, INT64_MAX,
+                [&](const uint8_t*, size_t, uint32_t, int64_t timestamp,
+                    int64_t, int64_t, const std::string&) {
+                  RTF_ASSERT(timestamp == 0);
+                  count++;
+                });
+    RTF_ASSERT(count == 1);
+    auto tags = reader.query_stream_tags(
+        0, NANOTS_SEC_KEY_UNSET, 0, INT64_MAX);
+    RTF_ASSERT(tags.size() == 1);
+    RTF_ASSERT(tags[0] == "zero_ts");
+    auto segments = reader.query_contiguous_segments(
+        "zero_ts", 0, NANOTS_SEC_KEY_UNSET, 0, INT64_MAX);
+    RTF_ASSERT(segments.size() == 1);
+    RTF_ASSERT(segments[0].start_timestamp == 0);
+    // The public C/C++ result structs retain their historical open-end value;
+    // the catalog and internal C++ state no longer rely on that sentinel.
+    RTF_ASSERT(segments[0].end_timestamp == 0);
+  }
+
+  // Finalization changes NULL to the actual endpoint, which is still zero.
+  {
+    nts_sqlite_conn conn(db_name, false, false);
+    auto rows = conn.exec(
+        "SELECT end_timestamp FROM segment_blocks sb "
+        "JOIN segments s ON s.id = sb.segment_id "
+        "WHERE s.stream_tag = 'zero_ts';");
+    RTF_ASSERT(rows.size() == 1);
+    RTF_ASSERT(rows[0]["end_timestamp"].has_value());
+    RTF_ASSERT(std::stoll(rows[0]["end_timestamp"].value()) == 0);
+  }
+
+  // A finalized zero-timestamp block is deletable; it is no longer confused
+  // with the formerly-zero open-block sentinel.
+  nanots_writer::free_blocks(file_name, "zero_ts", 0,
+                             NANOTS_SEC_KEY_UNSET, 0, INT64_MAX);
+  nanots_iterator after_free(file_name, "zero_ts");
+  RTF_ASSERT(!after_free.valid());
+}
+
+// A v2 catalog cannot distinguish an open block from a finalized block ending
+// at timestamp zero. The v3 migration resolves both from the committed indexes.
+void test_nanots::test_nanots_catalog_v2_to_v3_migration() {
+  const char* file_name = "nanots_test_4mb.nts";
+  const std::string db_name = _database_name(file_name);
+
+  {
+    nanots_writer db(file_name, false);
+    {
+      auto wctx = db.create_write_context("migrate_zero", "v2 zero");
+      const uint8_t value = 0x10;
+      db.write(wctx, &value, 1, 0, 0);
+    }
+    {
+      auto wctx = db.create_write_context("migrate_positive", "v2 open");
+      const uint8_t value = 0x20;
+      db.write(wctx, &value, 1, 0, 4242);
+    }
+  }
+
+  // Recreate the v2 ambiguity for both rows. For migrate_zero this represents
+  // a finalized endpoint of zero; for migrate_positive it represents a block
+  // left open by a crash.
+  {
+    nts_sqlite_conn conn(db_name, true, true);
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+      tx.exec(
+          "UPDATE segment_blocks SET end_timestamp = 0, "
+          "end_secondary_key = 0 WHERE segment_id IN "
+          "(SELECT id FROM segments WHERE stream_tag IN "
+          "('migrate_zero', 'migrate_positive')); ");
+      tx.exec("PRAGMA user_version = 2;");
+    });
+  }
+
+  // Opening any NanoTS writer performs and completes the catalog migration.
+  { nanots_writer migrated(file_name, false); }
+
+  {
+    nts_sqlite_conn conn(db_name, false, false);
+    auto version = conn.exec("PRAGMA user_version;");
+    RTF_ASSERT(version.size() == 1);
+    RTF_ASSERT(std::stoi(version[0].begin()->second.value()) == 3);
+
+    auto rows = conn.exec(
+        "SELECT s.stream_tag, sb.end_timestamp, sb.end_secondary_key "
+        "FROM segment_blocks sb JOIN segments s ON s.id = sb.segment_id "
+        "WHERE s.stream_tag IN ('migrate_zero', 'migrate_positive') "
+        "ORDER BY s.stream_tag;");
+    RTF_ASSERT(rows.size() == 2);
+    for (const auto& row : rows) {
+      RTF_ASSERT(row.at("end_timestamp").has_value());
+      RTF_ASSERT(row.at("end_secondary_key").has_value());
+      const auto& tag = row.at("stream_tag").value();
+      const int64_t end = std::stoll(row.at("end_timestamp").value());
+      if (tag == "migrate_zero")
+        RTF_ASSERT(end == 0);
+      else if (tag == "migrate_positive")
+        RTF_ASSERT(end == 4242);
+      else
+        RTF_ASSERT(false);
+    }
+  }
+
+  // Reader-only applications must also be able to perform the first upgrade.
+  // Downgrade the simulated catalog once more and prove that constructing a
+  // reader migrates and recovers it before issuing any query.
+  {
+    nts_sqlite_conn conn(db_name, true, true);
+    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+      tx.exec(
+          "UPDATE segment_blocks SET end_timestamp = 0, "
+          "end_secondary_key = 0 WHERE segment_id IN "
+          "(SELECT id FROM segments WHERE stream_tag IN "
+          "('migrate_zero', 'migrate_positive')); ");
+      tx.exec("PRAGMA user_version = 2;");
+    });
+  }
+
+  {
+    nanots_reader reader(file_name);
+    int count = 0;
+    reader.read("migrate_positive", 4242, NANOTS_SEC_KEY_UNSET,
+                4242, INT64_MAX,
+                [&](const uint8_t*, size_t, uint32_t, int64_t timestamp,
+                    int64_t, int64_t, const std::string&) {
+                  RTF_ASSERT(timestamp == 4242);
+                  count++;
+                });
+    RTF_ASSERT(count == 1);
+  }
+
+  {
+    nts_sqlite_conn conn(db_name, false, false);
+    auto version = conn.exec("PRAGMA user_version;");
+    RTF_ASSERT(std::stoi(version[0].begin()->second.value()) == 3);
+    auto open_rows = conn.exec(
+        "SELECT 1 FROM segment_blocks WHERE end_timestamp IS NULL;");
+    RTF_ASSERT(open_rows.empty());
+  }
+
+  nanots_iterator zero(file_name, "migrate_zero");
+  RTF_ASSERT(zero.valid());
+  RTF_ASSERT(zero->timestamp == 0);
+  nanots_iterator positive(file_name, "migrate_positive");
+  RTF_ASSERT(positive.valid());
+  RTF_ASSERT(positive->timestamp == 4242);
 }

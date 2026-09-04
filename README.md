@@ -60,6 +60,12 @@ so adding new capabilities should not require breaking the format again.
 v2 build — there is no migration tool. Migrate by re-writing data into a
 freshly-allocated v2 file.
 
+The companion SQLite catalog is versioned independently. The current catalog
+schema is **v3**. Opening a v2 catalog automatically migrates it to v3 by
+replacing the ambiguous `end_timestamp = 0` open-block marker with SQL `NULL`
+and recovering each affected block's actual end timestamp from its committed
+on-disk frame index. The binary `.nts` format remains v2.
+
 ### Durability Guarantees
 
 - **Frame-level atomicity**: Individual frames are written atomically

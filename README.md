@@ -196,6 +196,10 @@ volume up front.
 Growable mode can be combined with `auto_reclaim`: grow until the cap (or
 disk-full) is reached, then start recycling the oldest blocks.
 
+'auto_reclaim' can also be used with preallocated storage files. In this use
+writes won't fail because of a lack of free space, BUT you will eventually
+overwrite your oldest data.
+
 Internally, growable files are marked by `n_blocks == 0` in the file header.
 Existing preallocated files are unaffected and continue to open as before.
 

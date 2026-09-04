@@ -8,7 +8,21 @@
       "Bash(grep -E \"\\\\.\\(c|cpp|so|pyd|o\\)$\")",
       "PowerShell(cmake --build c:/dev/nanots/build --config Debug 2>&1)",
       "Bash(./nanots_ut.exe)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "WebSearch",
+      "Bash(gh pr *)",
+      "Bash(git remote *)",
+      "Bash(git fetch *)",
+      "Bash(git checkout *)",
+      "Bash(ls -d build 2>/dev/null; find . -maxdepth 2 -name \"*.sln\" -o -maxdepth 2 -name \"CMakeCache.txt\" 2>/dev/null | head; echo \"---cl---\"; ls \"/c/Program Files \\(x86\\)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe\" 2>/dev/null && echo \"cl found\")",
+      "Read(//c/Program Files \\(x86\\)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/**)",
+      "PowerShell(cmake --build build --config Debug --target nanots_static 2>&1)",
+      "PowerShell(cmake --build build --config Debug 2>&1)",
+      "PowerShell(& \"C:\\\\dev\\\\nanots\\\\build\\\\ut\\\\Debug\\\\nanots_ut.exe\" 2>&1)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(git clean *)"
     ]
   }
 }

@@ -21,6 +21,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_sparse_timestamp_seeking);
   TEST(test_nanots::test_nanots_write_context_lifecycle);
   TEST(test_nanots::test_nanots_multiple_streams_separate_writers);
+  TEST(test_nanots::test_nanots_concurrent_writers_claim_distinct_blocks);
   TEST(test_nanots::test_nanots_invalid_multiple_writers_same_stream);
   TEST(test_nanots::test_nanots_multiple_segments_same_stream);
   TEST(test_nanots::test_nanots_iterator_edge_navigation);
@@ -78,6 +79,7 @@ class test_nanots : public test_fixture {
   void test_nanots_sparse_timestamp_seeking();
   void test_nanots_write_context_lifecycle();
   void test_nanots_multiple_streams_separate_writers();
+  void test_nanots_concurrent_writers_claim_distinct_blocks();
   void test_nanots_invalid_multiple_writers_same_stream();
   void test_nanots_multiple_segments_same_stream();
   void test_nanots_iterator_edge_navigation();

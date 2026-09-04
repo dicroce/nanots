@@ -875,9 +875,8 @@ int nts_memory_map::_GetPosixAdvice(int advice) const {
 #endif
 
 void generate_entropy_id(uint8_t* id) {
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  static std::uniform_int_distribution<unsigned int> dis(0, 255);
+  thread_local std::mt19937 gen(std::random_device{}());
+  std::uniform_int_distribution<unsigned int> dis(0, 255);
 
   // Generate 16 random bytes (128 bits of entropy)
   for (int i = 0; i < 16; i++)

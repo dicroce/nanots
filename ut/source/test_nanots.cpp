@@ -1,6 +1,10 @@
 #include "test_nanots.h"
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <set>
+#include <thread>
+#include <vector>
 #include <inttypes.h>
 #include "nanots.h"
 
@@ -23,7 +27,8 @@ static void _whack_files() {
     rtf_remove_file("nanots_test_2048_4k_blocks.nts");
 
   for (const char* name :
-       {"nanots_growable_basic", "nanots_growable_doubling", "nanots_growable_cap"}) {
+       {"nanots_growable_basic", "nanots_growable_doubling", "nanots_growable_cap",
+        "nanots_growable_concurrent"}) {
     std::string nts = std::string(name) + ".nts";
     std::string db  = std::string(name) + ".db";
     std::string shm = db + "-shm";
@@ -1008,6 +1013,81 @@ void test_nanots::test_nanots_multiple_streams_separate_writers() {
   verify_stream("video_stream", "video", 0x01);
   verify_stream("audio_stream", "audio", 0x02);
   verify_stream("data_stream", "sensor", 0x03);
+}
+
+void test_nanots::test_nanots_concurrent_writers_claim_distinct_blocks() {
+  constexpr int writer_count = 16;
+
+  auto run_concurrent_claims = [&](const std::string& path) {
+    // Use separate writer instances to exercise SQLite's cross-connection
+    // allocator. Every writer targets a distinct stream, as supported by the
+    // public threading contract.
+    std::vector<std::unique_ptr<nanots_writer>> writers;
+    std::vector<std::unique_ptr<write_context>> contexts;
+    writers.reserve(writer_count);
+    contexts.reserve(writer_count);
+
+    for (int i = 0; i < writer_count; ++i) {
+      writers.emplace_back(std::make_unique<nanots_writer>(path, false));
+      contexts.emplace_back(std::make_unique<write_context>(
+          writers.back()->create_write_context(
+              "concurrent_writer_" + std::to_string(i), "concurrent claim")));
+    }
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    // Each thread owns one distinct element; avoid vector<bool>'s shared packed
+    // storage, which would itself introduce a test-only data race.
+    std::vector<int> write_succeeded(writer_count, 0);
+    threads.reserve(writer_count);
+
+    for (int i = 0; i < writer_count; ++i) {
+      threads.emplace_back([&, i]() {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire))
+          std::this_thread::yield();
+
+        try {
+          std::string payload = "writer_payload_" + std::to_string(i);
+          writers[i]->write(*contexts[i],
+                            reinterpret_cast<const uint8_t*>(payload.data()),
+                            payload.size(), 0, 1000 + i);
+          write_succeeded[i] = 1;
+        } catch (...) {
+          write_succeeded[i] = 0;
+        }
+      });
+    }
+
+    while (ready.load(std::memory_order_acquire) != writer_count)
+      std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+
+    for (auto& thread : threads)
+      thread.join();
+
+    for (int i = 0; i < writer_count; ++i)
+      RTF_ASSERT(write_succeeded[i]);
+
+    // Finalize every block before opening readers.
+    contexts.clear();
+    writers.clear();
+
+    for (int i = 0; i < writer_count; ++i) {
+      nanots_iterator iter(path, "concurrent_writer_" + std::to_string(i));
+      RTF_ASSERT(iter.valid());
+      std::string expected = "writer_payload_" + std::to_string(i);
+      std::string actual(reinterpret_cast<const char*>(iter->data), iter->size);
+      RTF_ASSERT(actual == expected);
+    }
+  };
+
+  // Cover both the free-list claim and the COUNT+grow+INSERT path.
+  run_concurrent_claims("nanots_test_16mb.nts");
+  nanots_writer::allocate_growable("nanots_growable_concurrent.nts", 65536,
+                                   writer_count);
+  run_concurrent_claims("nanots_growable_concurrent.nts");
 }
 
 void test_nanots::test_nanots_invalid_multiple_writers_same_stream() {

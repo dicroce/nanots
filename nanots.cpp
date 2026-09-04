@@ -832,17 +832,19 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
     }
   }
 
-  // 2. Try a truly free block.
-  if (auto b = _db_get_free_block(conn)) {
-    return *b;
-  }
-
-  // 3. Growable: extend the file.
-  if (is_growable()) {
-    if (auto b = _grow_blocks(conn)) {
-      return *b;
-    }
-  }
+  // 2. Claim a truly free block, or grow the file, while holding SQLite's
+  // write lock. The SELECT+UPDATE in _db_get_free_block and the
+  // COUNT+extend+INSERT sequence in _grow_blocks must be one serialized
+  // catalog operation; otherwise two writer instances can select the same
+  // physical block (or both grow starting at the same block index).
+  std::optional<block> available;
+  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+    available = _db_get_free_block(tx);
+    if (!available && is_growable())
+      available = _grow_blocks(tx);
+  });
+  if (available)
+    return *available;
 
   // 4. Auto-reclaim: retire blocks into limbo and consume from ready.
   if (_auto_reclaim) {
@@ -859,8 +861,12 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
         }
       }
 
-      // Retire one block (SQL: delete its segment_block, mark reserved).
-      auto victim = _db_reclaim_oldest_used_block(conn);
+      // Retire one block atomically. Multiple auto-reclaiming writers must not
+      // select and retire the same segment_block concurrently.
+      std::optional<block> victim;
+      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+        victim = _db_reclaim_oldest_used_block(tx);
+      });
       if (!victim) {
         // Nothing finalized to retire (either no blocks at all, or every
         // remaining block is still being actively written). Fall through
@@ -940,9 +946,9 @@ void nanots_writer::write(write_context& wctx,
 
     // Acquire a physical block under EBR. The returned block is always safe
     // to overwrite: it is either a freshly-free block, a newly-grown block,
-    // or a retired block that has cleared EBR safety. Block acquisition
-    // happens outside the transaction below because retiring may need
-    // multiple sub-transactions and yields while waiting on readers.
+    // or a retired block that has cleared EBR safety. Acquisition uses short
+    // internal IMMEDIATE transactions to serialize each catalog claim; it
+    // does not hold a SQLite transaction while waiting on readers.
     block phys = _acquire_writable_block(conn);
 
     nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {

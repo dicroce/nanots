@@ -937,6 +937,9 @@ void s_to_entropy_id(const std::string& idS, uint8_t* id) {
 /* NANOTS */
 
 
+#include <cctype>
+#include <filesystem>
+
 std::mutex current_stream_tags_lok;
 std::set<std::string> current_stream_tags;
 
@@ -963,6 +966,28 @@ int64_t _now_us() {
 // last writer and iterator on a file are destroyed.
 std::mutex                                                    g_registry_table_mu;
 std::map<std::string, std::weak_ptr<nanots_epoch_registry>>   g_registry_table;
+
+std::string _registry_key(const std::string& file_path) {
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  fs::path normalized = fs::weakly_canonical(fs::path(file_path), ec);
+  if (ec) {
+    ec.clear();
+    normalized = fs::absolute(fs::path(file_path), ec);
+    if (ec) normalized = fs::path(file_path);
+  }
+
+  std::string key = normalized.lexically_normal().generic_string();
+#ifdef _WIN32
+  // Windows paths are case-insensitive. weakly_canonical() normalizes aliases
+  // and dot components, but it does not promise a canonical letter case.
+  std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+#endif
+  return key;
+}
 
 }  // namespace
 
@@ -1001,16 +1026,12 @@ void nanots_epoch_registry::release_slot(uint32_t id) {
 
 bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
                                         int64_t  now_us) const {
+  (void)now_us;  // retained API parameter; elapsed time is not proof of safety
   std::lock_guard<std::mutex> g(_slots_mu);
   for (const auto& slot_ptr : _slots) {
     uint64_t e = slot_ptr->epoch.load(std::memory_order_acquire);
     if (e == INACTIVE) continue;
     if (e > retired_epoch) continue;
-
-    // Slot is at-or-before the retire. Check liveness via heartbeat.
-    int64_t hb = slot_ptr->heartbeat_us.load(std::memory_order_relaxed);
-    if (now_us - hb > NANOTS_HEARTBEAT_TIMEOUT_US) continue;  // dead, ignore
-
     return false;  // active reader still pinning this retire
   }
   return true;
@@ -1018,16 +1039,17 @@ bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
 
 std::shared_ptr<nanots_epoch_registry>
 nanots_epoch_registry::get_or_create(const std::string& file_path) {
+  const std::string key = _registry_key(file_path);
   std::lock_guard<std::mutex> g(g_registry_table_mu);
 
-  auto it = g_registry_table.find(file_path);
+  auto it = g_registry_table.find(key);
   if (it != g_registry_table.end()) {
     if (auto sp = it->second.lock()) return sp;
     // weak_ptr expired; fall through and create a new one.
   }
 
   auto sp = std::make_shared<nanots_epoch_registry>();
-  g_registry_table[file_path] = sp;
+  g_registry_table[key] = sp;
   return sp;
 }
 
@@ -1040,7 +1062,7 @@ nanots_slot_guard::nanots_slot_guard(
     : _registry(std::move(registry)) {
   if (_registry) {
     _slot_id = _registry->acquire_slot();
-    op_begin();  // publish initial epoch + heartbeat
+    op_begin();  // publish initial epoch + diagnostic heartbeat
   }
 }
 
@@ -1559,13 +1581,12 @@ static void _db_trans_finalize_reserved_blocks(const nts_sqlite_conn& conn) {
   //          again and it is never 'free' to hand out. That is the wedge bug
   //          (NANOTS_EC_NO_FREE_BLOCKS) this code path used to cause.
   //        - Flipping it to 'free' is unsafe: the victim may still be pinned by
-  //          a live reader. EBR treats a reader as live for up to
-  //          NANOTS_HEARTBEAT_TIMEOUT_US (60s) — far longer than this 10s grace
-  //          window — and a reader that pinned the block before its
-  //          segment_block was deleted is still dereferencing its bytes. A
-  //          later _db_get_free_block() would then hand the block to a writer
-  //          that overwrites it under the reader, breaking the core
-  //          reads-disconnected-from-writes guarantee.
+  //          a live reader. EBR keeps a reader pinned until its iterator or
+  //          reader operation releases the slot; a reader that pinned the
+  //          block before its segment_block was deleted may still be
+  //          dereferencing its bytes. A later _db_get_free_block() would then
+  //          hand the block to a writer that overwrites it under the reader,
+  //          breaking the core reads-disconnected-from-writes guarantee.
   //
   //   Reclaim victims are recycled the safe way instead: while the process
   //   lives, _scan_limbo() promotes a victim to the ready list only once

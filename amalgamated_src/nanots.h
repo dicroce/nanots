@@ -538,7 +538,7 @@ struct segment_block {
 // the writer defers byte-overwriting reclaim of a block until no reader's slot
 // can still be holding pointers into that block's bytes.
 //
-// Hot-path cost: one atomic load + one atomic store per iterator operation;
+// Hot-path cost: one atomic load + two atomic stores per iterator operation;
 // one atomic increment per writer retire.
 //
 // Within a single process only. Cross-process readers are not protected.
@@ -561,9 +561,10 @@ public:
       return _global_epoch.fetch_add(1, std::memory_order_release);
     }
 
-    // Returns true if no active slot's epoch is <= retired_epoch. Slots whose
-    // heartbeat is older than NANOTS_HEARTBEAT_TIMEOUT_US are treated as dead
-    // and ignored.
+    // Returns true if no active slot's epoch is <= retired_epoch. An active
+    // slot remains pinned until its owner explicitly releases it; elapsed time
+    // cannot prove that mapped frame data is no longer in use. now_us is kept
+    // in the signature for source and binary compatibility and is ignored.
     bool can_recycle(uint64_t retired_epoch, int64_t now_us) const;
 
     // Accessor for slot_guard.
@@ -573,8 +574,8 @@ public:
     uint32_t acquire_slot();
     void release_slot(uint32_t id);
 
-    // Path-keyed singleton accessor. Same path string returns the same registry
-    // for the lifetime of any caller holding the shared_ptr.
+    // Path-keyed singleton accessor. Equivalent paths to the same file return
+    // the same registry for the lifetime of any caller holding the shared_ptr.
     static std::shared_ptr<nanots_epoch_registry> get_or_create(
         const std::string& file_path
     );
@@ -585,8 +586,8 @@ private:
     std::vector<std::unique_ptr<Slot>> _slots;
 };
 
-// Heartbeat timeout: a slot whose last heartbeat is older than this is
-// treated as dead by can_recycle().
+// Retained for source compatibility. Heartbeat age is diagnostic only and is
+// never used to infer that an active reader is safe to ignore.
 constexpr int64_t NANOTS_HEARTBEAT_TIMEOUT_US = 60LL * 1000 * 1000;  // 60s
 
 // ---------------------------------------------------------------------------
@@ -594,8 +595,8 @@ constexpr int64_t NANOTS_HEARTBEAT_TIMEOUT_US = 60LL * 1000 * 1000;  // 60s
 // ---------------------------------------------------------------------------
 //
 // On construction: acquires a slot from the registry and publishes the current
-// global_epoch + heartbeat. On destruction: sets the slot to INACTIVE and
-// releases it. Pairing the acquire and the release in one object means an
+// global_epoch + a diagnostic heartbeat. On destruction: sets the slot to
+// INACTIVE and releases it. Pairing the acquire and the release in one object means an
 // exception thrown anywhere in iterator construction or operation still leaves
 // the slot in a clean state.
 //
@@ -612,7 +613,7 @@ public:
     nanots_slot_guard(nanots_slot_guard&& other) noexcept;
     nanots_slot_guard& operator=(nanots_slot_guard&& other) noexcept;
 
-    // Publishes the latest global_epoch to our slot and updates the heartbeat.
+    // Publishes the latest global_epoch and updates the diagnostic heartbeat.
     // Call at the start of every iterator operation. No-op if !active().
     void op_begin();
 
@@ -631,7 +632,7 @@ private:
 // ---------------------------------------------------------------------------
 //
 // Stack-only RAII wrapper that marks the start of one iterator operation.
-// Construction publishes the current global_epoch + heartbeat to the slot;
+// Construction publishes the current global_epoch + diagnostic heartbeat;
 // destruction is intentionally a no-op (the slot retains the published epoch
 // until the next op or the iterator is destroyed — that's what protects the
 // Frame::data validity contract). The point of this type is to make "this
@@ -1017,7 +1018,7 @@ class NANOTS_API nanots_iterator {
 
     // EBR slot. Acquired on construction, released on destruction. Each
     // navigation operation (find, ++, --, reset, seek_end) calls op_begin()
-    // to publish the current global epoch + heartbeat. This is what permits
+    // to publish the current global epoch + diagnostic heartbeat. This permits
     // the writer to know it's safe to physically recycle a block.
     nanots_slot_guard _slot_guard;
 };

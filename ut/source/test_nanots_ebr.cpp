@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 #include <vector>
 
@@ -151,14 +152,14 @@ void test_nanots_ebr::test_inactive_slot_does_not_pin() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: a slot whose heartbeat is stale is treated as dead.
+// Test: an idle iterator remains pinned until it is destroyed.
 // ---------------------------------------------------------------------------
 //
-// Simulates a reader that "died" — its slot still has a non-INACTIVE epoch
-// but its heartbeat is far in the past. The writer's reclaim should treat
-// this slot as dead and proceed.
+// Frame::data points directly into the mapped block and remains valid between
+// iterator operations. Time passing therefore cannot safely make the slot
+// reclaimable; only releasing the iterator can do that.
 //
-void test_nanots_ebr::test_dead_heartbeat_does_not_pin() {
+void test_nanots_ebr::test_stale_heartbeat_still_pins() {
   // Write a few frames so the iterator can find something.
   {
     nanots_writer writer(EBR_FILE, false);
@@ -179,14 +180,28 @@ void test_nanots_ebr::test_dead_heartbeat_does_not_pin() {
   // Sanity: live iterator pins this retire.
   RTF_ASSERT(registry->can_recycle(retire_epoch, _now_us_test()) == false);
 
-  // Now forcibly age the iterator's heartbeat far past the timeout.
-  // (Public API: we walk slots from index 0; the iterator owns the first one.)
+  // Simulate more than 60 seconds without an iterator operation.
+  // The iterator still owns its slot and may still expose mapped frame data.
   registry->slot(0).heartbeat_us.store(0, std::memory_order_relaxed);
 
-  // can_recycle treats now-vs-heartbeat as the liveness signal. now_us is
-  // huge (microseconds since steady_clock epoch); heartbeat is 0; diff is
-  // way past timeout. Slot should be ignored.
-  RTF_ASSERT(registry->can_recycle(retire_epoch, _now_us_test()) == true);
+  RTF_ASSERT(registry->can_recycle(retire_epoch, _now_us_test()) == false);
+}
+
+// ---------------------------------------------------------------------------
+// Test: equivalent path spellings share one in-process EBR registry.
+// ---------------------------------------------------------------------------
+//
+// A writer opened with an absolute path and an iterator opened with a relative
+// path still access the same physical file, so they must see the same reader
+// slots. Otherwise reclamation through one spelling can overwrite memory held
+// by a reader opened through the other.
+//
+void test_nanots_ebr::test_equivalent_paths_share_registry() {
+  auto relative = nanots_epoch_registry::get_or_create(EBR_FILE);
+  auto absolute = nanots_epoch_registry::get_or_create(
+      std::filesystem::absolute(EBR_FILE).string());
+
+  RTF_ASSERT(relative.get() == absolute.get());
 }
 
 // ---------------------------------------------------------------------------

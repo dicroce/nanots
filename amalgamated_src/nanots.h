@@ -970,6 +970,7 @@ class NANOTS_API nanots_iterator {
     bool _ts_index_relocate();
 
     bool _load_block_data(block_info& block);
+    bool _refresh_committed_index_count(block_info& block);
     bool _load_current_frame();
     void _select_block(const block_info& block, size_t frame_idx);
 

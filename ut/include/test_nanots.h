@@ -7,6 +7,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_basic);
   TEST(test_nanots::test_nanots_iterator_find);
   TEST(test_nanots::test_nanots_iterator_reseek_after_block_transition);
+  TEST(test_nanots::test_nanots_iterator_sees_appends_in_loaded_block);
   TEST(test_nanots::test_nanots_multiple_streams);
   TEST(test_nanots::test_nanots_reader_time_range);
   TEST(test_nanots::test_nanots_iterator_bidirectional);
@@ -67,6 +68,7 @@ class test_nanots : public test_fixture {
   void test_nanots_basic();
   void test_nanots_iterator_find();
   void test_nanots_iterator_reseek_after_block_transition();
+  void test_nanots_iterator_sees_appends_in_loaded_block();
   void test_nanots_basic_read();
   void test_nanots_multiple_streams();
   void test_nanots_reader_time_range();

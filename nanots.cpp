@@ -176,6 +176,24 @@ static bool _validate_frame_header(const uint8_t* frame_p,
   return true;
 }
 
+// The writer publishes an index entry by incrementing this counter only after
+// its frame and index bytes are complete. Readers use an acquire load so
+// observing the new count also makes those preceding writes visible.
+static uint32_t _load_committed_index_count(uint32_t* valid_counter) {
+#ifdef _WIN32
+  // The mapping may be read-only, so an interlocked read-modify-write (even
+  // one that stores the same value) is not permitted. Aligned 32-bit reads
+  // are atomic on supported Windows targets; the full barrier supplies the
+  // acquire ordering paired with the writer's interlocked increment.
+  uint32_t observed =
+      *reinterpret_cast<volatile uint32_t*>(valid_counter);
+  MemoryBarrier();
+  return observed;
+#else
+  return __atomic_load_n(valid_counter, std::memory_order_acquire);
+#endif
+}
+
 static std::string _database_name(const std::string& file_name) {
   return file_name.substr(0, file_name.find(".nts")) + ".db";
 }
@@ -293,12 +311,8 @@ static void _validate_blocks(const std::string& file_name) {
 
       auto valid_counter = (uint32_t*)(block_p + 8);
 
-      #ifdef _WIN32
-          uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
-          _ReadWriteBarrier(); // compiler barrier (not mem)
-      #else
-          uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
-      #endif
+      uint32_t n_valid_indexes =
+          _load_committed_index_count(valid_counter);
 
       if((n_valid_indexes * INDEX_ENTRY_SIZE) >= (block_size / 2) || n_valid_indexes == 0) {
         _free_block(conn, sb_id, block_id);
@@ -1399,12 +1413,8 @@ void nanots_reader::read(
 
     auto valid_counter = (uint32_t*)(block_p + 8);
 
-#ifdef _WIN32
-    uint32_t n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
-    _ReadWriteBarrier(); // compiler barrier (not mem)
-#else
-    uint32_t n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
-#endif
+    uint32_t n_valid_indexes =
+        _load_committed_index_count(valid_counter);
 
     uint8_t* index_start = block_p + BLOCK_HEADER_SIZE;
     uint8_t* index_end = index_start + (n_valid_indexes * INDEX_ENTRY_SIZE);
@@ -1890,19 +1900,28 @@ bool nanots_iterator::_load_block_data(block_info& block) {
 
   block.block_p = (uint8_t*)block.mm.map();
 
-  auto valid_counter = (uint32_t*)(block.block_p + 8);
-
-#ifdef _WIN32
-    block.n_valid_indexes = *reinterpret_cast<volatile uint32_t*>(valid_counter);
-    _ReadWriteBarrier(); // compiler barrier (not mem)
-#else
-    block.n_valid_indexes = __atomic_load_n(valid_counter, std::memory_order_acquire);
-#endif
-
   // Convert UUID std::string to bytes
   s_to_entropy_id(block.uuid_hex, block.uuid);
 
   block.is_loaded = true;
+  return _refresh_committed_index_count(block);
+}
+
+bool nanots_iterator::_refresh_committed_index_count(block_info& block) {
+  if (!block.is_loaded || !block.block_p)
+    return false;
+
+  auto* valid_counter = reinterpret_cast<uint32_t*>(block.block_p + 8);
+  uint32_t observed = _load_committed_index_count(valid_counter);
+  uint64_t max_indexes =
+      (_block_size - BLOCK_HEADER_SIZE) / INDEX_ENTRY_SIZE;
+
+  // A live block's committed prefix can only grow. A decrease means the
+  // physical block was recycled unexpectedly; an oversized count is corrupt.
+  if (observed < block.n_valid_indexes || observed > max_indexes)
+    return false;
+
+  block.n_valid_indexes = observed;
   return true;
 }
 
@@ -1975,7 +1994,17 @@ nanots_iterator& nanots_iterator::operator++() {
 
   _current_frame_idx++;
 
-  // If we've gone past the end of current block, move to next block
+  // The mapped block is live. Only pay for a synchronized counter read when
+  // advancing would leave the committed prefix we previously observed.
+  if (_current_frame_idx >= current_block->n_valid_indexes &&
+      !current_block->end_timestamp.has_value()) {
+    if (!_refresh_committed_index_count(*current_block)) {
+      _valid = false;
+      return *this;
+    }
+  }
+
+  // If the refreshed count still has no next frame, move to the next block.
   if (_current_frame_idx >= current_block->n_valid_indexes) {
     auto* next_block = _get_next_block();
     if (!next_block) {
@@ -2052,17 +2081,33 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
 
   _select_block(*block, 0);
 
-  // Composite lower_bound within the block.
-  uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
-  uint8_t* index_end =
-      index_start + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
-
   int64_t target[2] = {timestamp, secondary_key};
-  uint8_t* found_entry =
-      lower_bound_bytes(index_start, index_end, (uint8_t*)target,
-                        INDEX_ENTRY_SIZE, _compare_index_entry_composite);
+  auto find_in_committed_prefix = [&]() {
+    uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
+    uint8_t* index_end =
+        index_start + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
+    uint8_t* found_entry =
+        lower_bound_bytes(index_start, index_end, (uint8_t*)target,
+                          INDEX_ENTRY_SIZE, _compare_index_entry_composite);
+    _current_frame_idx =
+        (found_entry - index_start) / INDEX_ENTRY_SIZE;
+  };
 
-  _current_frame_idx = (found_entry - index_start) / INDEX_ENTRY_SIZE;
+  find_in_committed_prefix();
+
+  // A miss at the cached end of an open block may simply mean the writer
+  // appended since we last observed its committed count. Refresh on demand
+  // and repeat the binary search only if the prefix grew.
+  if (_current_frame_idx >= block->n_valid_indexes &&
+      !block->end_timestamp.has_value()) {
+    uint32_t cached_count = block->n_valid_indexes;
+    if (!_refresh_committed_index_count(*block)) {
+      _valid = false;
+      return false;
+    }
+    if (block->n_valid_indexes > cached_count)
+      find_in_committed_prefix();
+  }
 
   // If we didn't find it in this block, try next block
   if (_current_frame_idx >= block->n_valid_indexes) {
@@ -2092,6 +2137,9 @@ void nanots_iterator::reset() {
 
 bool nanots_iterator::seek_end() {
   nanots_op_scope _op(_slot_guard);
+  // A writer may have rolled the live tail into a block created after this
+  // iterator cached the stream's block list.
+  _refresh_ts_index();
   auto* block = _get_last_block();
   if (!block) {
     _valid = false;
@@ -2099,6 +2147,17 @@ bool nanots_iterator::seek_end() {
   }
 
   if (!_load_block_data(*block)) {
+    _valid = false;
+    return false;
+  }
+
+  if (!block->end_timestamp.has_value() &&
+      !_refresh_committed_index_count(*block)) {
+    _valid = false;
+    return false;
+  }
+
+  if (block->n_valid_indexes == 0) {
     _valid = false;
     return false;
   }

@@ -214,6 +214,70 @@ void test_nanots::test_nanots_iterator_reseek_after_block_transition() {
   RTF_ASSERT(composite_iter->block_sequence == composite_first_block);
 }
 
+// A mapped block is live. An iterator must refresh the block's committed
+// index count when an operation reaches the end of its cached prefix.
+void test_nanots::test_nanots_iterator_sees_appends_in_loaded_block() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+  auto wctx = db.create_write_context("live_tail", "");
+
+  const std::string first = "first";
+  db.write(wctx, reinterpret_cast<const uint8_t*>(first.data()), first.size(),
+           1, 100);
+
+  nanots_iterator iter("nanots_test_4mb.nts", "live_tail");
+  RTF_ASSERT(iter.find(100));
+  RTF_ASSERT(iter->timestamp == 100);
+
+  const int64_t block_sequence = iter->block_sequence;
+  const std::string second = "second";
+  db.write(wctx, reinterpret_cast<const uint8_t*>(second.data()), second.size(),
+           2, 200);
+
+  // find() must extend its binary-search range past the one-entry prefix the
+  // iterator observed when it first mapped this block.
+  RTF_ASSERT(iter.find(200));
+  RTF_ASSERT(iter->timestamp == 200);
+  RTF_ASSERT(iter->block_sequence == block_sequence);
+
+  const std::string third = "third";
+  db.write(wctx, reinterpret_cast<const uint8_t*>(third.data()), third.size(),
+           3, 300);
+
+  // seek_end() must use the current committed count, not the cached count.
+  RTF_ASSERT(iter.seek_end());
+  RTF_ASSERT(iter->timestamp == 300);
+  RTF_ASSERT(iter->block_sequence == block_sequence);
+
+  const std::string fourth = "fourth";
+  db.write(wctx, reinterpret_cast<const uint8_t*>(fourth.data()), fourth.size(),
+           4, 400);
+
+  // Advancing from the formerly-known tail must discover the new entry in
+  // the same block instead of looking for a next block and becoming invalid.
+  ++iter;
+  RTF_ASSERT(iter.valid());
+  RTF_ASSERT(iter->timestamp == 400);
+  RTF_ASSERT(iter->block_sequence == block_sequence);
+
+  // seek_end() must also notice that the live tail rolled into a block that
+  // did not exist in the iterator's cached block list.
+  nanots_writer rolling_db("nanots_test_2048_4k_blocks.nts", false);
+  auto rolling_ctx = rolling_db.create_write_context("live_tail_rollover", "");
+  std::vector<uint8_t> row(16 * 1024, 0x6B);
+  rolling_db.write(rolling_ctx, row.data(), row.size(), 0, 1000);
+
+  nanots_iterator rolling_iter(
+      "nanots_test_2048_4k_blocks.nts", "live_tail_rollover");
+  const int64_t rolling_first_block = rolling_iter->block_sequence;
+  for (int i = 1; i < 12; ++i)
+    rolling_db.write(rolling_ctx, row.data(), row.size(),
+                     static_cast<uint32_t>(i), 1000 + i);
+
+  RTF_ASSERT(rolling_iter.seek_end());
+  RTF_ASSERT(rolling_iter->timestamp == 1011);
+  RTF_ASSERT(rolling_iter->block_sequence != rolling_first_block);
+}
+
 void test_nanots::test_nanots_multiple_streams() {
   nanots_writer db("nanots_test_4mb.nts", false);
 

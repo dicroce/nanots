@@ -601,6 +601,7 @@ class NANOTS_API nanots_iterator {
 
     bool _load_block_data(block_info& block);
     bool _load_current_frame();
+    void _select_block(const block_info& block, size_t frame_idx);
 
     std::string _file_name;
     std::string _stream_tag;
@@ -613,6 +614,8 @@ class NANOTS_API nanots_iterator {
     size_t _current_frame_idx;
     int64_t _current_block_start_ts;
     std::optional<int64_t> _current_block_end_ts;
+    int64_t _current_block_start_sk;
+    std::optional<int64_t> _current_block_end_sk;
 
     // Cache of visited blocks (segment_id:sequence -> block_info)
     // Using string key for simplicity: "segment_id:sequence"

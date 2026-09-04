@@ -150,6 +150,70 @@ void test_nanots::test_nanots_iterator_find() {
   RTF_ASSERT(!iter.valid());
 }
 
+// find() caches the range of the block it selects. Walking into another block
+// must update that range; otherwise a later seek into the old range takes the
+// fast path but searches the iterator's new physical block.
+void test_nanots::test_nanots_iterator_reseek_after_block_transition() {
+  nanots_writer db("nanots_test_2048_4k_blocks.nts", false);
+
+  constexpr int N = 12;
+  {
+    auto wctx = db.create_write_context("reseek", "");
+    // allocate() rounds this fixture's requested 4 KiB blocks to NanoTS's
+    // 64 KiB minimum. A 16 KiB payload guarantees several transitions.
+    std::vector<uint8_t> row(16 * 1024, 0x5A);
+    for (int i = 0; i < N; ++i) {
+      db.write(wctx, row.data(), row.size(), static_cast<uint32_t>(i),
+               1000 + (i * 10), 500 + i);
+    }
+  }
+
+  nanots_iterator iter("nanots_test_2048_4k_blocks.nts", "reseek");
+  RTF_ASSERT(iter.find(1000, 500));
+  RTF_ASSERT(iter->timestamp == 1000);
+  RTF_ASSERT(iter->secondary_key == 500);
+
+  const int64_t first_block = iter->block_sequence;
+  while (iter.valid() && iter->block_sequence == first_block)
+    ++iter;
+
+  RTF_ASSERT(iter.valid());
+  RTF_ASSERT(iter->block_sequence != first_block);
+
+  // This used to search the current (second) block using the stale cached
+  // range of the first block, returning the second block's first frame.
+  RTF_ASSERT(iter.find(1000, 500));
+  RTF_ASSERT(iter->timestamp == 1000);
+  RTF_ASSERT(iter->secondary_key == 500);
+  RTF_ASSERT(iter->block_sequence == first_block);
+
+  // Exercise the other half of the fast-path bug: adjacent blocks can share
+  // a timestamp when secondary keys provide the ordering. Updating only the
+  // cached timestamps would still search the wrong block here.
+  {
+    auto wctx = db.create_write_context("reseek_composite", "");
+    std::vector<uint8_t> row(16 * 1024, 0xA5);
+    for (int i = 0; i < N; ++i)
+      db.write(wctx, row.data(), row.size(), static_cast<uint32_t>(i),
+               2000, i);
+  }
+
+  nanots_iterator composite_iter(
+      "nanots_test_2048_4k_blocks.nts", "reseek_composite");
+  RTF_ASSERT(composite_iter.find(2000, 0));
+  const int64_t composite_first_block = composite_iter->block_sequence;
+  while (composite_iter.valid() &&
+         composite_iter->block_sequence == composite_first_block)
+    ++composite_iter;
+
+  RTF_ASSERT(composite_iter.valid());
+  RTF_ASSERT(composite_iter->block_sequence != composite_first_block);
+  RTF_ASSERT(composite_iter.find(2000, 0));
+  RTF_ASSERT(composite_iter->timestamp == 2000);
+  RTF_ASSERT(composite_iter->secondary_key == 0);
+  RTF_ASSERT(composite_iter->block_sequence == composite_first_block);
+}
+
 void test_nanots::test_nanots_multiple_streams() {
   nanots_writer db("nanots_test_4mb.nts", false);
 

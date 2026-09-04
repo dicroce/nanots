@@ -2516,6 +2516,8 @@ nanots_iterator::nanots_iterator(const std::string& file_name,
       _current_frame_idx(0),
       _current_block_start_ts(0),
       _current_block_end_ts(std::nullopt),
+      _current_block_start_sk(NANOTS_SEC_KEY_UNSET),
+      _current_block_end_sk(std::nullopt),
       _valid(false),
       _initialized(false),
       _slot_guard(nanots_epoch_registry::get_or_create(file_name)) {
@@ -2883,6 +2885,17 @@ bool nanots_iterator::_load_current_frame() {
   return true;
 }
 
+void nanots_iterator::_select_block(const block_info& block,
+                                    size_t frame_idx) {
+  _current_segment_id = block.segment_id;
+  _current_block_sequence = block.block_sequence;
+  _current_frame_idx = frame_idx;
+  _current_block_start_ts = block.start_timestamp;
+  _current_block_end_ts = block.end_timestamp;
+  _current_block_start_sk = block.start_secondary_key;
+  _current_block_end_sk = block.end_secondary_key;
+}
+
 nanots_iterator& nanots_iterator::operator++() {
   nanots_op_scope _op(_slot_guard);
   if (!_valid)
@@ -2904,9 +2917,7 @@ nanots_iterator& nanots_iterator::operator++() {
       return *this;
     }
 
-    _current_segment_id = next_block->segment_id;
-    _current_block_sequence = next_block->block_sequence;
-    _current_frame_idx = 0;
+    _select_block(*next_block, 0);
   }
 
   _load_current_frame();
@@ -2931,10 +2942,9 @@ nanots_iterator& nanots_iterator::operator--() {
       return *this;
     }
 
-    _current_segment_id = prev_block->segment_id;
-    _current_block_sequence = prev_block->block_sequence;
-    _current_frame_idx =
-        (prev_block->n_valid_indexes > 0) ? prev_block->n_valid_indexes - 1 : 0;
+    _select_block(
+        *prev_block,
+        (prev_block->n_valid_indexes > 0) ? prev_block->n_valid_indexes - 1 : 0);
   } else
     _current_frame_idx--;
 
@@ -2948,9 +2958,16 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
 
   // Fast path: if the target is within the already-loaded block's range
   // (composite), skip the SQL lookup entirely.
+  using composite_key = std::pair<int64_t, int64_t>;
+  const composite_key target_key{timestamp, secondary_key};
+  const composite_key current_start{
+      _current_block_start_ts, _current_block_start_sk};
+  const composite_key current_end{
+      _current_block_end_ts.value_or(0),
+      _current_block_end_sk.value_or(NANOTS_SEC_KEY_UNSET)};
   if (_valid && _current_block_end_ts.has_value() &&
-      timestamp >= _current_block_start_ts &&
-      timestamp <= _current_block_end_ts.value()) {
+      _current_block_end_sk.has_value() &&
+      target_key >= current_start && target_key <= current_end) {
     block = _get_block_by_segment_and_sequence(_current_segment_id, _current_block_sequence);
   }
 
@@ -2967,11 +2984,7 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
     return false;
   }
 
-  _current_block_start_ts = block->start_timestamp;
-  _current_block_end_ts   = block->end_timestamp;
-
-  _current_segment_id = block->segment_id;
-  _current_block_sequence = block->block_sequence;
+  _select_block(*block, 0);
 
   // Composite lower_bound within the block.
   uint8_t* index_start = block->block_p + BLOCK_HEADER_SIZE;
@@ -2993,9 +3006,7 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
       return false;
     }
 
-    _current_segment_id = next_block->segment_id;
-    _current_block_sequence = next_block->block_sequence;
-    _current_frame_idx = 0;
+    _select_block(*next_block, 0);
   }
 
   return _load_current_frame();
@@ -3009,9 +3020,7 @@ void nanots_iterator::reset() {
     return;
   }
 
-  _current_segment_id = first_block->segment_id;
-  _current_block_sequence = first_block->block_sequence;
-  _current_frame_idx = 0;
+  _select_block(*first_block, 0);
   _load_current_frame();
 }
 
@@ -3028,9 +3037,7 @@ bool nanots_iterator::seek_end() {
     return false;
   }
 
-  _current_segment_id = block->segment_id;
-  _current_block_sequence = block->block_sequence;
-  _current_frame_idx = block->n_valid_indexes - 1;
+  _select_block(*block, block->n_valid_indexes - 1);
   return _load_current_frame();
 }
 

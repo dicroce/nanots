@@ -882,15 +882,22 @@ void nanots_writer::_scan_limbo() {
 }
 
 block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
-  // 1. Try the ready queue (limbo entries that have already cleared EBR).
-  {
+  auto take_ready = [&]() -> std::optional<block> {
     std::lock_guard<std::mutex> g(_limbo_mu);
     if (!_ready.empty()) {
       auto e = _ready.front();
       _ready.pop_front();
       return block{e.block_id, e.block_idx};
     }
-  }
+    return std::nullopt;
+  };
+
+  // 1. Existing retired blocks may have become safe since the previous write.
+  // Scan before touching the catalog so we never strand a reusable victim or
+  // retire additional history unnecessarily.
+  _scan_limbo();
+  if (auto ready = take_ready())
+    return *ready;
 
   // 2. Claim a truly free block, or grow the file, while holding SQLite's
   // write lock. The SELECT+UPDATE in _db_get_free_block and the
@@ -906,53 +913,40 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
   if (available)
     return *available;
 
-  // 4. Auto-reclaim: retire blocks into limbo and consume from ready.
+  // 4. Auto-reclaim. One acquisition may retire at most one catalog block.
+  // If a prior victim is still waiting in limbo, all later retirement epochs
+  // would be pinned by the same reader, so deleting more history cannot help.
   if (_auto_reclaim) {
+    _scan_limbo();
+    if (auto ready = take_ready())
+      return *ready;
+
+    {
+      std::lock_guard<std::mutex> g(_limbo_mu);
+      if (_limbo.empty()) {
+        // Keep this writer's empty-check, retirement and enqueue together so
+        // concurrent write contexts cannot both create a first pending victim.
+        // SQLite's transaction still serializes victim choice across distinct
+        // nanots_writer instances.
+        std::optional<block> victim;
+        nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+          victim = _db_reclaim_oldest_used_block(tx);
+        });
+
+        if (victim) {
+          uint64_t retired_epoch = _epoch->global_epoch_bump();
+          _limbo.push_back({victim->id, victim->idx, retired_epoch});
+        }
+      }
+    }
+
+    // Give an active reader the same short opportunity to advance that the old
+    // loop provided, but only rescan the existing victim—never retire another.
     constexpr int MAX_RETRIES = 100;
     for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
-      // Cap check before retiring.
-      {
-        std::lock_guard<std::mutex> g(_limbo_mu);
-        if (_limbo.size() >= LIMBO_MAX_ENTRIES) {
-          throw nanots_exception(
-              NANOTS_EC_NO_FREE_BLOCKS,
-              "EBR limbo cap exceeded; pinned readers blocking reclaim.",
-              __FILE__, __LINE__);
-        }
-      }
-
-      // Retire one block atomically. Multiple auto-reclaiming writers must not
-      // select and retire the same segment_block concurrently.
-      std::optional<block> victim;
-      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
-        victim = _db_reclaim_oldest_used_block(tx);
-      });
-      if (!victim) {
-        // Nothing finalized to retire (either no blocks at all, or every
-        // remaining block is still being actively written). Fall through
-        // to the throw below.
-        break;
-      }
-
-      uint64_t retired_epoch = _epoch->global_epoch_bump();
-      {
-        std::lock_guard<std::mutex> g(_limbo_mu);
-        _limbo.push_back({victim->id, victim->idx, retired_epoch});
-      }
-
-      // Try to migrate cleared entries to ready and consume one.
       _scan_limbo();
-      {
-        std::lock_guard<std::mutex> g(_limbo_mu);
-        if (!_ready.empty()) {
-          auto e = _ready.front();
-          _ready.pop_front();
-          return block{e.block_id, e.block_idx};
-        }
-      }
-
-      // No ready block yet — readers haven't advanced their epochs. Yield
-      // briefly and retry.
+      if (auto ready = take_ready())
+        return *ready;
       std::this_thread::yield();
     }
   }

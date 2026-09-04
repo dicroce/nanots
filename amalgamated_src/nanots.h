@@ -758,14 +758,10 @@ class NANOTS_API nanots_writer {
         uint64_t retired_epoch;
     };
 
-    // Cap on outstanding limbo entries. If a long-stalled reader prevents
-    // any limbo entry from clearing, retire calls throw rather than grow
-    // unboundedly.
-    static constexpr size_t LIMBO_MAX_ENTRIES = 1024;
-
     // Top-level block acquisition under EBR. Tries (1) ready queue, (2) free
-    // block, (3) growable extension, (4) retire-into-limbo + ready queue with
-    // bounded retries. Returned block is always safe to pass through
+    // block, (3) growable extension, (4) one retire-into-limbo followed by
+    // bounded rescans of that same victim. Returned block is always safe to
+    // pass through
     // _recycle_block: either truly free (already zeroed), freshly grown, or
     // an EBR-cleared retired block.
     block _acquire_writable_block(const nts_sqlite_conn& conn);

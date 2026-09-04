@@ -382,3 +382,56 @@ void test_nanots_ebr::test_ts_index_refresh_finds_new_blocks() {
   // We should now be reading into the post-refresh region.
   RTF_ASSERT(iter->timestamp > 1000 + 31 * 100);
 }
+
+// A reader-pinned reclaim must not make one write delete every finalized
+// segment_block while spinning for a reusable physical block. Once the reader
+// releases its pin, the next write must reuse the already-retired block rather
+// than remain stuck or retire another one.
+void test_nanots_ebr::test_blocked_reclaim_retires_only_one_block() {
+  nanots_writer writer(EBR_FILE, /*auto_reclaim=*/true);
+  auto wctx = writer.create_write_context("stream_a", "reclaim bound");
+  std::vector<uint8_t> payload(EBR_BLOCK_SIZE / 2, 0x7C);
+
+  // This payload permits exactly one frame per block. Fill the eight-block
+  // pool, leaving the eighth block open until the ninth write rolls it over.
+  for (int i = 0; i < static_cast<int>(EBR_N_BLOCKS); ++i)
+    writer.write(wctx, payload.data(), payload.size(), 0, 1000 + i * 100);
+
+  auto count_segment_blocks = []() -> int64_t {
+    nts_sqlite_conn conn("nanots_test_ebr.db", false, false);
+    auto rows = conn.exec("SELECT COUNT(*) AS n FROM segment_blocks;");
+    return std::stoll(rows.front()["n"].value());
+  };
+
+  RTF_ASSERT_EQUAL(count_segment_blocks(),
+                   static_cast<int64_t>(EBR_N_BLOCKS));
+
+  {
+    nanots_iterator pinned(EBR_FILE, "stream_a");
+    RTF_ASSERT(pinned.valid());
+
+    bool no_free_blocks = false;
+    try {
+      writer.write(wctx, payload.data(), payload.size(), 0, 1800);
+    } catch (const nanots_exception& e) {
+      no_free_blocks = (e.get_ec() == NANOTS_EC_NO_FREE_BLOCKS);
+    }
+    RTF_ASSERT(no_free_blocks);
+
+    // One acquisition may retire one victim, not drain all eight catalog
+    // entries while the reader prevents physical reuse.
+    RTF_ASSERT_EQUAL(count_segment_blocks(),
+                     static_cast<int64_t>(EBR_N_BLOCKS - 1));
+  }
+
+  // The pinned victim is now safe. A subsequent attempt must scan limbo,
+  // reuse that same block, and restore the pool to eight catalog entries.
+  RTF_ASSERT_NO_THROW(
+      writer.write(wctx, payload.data(), payload.size(), 0, 1800));
+  RTF_ASSERT_EQUAL(count_segment_blocks(),
+                   static_cast<int64_t>(EBR_N_BLOCKS));
+
+  nanots_iterator verify(EBR_FILE, "stream_a");
+  RTF_ASSERT(verify.find(1800));
+  RTF_ASSERT_EQUAL(verify->timestamp, static_cast<int64_t>(1800));
+}

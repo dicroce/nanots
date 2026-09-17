@@ -72,6 +72,7 @@ uint32_t nanots_epoch_registry::acquire_slot() {
     if (_slots[i]->epoch.load(std::memory_order_relaxed) == INACTIVE) {
       // Mark acquired with a temporary 0 epoch; caller will overwrite via
       // op_begin().
+      _slots[i]->pinned_block_idx.store(-1, std::memory_order_relaxed);
       _slots[i]->epoch.store(0, std::memory_order_relaxed);
       return static_cast<uint32_t>(i);
     }
@@ -86,6 +87,7 @@ uint32_t nanots_epoch_registry::acquire_slot() {
 void nanots_epoch_registry::release_slot(uint32_t id) {
   std::lock_guard<std::mutex> g(_slots_mu);
   if (id < _slots.size()) {
+    _slots[id]->pinned_block_idx.store(-1, std::memory_order_release);
     _slots[id]->epoch.store(INACTIVE, std::memory_order_release);
   }
 }
@@ -101,6 +103,16 @@ bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
     return false;  // active reader still pinning this retire
   }
   return true;
+}
+
+bool nanots_epoch_registry::block_pinned(int64_t block_idx) const {
+  std::lock_guard<std::mutex> g(_slots_mu);
+  for (const auto& slot_ptr : _slots) {
+    if (slot_ptr->epoch.load(std::memory_order_acquire) == INACTIVE) continue;
+    if (slot_ptr->pinned_block_idx.load(std::memory_order_acquire) == block_idx)
+      return true;
+  }
+  return false;
 }
 
 std::shared_ptr<nanots_epoch_registry>
@@ -156,6 +168,12 @@ void nanots_slot_guard::op_begin() {
   uint64_t e = _registry->global_epoch_load();
   s.epoch.store(e, std::memory_order_release);
   s.heartbeat_us.store(_now_us(), std::memory_order_relaxed);
+}
+
+void nanots_slot_guard::pin_block(int64_t block_idx) {
+  if (_slot_id == UINT32_MAX) return;
+  auto& s = _registry->slot(_slot_id);
+  s.pinned_block_idx.store(block_idx, std::memory_order_seq_cst);
 }
 
 void nanots_slot_guard::_release() noexcept {
@@ -889,16 +907,17 @@ write_context nanots_writer::create_write_context(const std::string& stream_tag,
 }
 
 void nanots_writer::_scan_limbo() {
-  int64_t now = _now_us();
   std::lock_guard<std::mutex> g(_limbo_mu);
-  // Front-of-deque ordering by retired_epoch is monotonic (every retire
-  // bumps global_epoch), so once the front is blocked, everything behind
-  // it is too.
-  while (!_limbo.empty()) {
-    const auto& front = _limbo.front();
-    if (!_epoch->can_recycle(front.retired_epoch, now)) break;
-    _ready.push_back(front);
-    _limbo.pop_front();
+  // A retired block may be recycled once no reader's current frame points
+  // into it. Pins are per-block, so limbo entries clear independently — a
+  // reader parked on one old block no longer wedges everything behind it.
+  for (auto it = _limbo.begin(); it != _limbo.end();) {
+    if (_epoch->block_pinned(it->block_idx)) {
+      ++it;
+      continue;
+    }
+    _ready.push_back(*it);
+    it = _limbo.erase(it);
   }
 }
 
@@ -927,6 +946,13 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
   // physical block (or both grow starting at the same block index).
   std::optional<block> available;
   nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+    // Maintenance: promote aged live-writer 'reserved' rows to 'used'. Block
+    // transitions are the one event every healthy writer performs regularly;
+    // running the sweep here keeps catalog status labels current for
+    // long-lived writers that never destroy their write contexts (previously
+    // the sweep only ran in ~write_context, so a service recording 24/7
+    // accumulated months of stale 'reserved' labels).
+    _db_trans_finalize_reserved_blocks(tx);
     available = _db_get_free_block(tx);
     if (!available && is_growable())
       available = _grow_blocks(tx);
@@ -934,21 +960,33 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
   if (available)
     return *available;
 
-  // 4. Auto-reclaim. One acquisition may retire at most one catalog block.
-  // If a prior victim is still waiting in limbo, all later retirement epochs
-  // would be pinned by the same reader, so deleting more history cannot help.
+  // 4. Auto-reclaim. Pins are per-block, so a victim recycles the moment no
+  // reader's current frame points into it — for the common case (no reader
+  // parked on the oldest block) the first retire below returns immediately.
+  // When the oldest block IS pinned, we park it in limbo and retire the
+  // next-oldest instead (ring semantics: newest data outranks oldest), up to
+  // LIMBO_CAP parked victims. A ring writer therefore only fails when every
+  // reclaim candidate is simultaneously pinned by a distinct reader — a
+  // pathological state — and even then only after a bounded wall-clock wait
+  // for pins to move, not the instant a reader happens to be mid-operation.
   if (_auto_reclaim) {
     _scan_limbo();
     if (auto ready = take_ready())
       return *ready;
 
-    {
-      std::lock_guard<std::mutex> g(_limbo_mu);
-      if (_limbo.empty()) {
-        // Keep this writer's empty-check, retirement and enqueue together so
-        // concurrent write contexts cannot both create a first pending victim.
-        // SQLite's transaction still serializes victim choice across distinct
-        // nanots_writer instances.
+    constexpr size_t LIMBO_CAP = 8;
+    constexpr int64_t ACQUIRE_DEADLINE_US = 2 * 1000 * 1000;
+    const int64_t t0 = _now_us();
+    for (;;) {
+      bool may_retire;
+      {
+        std::lock_guard<std::mutex> g(_limbo_mu);
+        may_retire = _limbo.size() < LIMBO_CAP;
+      }
+
+      if (may_retire) {
+        // SQLite's transaction serializes victim choice across writer
+        // instances and write contexts; a row can only be reclaimed once.
         std::optional<block> victim;
         nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
           victim = _db_reclaim_oldest_used_block(tx);
@@ -956,24 +994,25 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
 
         if (victim) {
           uint64_t retired_epoch = _epoch->global_epoch_bump();
+          std::lock_guard<std::mutex> g(_limbo_mu);
           _limbo.push_back({victim->id, victim->idx, retired_epoch});
         }
       }
-    }
 
-    // Give an active reader the same short opportunity to advance that the old
-    // loop provided, but only rescan the existing victim—never retire another.
-    constexpr int MAX_RETRIES = 100;
-    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
       _scan_limbo();
       if (auto ready = take_ready())
         return *ready;
-      std::this_thread::yield();
+
+      if (_now_us() - t0 > ACQUIRE_DEADLINE_US) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
 
-  throw nanots_exception(NANOTS_EC_NO_FREE_BLOCKS, "Unable to get free block.",
-                         __FILE__, __LINE__);
+  throw nanots_exception(
+      NANOTS_EC_NO_FREE_BLOCKS,
+      "Unable to get a writable block: every reclaim candidate is pinned by "
+      "an active reader (or the ring has no reclaimable blocks).",
+      __FILE__, __LINE__);
 }
 
 void nanots_writer::write(write_context& wctx,
@@ -1373,9 +1412,17 @@ void nanots_reader::read(
     int64_t end_secondary_key,
     const std::function<
         void(const uint8_t*, size_t, uint32_t, int64_t, int64_t, int64_t, const std::string&)>& callback) {
-  // EBR critical section spans the entire read(): the writer must not
-  // overwrite any block whose bytes the callback might dereference.
+  // The writer must not overwrite the block whose bytes the callback is
+  // currently dereferencing: each block is pinned for exactly the span of its
+  // own scan below, and the pin is dropped on every exit path. Frame pointers
+  // handed to the callback are valid only for the duration of the callback,
+  // so nothing needs protection once read() returns — which also means a
+  // leaked/idle nanots_reader pins nothing.
   nanots_op_scope _op(_slot_guard);
+  struct unpin_on_exit final {
+    nanots_slot_guard& g;
+    ~unpin_on_exit() { g.pin_block(-1); }
+  } _unpin{_slot_guard};
 
   nts_sqlite_conn db(_database_name(_file_name), false, true);
 
@@ -1419,6 +1466,9 @@ void nanots_reader::read(
     uint8_t uuid[16];
     s_to_entropy_id(uuid_hex, uuid);
 
+    // Pin before the first dereference of this block's bytes.
+    _slot_guard.pin_block(block_idx);
+
     auto mm = nts_memory_map(
         filenum(_file), FILE_HEADER_BLOCK_SIZE + (block_idx * _block_size),
         _block_size, nts_memory_map::NMM_PROT_READ,
@@ -1459,6 +1509,14 @@ void nanots_reader::read(
           (timestamp == end_timestamp && sk_index > end_secondary_key))
         return;  // All done!
 
+      // Bounds-check the offset before touching the frame header: a block
+      // recycled under a racing reader can carry arbitrary index bytes, and
+      // the uuid check inside _validate_frame_header only runs AFTER the
+      // dereference. A garbage offset means the whole block is suspect.
+      if (offset < BLOCK_HEADER_SIZE + ((i + 1) * INDEX_ENTRY_SIZE) ||
+          offset > _block_size - FRAME_HEADER_SIZE)
+        break;
+
       // Validate frame header
       uint32_t flags;
       uint32_t frame_size;
@@ -1468,6 +1526,9 @@ void nanots_reader::read(
         // Log warning? Skip corrupted frame
         continue;
       }
+
+      if (frame_size > _block_size - offset - FRAME_HEADER_SIZE)
+        break;
 
       // Callback with frame data
       callback(block_p + offset + FRAME_HEADER_SIZE, (size_t)frame_size, flags,
@@ -1947,6 +2008,11 @@ bool nanots_iterator::_load_current_frame() {
     return false;
   }
 
+  // Pin before the first dereference of the block's bytes; the writer will
+  // not recycle a pinned block, which is what keeps _current_frame.data valid
+  // until the next operation on this iterator.
+  _slot_guard.pin_block(block->block_idx);
+
   if (!_load_block_data(*block)) {
     _valid = false;
     return false;
@@ -1963,12 +2029,28 @@ bool nanots_iterator::_load_current_frame() {
   int64_t timestamp = *(int64_t*)(index_p + INDEX_ENTRY_TS_OFFSET);
   uint64_t offset   = *(uint64_t*)(index_p + INDEX_ENTRY_OFFSET_OFFSET);
 
+  // Bounds-check the offset before touching the frame header: on a block
+  // recycled under a racing reader, index bytes can be arbitrary. Without
+  // this, a garbage offset is an out-of-bounds read (the uuid check inside
+  // _validate_frame_header only runs AFTER the dereference).
+  uint32_t index_region_end =
+      BLOCK_HEADER_SIZE + (block->n_valid_indexes * INDEX_ENTRY_SIZE);
+  if (offset < index_region_end || offset > _block_size - FRAME_HEADER_SIZE) {
+    _valid = false;
+    return false;
+  }
+
   // Validate frame header
   uint32_t flags;
   uint32_t frame_size;
   int64_t sec_key;
   if (!_validate_frame_header(block->block_p + offset, block->uuid, &flags,
                               &frame_size, &sec_key)) {
+    _valid = false;
+    return false;
+  }
+
+  if (frame_size > _block_size - offset - FRAME_HEADER_SIZE) {
     _valid = false;
     return false;
   }
@@ -2047,6 +2129,8 @@ nanots_iterator& nanots_iterator::operator--() {
       return *this;
     }
 
+    _slot_guard.pin_block(prev_block->block_idx);
+
     if (!_load_block_data(*prev_block)) {
       _valid = false;
       return *this;
@@ -2088,6 +2172,10 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
     _valid = false;
     return false;
   }
+
+  // Pin before the first byte dereference (committed-count read inside
+  // _load_block_data, then the binary search below).
+  _slot_guard.pin_block(block->block_idx);
 
   if (!_load_block_data(*block)) {
     _valid = false;
@@ -2160,6 +2248,8 @@ bool nanots_iterator::seek_end() {
     _valid = false;
     return false;
   }
+
+  _slot_guard.pin_block(block->block_idx);
 
   if (!_load_block_data(*block)) {
     _valid = false;

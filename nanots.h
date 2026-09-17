@@ -180,6 +180,11 @@ public:
     struct Slot {
       std::atomic<uint64_t> epoch{INACTIVE};
       std::atomic<int64_t> heartbeat_us{0};
+      // Physical block index (blocks.idx) whose bytes this reader's current
+      // frame may point into; -1 = none. Recycling is gated on this, not on
+      // epochs: an idle reader pins only the one block its live Frame::data
+      // pointer targets, instead of freezing reclamation file-wide.
+      std::atomic<int64_t> pinned_block_idx{-1};
     };
 
     // Hot-path operations.
@@ -196,6 +201,11 @@ public:
     // cannot prove that mapped frame data is no longer in use. now_us is kept
     // in the signature for source and binary compatibility and is ignored.
     bool can_recycle(uint64_t retired_epoch, int64_t now_us) const;
+
+    // Returns true if any active slot's current frame points into the block
+    // at this physical index. This is the recycling gate: a retired block may
+    // be overwritten once no reader pins it, regardless of epochs.
+    bool block_pinned(int64_t block_idx) const;
 
     // Accessor for slot_guard.
     Slot& slot(uint32_t id);
@@ -247,6 +257,12 @@ public:
     // Call at the start of every iterator operation. No-op if !active().
     void op_begin();
 
+    // Publishes which physical block this reader's live frame pointer targets
+    // (-1 = none). MUST be called before the first dereference of a block's
+    // mapped bytes; the writer will not recycle a pinned block. No-op if
+    // !active().
+    void pin_block(int64_t block_idx);
+
     // True if this guard owns a slot.
     bool active() const { return _slot_id != UINT32_MAX; }
 
@@ -264,8 +280,10 @@ private:
 // Stack-only RAII wrapper that marks the start of one iterator operation.
 // Construction publishes the current global_epoch + diagnostic heartbeat;
 // destruction is intentionally a no-op (the slot retains the published epoch
-// until the next op or the iterator is destroyed — that's what protects the
-// Frame::data validity contract). The point of this type is to make "this
+// and its block pin until the next op or the iterator is destroyed — the pin
+// is what protects the Frame::data validity contract, and it covers only the
+// one block the current frame points into, so an idle iterator no longer
+// blocks reclamation of the rest of the file). The point of this type is to make "this
 // scope is one iterator op" syntactically explicit at every call site, and to
 // reserve a hook for any future op-exit work (latency counters, debug
 // assertions, etc.) without churning all the call sites again.

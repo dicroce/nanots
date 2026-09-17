@@ -398,11 +398,14 @@ void test_nanots_ebr::test_ts_index_refresh_finds_new_blocks() {
   RTF_ASSERT(iter->timestamp > 1000 + 31 * 100);
 }
 
-// A reader-pinned reclaim must not make one write delete every finalized
-// segment_block while spinning for a reusable physical block. Once the reader
-// releases its pin, the next write must reuse the already-retired block rather
-// than remain stuck or retire another one.
-void test_nanots_ebr::test_blocked_reclaim_retires_only_one_block() {
+// A ring writer must not fail because a reader happens to pin the oldest
+// block: the acquisition parks the pinned victim in limbo and retires the
+// next-oldest instead, so the write SUCCEEDS while the pinned block's bytes
+// stay untouched (that is the Frame::data contract). Once the reader releases
+// its pin, the parked victim must be reused rather than retiring yet another
+// block. Pins are per-block, so a parked reader wedges only its own block —
+// never the whole file.
+void test_nanots_ebr::test_blocked_reclaim_advances_past_pinned_victim() {
   nanots_writer writer(EBR_FILE, /*auto_reclaim=*/true);
   auto wctx = writer.create_write_context("stream_a", "reclaim bound");
   std::vector<uint8_t> payload(EBR_BLOCK_SIZE / 2, 0x7C);
@@ -422,31 +425,37 @@ void test_nanots_ebr::test_blocked_reclaim_retires_only_one_block() {
                    static_cast<int64_t>(EBR_N_BLOCKS));
 
   {
+    // The iterator sits on the stream's first frame, pinning the oldest
+    // block — exactly the block reclaim wants first.
     nanots_iterator pinned(EBR_FILE, "stream_a");
     RTF_ASSERT(pinned.valid());
+    RTF_ASSERT_EQUAL(pinned->timestamp, static_cast<int64_t>(1000));
 
-    bool no_free_blocks = false;
-    try {
-      writer.write(wctx, payload.data(), payload.size(), 0, 1800);
-    } catch (const nanots_exception& e) {
-      no_free_blocks = (e.get_ec() == NANOTS_EC_NO_FREE_BLOCKS);
-    }
-    RTF_ASSERT(no_free_blocks);
+    // The write must succeed: the pinned victim parks in limbo and the
+    // next-oldest block is retired and recycled in its place.
+    RTF_ASSERT_NO_THROW(
+        writer.write(wctx, payload.data(), payload.size(), 0, 1800));
 
-    // One acquisition may retire one victim, not drain all eight catalog
-    // entries while the reader prevents physical reuse.
+    // Two rows retired (pinned victim + its unpinned replacement), one row
+    // created for the new block — not a drain of the whole catalog.
     RTF_ASSERT_EQUAL(count_segment_blocks(),
                      static_cast<int64_t>(EBR_N_BLOCKS - 1));
+
+    // The pinned reader's frame bytes were never overwritten.
+    RTF_ASSERT(pinned.valid());
+    RTF_ASSERT_EQUAL(pinned->timestamp, static_cast<int64_t>(1000));
   }
 
-  // The pinned victim is now safe. A subsequent attempt must scan limbo,
-  // reuse that same block, and restore the pool to eight catalog entries.
+  // The parked victim is now unpinned. The next roll must reuse it from the
+  // ready list rather than retiring another block, restoring the pool.
   RTF_ASSERT_NO_THROW(
-      writer.write(wctx, payload.data(), payload.size(), 0, 1800));
+      writer.write(wctx, payload.data(), payload.size(), 0, 1900));
   RTF_ASSERT_EQUAL(count_segment_blocks(),
                    static_cast<int64_t>(EBR_N_BLOCKS));
 
   nanots_iterator verify(EBR_FILE, "stream_a");
   RTF_ASSERT(verify.find(1800));
   RTF_ASSERT_EQUAL(verify->timestamp, static_cast<int64_t>(1800));
+  RTF_ASSERT(verify.find(1900));
+  RTF_ASSERT_EQUAL(verify->timestamp, static_cast<int64_t>(1900));
 }

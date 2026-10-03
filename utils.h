@@ -215,6 +215,12 @@ class NANOTS_API nts_file final {
 bool file_exists(const std::string& path);
 int filenum(FILE* f);
 uint64_t file_size(const std::string& fileName);
+// Extend `file` to `size` bytes.
+//
+// RETURNS 0 on success and a POSITIVE errno on failure — posix_fallocate(3)
+// reports that way and does NOT set errno, so a caller that tests `< 0` never
+// sees ENOSPC or EFBIG. The Windows and macOS branches are normalised to the
+// same convention here so every caller can use one test (`!= 0`).
 int fallocate(FILE* file, uint64_t size);
 void remove_file(const std::string& path);
 

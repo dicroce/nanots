@@ -4,6 +4,8 @@
 #include "nanots.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 
 std::mutex current_stream_tags_lok;
@@ -862,9 +864,17 @@ std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {
   uint64_t new_size = FILE_HEADER_BLOCK_SIZE +
                       static_cast<uint64_t>(current_count + to_add) * _block_size;
 
-  if (fallocate(_file, new_size) < 0)
+  // fallocate() returns a positive errno, never -1: the old `< 0` test could
+  // not fire, so an ENOSPC/EFBIG here fell through to the INSERTs below, the
+  // caller committed those phantom block rows, and the first write into the
+  // unbacked mapping was a SIGBUS — with a catalog pointing past EOF, so that
+  // reopening the database SIGBUSed as well. Throwing HERE, before the INSERTs
+  // and inside the caller's IMMEDIATE transaction, rolls the catalog back and
+  // turns a full disk into a plain NANOTS_EC_UNABLE_TO_ALLOCATE_FILE error.
+  if (const int fa_err = fallocate(_file, new_size); fa_err != 0)
     throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE,
-                           "Unable to grow file.", __FILE__, __LINE__);
+                           "Unable to grow file: " + std::string(strerror(fa_err)),
+                           __FILE__, __LINE__);
 
   _file_size = new_size;
 
@@ -1246,8 +1256,10 @@ void nanots_writer::allocate(const std::string& file_name,
   {
     auto f = nts_file::open(file_name, "w+");
 
-    if (fallocate(f, file_size) < 0)
-      throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE, "Unable to allocate file.", __FILE__, __LINE__);
+    if (const int fa_err = fallocate(f, file_size); fa_err != 0)
+      throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE,
+                             "Unable to allocate file: " + std::string(strerror(fa_err)),
+                             __FILE__, __LINE__);
   }
 
   {

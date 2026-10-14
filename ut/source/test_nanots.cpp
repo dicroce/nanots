@@ -8,6 +8,11 @@
 #include <inttypes.h>
 #include "nanots.h"
 
+#ifdef __linux__
+#include <signal.h>
+#include <sys/resource.h>
+#endif
+
 // Forward declaration from nanots.cpp
 static std::string _database_name(const std::string& file_name) {
   return file_name.substr(0, file_name.find(".nts")) + ".db";
@@ -28,7 +33,7 @@ static void _whack_files() {
 
   for (const char* name :
        {"nanots_growable_basic", "nanots_growable_doubling", "nanots_growable_cap",
-        "nanots_growable_concurrent"}) {
+        "nanots_growable_concurrent", "nanots_growable_enospc"}) {
     std::string nts = std::string(name) + ".nts";
     std::string db  = std::string(name) + ".db";
     std::string shm = db + "-shm";
@@ -2385,6 +2390,71 @@ void test_nanots::test_nanots_growable_max_cap() {
 
   uint64_t final_size = file_size(nts);
   RTF_ASSERT(final_size == 64 * 1024 + (uint64_t)cap * block_size);
+}
+
+// A grow that cannot extend the file (ENOSPC / EFBIG) must surface as
+// NANOTS_EC_UNABLE_TO_ALLOCATE_FILE and leave the catalog untouched, not
+// commit block rows past EOF (the old `fallocate() < 0` test never fired on
+// Linux, so the next store into the unbacked mapping was a SIGBUS). We force
+// EFBIG with RLIMIT_FSIZE; Linux only, since that is where posix_fallocate
+// runs.
+void test_nanots::test_nanots_growable_enospc() {
+#ifdef __linux__
+  const char* nts = "nanots_growable_enospc.nts";
+  const uint32_t block_size = 1024 * 1024;
+  const uint64_t one_block_size = 64 * 1024 + (uint64_t)block_size;
+
+  nanots_writer::allocate_growable(nts, block_size, 0);
+
+  const size_t frame_size = block_size / 2;
+  std::vector<uint8_t> data(frame_size, 0xE5);
+
+  {
+    nanots_writer db(nts, false);
+    auto wctx = db.create_write_context("enospc", "");
+
+    // First write grows the file to exactly one block.
+    db.write(wctx, data.data(), frame_size, 0, 1000);
+    RTF_ASSERT(file_size(nts) == one_block_size);
+
+    // The next write needs a second block. Cap file size halfway to it: the
+    // grow fails with EFBIG, while the small sqlite writes stay under it.
+    struct rlimit old_lim;
+    RTF_ASSERT(getrlimit(RLIMIT_FSIZE, &old_lim) == 0);
+    struct rlimit lim = old_lim;
+    lim.rlim_cur = one_block_size + block_size / 2;
+    auto old_handler = signal(SIGXFSZ, SIG_IGN);
+    RTF_ASSERT(setrlimit(RLIMIT_FSIZE, &lim) == 0);
+
+    nanots_ec_t ec = NANOTS_EC_OK;
+    try {
+      db.write(wctx, data.data(), frame_size, 0, 2000);
+    } catch (const nanots_exception& e) {
+      ec = e.get_ec();
+    }
+
+    setrlimit(RLIMIT_FSIZE, &old_lim);
+    signal(SIGXFSZ, old_handler);
+
+    RTF_ASSERT(ec == NANOTS_EC_UNABLE_TO_ALLOCATE_FILE);
+
+    // With the limit lifted the same write succeeds: the failed grow left
+    // no phantom block rows behind for it to land on.
+    db.write(wctx, data.data(), frame_size, 0, 3000);
+  }
+
+  RTF_ASSERT(file_size(nts) == 64 * 1024 + 2 * (uint64_t)block_size);
+
+  // Reopen and read back: nothing points past EOF.
+  nanots_iterator iter(nts, "enospc");
+  int n = 0;
+  while (iter.valid()) {
+    RTF_ASSERT(iter->size == frame_size);
+    n++;
+    ++iter;
+  }
+  RTF_ASSERT(n == 2);
+#endif
 }
 
 // --- Secondary key tests --------------------------------------------------

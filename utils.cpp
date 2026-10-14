@@ -2,6 +2,8 @@
 #include "utils.h"
 #include "sqlite3.h"
 
+#include <cerrno>
+
 std::string format_s(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -595,10 +597,10 @@ int fallocate(FILE* file, uint64_t size) {
   BOOL ok = SetFilePointerEx((HANDLE)_get_osfhandle(filenum(file)), li,
                                 nullptr, FILE_BEGIN);
   if (!ok)
-    return -1;
+    return EIO;
 
   if (!SetEndOfFile((HANDLE)_get_osfhandle(filenum(file))))
-    return -1;
+    return (GetLastError() == ERROR_DISK_FULL) ? ENOSPC : EIO;
 
   return 0;
 #elif defined(__APPLE__)
@@ -615,12 +617,28 @@ int fallocate(FILE* file, uint64_t size) {
   }
   
   if (result == -1)
-    return -1;
-    
+    return (errno != 0) ? errno : EIO;
+
   // Set the file size
-  return ftruncate(fd, size);
+  if (ftruncate(fd, size) != 0)
+    return (errno != 0) ? errno : EIO;
+
+  return 0;
 #else
+  // posix_fallocate64() RETURNS the error number (and leaves errno alone).
+  // Returning it unchanged is what makes `fallocate(...) != 0` a real test.
   return posix_fallocate64(filenum(file), 0, size);
+#endif
+}
+
+std::string errno_string(int err) {
+#ifdef _WIN32
+  char buf[256];
+  if (strerror_s(buf, sizeof(buf), err) != 0)
+    return "error " + std::to_string(err);
+  return buf;
+#else
+  return strerror(err);
 #endif
 }
 

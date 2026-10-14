@@ -631,6 +631,17 @@ int fallocate(FILE* file, uint64_t size) {
 #endif
 }
 
+std::string errno_string(int err) {
+#ifdef _WIN32
+  char buf[256];
+  if (strerror_s(buf, sizeof(buf), err) != 0)
+    return "error " + std::to_string(err);
+  return buf;
+#else
+  return strerror(err);
+#endif
+}
+
 void remove_file(const std::string& path) {
 #ifdef _WIN32
   if (DeleteFileA(path.c_str()) == 0)

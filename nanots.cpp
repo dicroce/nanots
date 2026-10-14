@@ -4,8 +4,6 @@
 #include "nanots.h"
 
 #include <cctype>
-#include <cerrno>
-#include <cstring>
 #include <filesystem>
 
 std::mutex current_stream_tags_lok;
@@ -873,7 +871,7 @@ std::optional<block> nanots_writer::_grow_blocks(const nts_sqlite_conn& conn) {
   // turns a full disk into a plain NANOTS_EC_UNABLE_TO_ALLOCATE_FILE error.
   if (const int fa_err = fallocate(_file, new_size); fa_err != 0)
     throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE,
-                           "Unable to grow file: " + std::string(strerror(fa_err)),
+                           "Unable to grow file: " + errno_string(fa_err),
                            __FILE__, __LINE__);
 
   _file_size = new_size;
@@ -1258,7 +1256,7 @@ void nanots_writer::allocate(const std::string& file_name,
 
     if (const int fa_err = fallocate(f, file_size); fa_err != 0)
       throw nanots_exception(NANOTS_EC_UNABLE_TO_ALLOCATE_FILE,
-                             "Unable to allocate file: " + std::string(strerror(fa_err)),
+                             "Unable to allocate file: " + errno_string(fa_err),
                              __FILE__, __LINE__);
   }
 

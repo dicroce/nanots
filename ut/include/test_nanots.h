@@ -41,6 +41,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_growable_basic);
   TEST(test_nanots::test_nanots_growable_doubling);
   TEST(test_nanots::test_nanots_growable_max_cap);
+  TEST(test_nanots::test_nanots_growable_enospc);
   TEST(test_nanots::test_nanots_secondary_key_basic);
   TEST(test_nanots::test_nanots_secondary_key_find);
   TEST(test_nanots::test_nanots_secondary_key_monotonic);
@@ -103,6 +104,7 @@ class test_nanots : public test_fixture {
   void test_nanots_growable_basic();
   void test_nanots_growable_doubling();
   void test_nanots_growable_max_cap();
+  void test_nanots_growable_enospc();
   void test_nanots_secondary_key_basic();
   void test_nanots_secondary_key_find();
   void test_nanots_secondary_key_monotonic();

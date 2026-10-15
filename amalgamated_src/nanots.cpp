@@ -1677,18 +1677,25 @@ write_context::~write_context() {
   current_stream_tags.erase(key);
 
   if (last_timestamp && current_block) {
-    mm.flush(mm.map(), _block_size, true);
+    // Destructors are noexcept: an exception escaping here (e.g. the database
+    // was deleted or became unwritable under a live writer) calls
+    // std::terminate. Finalizing is best effort: on failure the block is left
+    // exactly as a crash would leave it.
+    try {
+      mm.flush(mm.map(), _block_size, true);
 
-    auto db_name = _database_name(file_name);
-    nts_sqlite_conn conn(db_name, true, true);
+      auto db_name = _database_name(file_name);
+      nts_sqlite_conn conn(db_name, true, true);
 
-    int64_t end_sk = last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
+      int64_t end_sk = last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
 
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
-      _db_finalize_block(conn, current_block->id, last_timestamp.value(), end_sk);
-      // This is a maintenance task that needs to be done periodically.
-      _db_trans_finalize_reserved_blocks(conn);
-    });
+      nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+        _db_finalize_block(conn, current_block->id, last_timestamp.value(), end_sk);
+        // This is a maintenance task that needs to be done periodically.
+        _db_trans_finalize_reserved_blocks(conn);
+      });
+    } catch (...) {
+    }
   }
 }
 

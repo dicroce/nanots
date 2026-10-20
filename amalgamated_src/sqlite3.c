@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(HAVE_USLEEP)
+#define HAVE_USLEEP 1
+#endif
 #ifndef _WIN32
 #pragma GCC diagnostic ignored "-Wcast-function-type"
 #endif

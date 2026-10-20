@@ -59,8 +59,17 @@ if __name__ == "__main__":
     
     with open("amalgamated_src/sqlite3.h", 'w') as f:
         f.write(sqlite3_h)
+    # Without HAVE_USLEEP, SQLite's busy handler on Unix sleeps in whole
+    # seconds, so writers that collide on a lock give up with "database is
+    # locked". Projects that copy these files build with their own flags, so
+    # set it here (CMakeLists.txt sets it for the root sqlite3.c).
+    usleep_guard = (
+        "#if !defined(_WIN32) && !defined(HAVE_USLEEP)\n"
+        "#define HAVE_USLEEP 1\n"
+        "#endif\n"
+    )
     with open("amalgamated_src/sqlite3.c", 'w') as f:
-        f.write(sqlite3_c)
+        f.write(usleep_guard + sqlite3_c)
     
     # Create amalgamated header for your C++ code
     utils_h_content = remove_include_load("utils.h", ["#include \"sqlite3.h\""])

@@ -56,6 +56,14 @@ target_compile_definitions(nanots PRIVATE NANOTS_BUILDING_DLL)
 target_compile_definitions(nanots_static PRIVATE SQLITE_API=)
 target_compile_definitions(nanots PRIVATE SQLITE_API=)
 
+# Without HAVE_USLEEP, SQLite's busy handler on Unix sleeps in whole seconds,
+# so writers on separate connections that collide on a lock wait 1 s per retry
+# and give up after two (BUSY_TIMEOUT_MILLIS is 2000) with "database is locked".
+if(UNIX)
+    target_compile_definitions(nanots_static PRIVATE HAVE_USLEEP=1)
+    target_compile_definitions(nanots PRIVATE HAVE_USLEEP=1)
+endif()
+
 # Hide symbols by default on Linux/Unix and make SQLite symbols private
 if(UNIX)
     # Set default visibility to hidden for both libraries

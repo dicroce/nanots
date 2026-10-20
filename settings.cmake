@@ -11,6 +11,19 @@ if(NOT CMAKE_BUILD_TYPE)
     set (CMAKE_BUILD_TYPE Debug)
 endif()
 
+# -march=native builds for the build machine's CPU: fine for nanots' own
+# tests and benchmarks, wrong for a project that embeds nanots and ships its
+# binaries. A CI runner's CPU can have instructions (SVE on Arm runners,
+# AVX-512 on x86) the user's doesn't, and SQLite then dies with SIGILL on its
+# first query (Revere on a Raspberry Pi 5). So it is on only when nanots is
+# the top-level project.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(_nanots_native_default ON)
+else()
+    set(_nanots_native_default OFF)
+endif()
+option(NANOTS_MARCH_NATIVE "Release builds use -march=native" ${_nanots_native_default})
+
 # Apply build flags per platform and configuration
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -36,15 +49,17 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 
         add_compile_options(
             -O3
-            -march=native
             -ffast-math
             -fno-math-errno
             -fno-omit-frame-pointer
         )
         add_link_options(
             -O3
-            -march=native
         )
+        if(NANOTS_MARCH_NATIVE)
+            add_compile_options(-march=native)
+            add_link_options(-march=native)
+        endif()
     endif()
 
 elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")

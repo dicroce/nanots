@@ -59,6 +59,10 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_unfinalized_block_with_max_frame_survives);
   TEST(test_nanots::test_nanots_timestamp_zero_and_null_open_block);
   TEST(test_nanots::test_nanots_catalog_v2_to_v3_migration);
+  TEST(test_nanots::test_nanots_write_context_close);
+  TEST(test_nanots::test_nanots_write_context_close_reports_storage_failure);
+  TEST(test_nanots::test_nanots_write_context_move_keeps_ownership);
+  TEST(test_nanots::test_nanots_write_context_flush);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -122,4 +126,8 @@ class test_nanots : public test_fixture {
   void test_nanots_unfinalized_block_with_max_frame_survives();
   void test_nanots_timestamp_zero_and_null_open_block();
   void test_nanots_catalog_v2_to_v3_migration();
+  void test_nanots_write_context_close();
+  void test_nanots_write_context_close_reports_storage_failure();
+  void test_nanots_write_context_move_keeps_ownership();
+  void test_nanots_write_context_flush();
 };

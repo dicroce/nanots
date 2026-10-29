@@ -3395,3 +3395,108 @@ void test_nanots::test_nanots_catalog_v2_to_v3_migration() {
   RTF_ASSERT(positive.valid());
   RTF_ASSERT(positive->timestamp == 4242);
 }
+
+void test_nanots::test_nanots_write_context_close() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  auto wctx = db.create_write_context("close_stream", "close test");
+  for (int i = 0; i < 3; i++) {
+    std::string data = "frame_" + std::to_string(i);
+    db.write(wctx, (uint8_t*)data.c_str(), data.size(), 0, 1000 + i);
+  }
+
+  RTF_ASSERT(wctx.close() == 0);
+  RTF_ASSERT(wctx.close() == 0);  // a second close is a no-op
+
+  // close() released the stream tag while the context object is still alive.
+  RTF_ASSERT_NO_THROW(db.create_write_context("close_stream", "reopened"));
+
+  nanots_iterator iter("nanots_test_4mb.nts", "close_stream");
+  int n = 0;
+  while (iter.valid()) {
+    RTF_ASSERT(std::string((char*)iter->data, iter->size) == "frame_" + std::to_string(n));
+    ++n;
+    ++iter;
+  }
+  RTF_ASSERT(n == 3);
+}
+
+void test_nanots::test_nanots_write_context_close_reports_storage_failure() {
+  // The catalog deleted under a live writer: the destructor can only swallow
+  // this, close() has to report it.
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  auto wctx = db.create_write_context("doomed_stream", "doomed");
+  db.write(wctx, (uint8_t*)"frame", 5, 0, 1000);
+
+  rtf_remove_file("nanots_test_4mb.db");
+  rtf_remove_file("nanots_test_4mb.db-wal");
+  rtf_remove_file("nanots_test_4mb.db-shm");
+
+  RTF_ASSERT(wctx.close() != 0);
+  RTF_ASSERT(wctx.close() == 0);
+}
+
+void test_nanots::test_nanots_write_context_move_keeps_ownership() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  auto a = db.create_write_context("moved_stream", "move test");
+  db.write(a, (uint8_t*)"frame_0", 7, 0, 1000);
+
+  write_context b = std::move(a);
+
+  // The moved-from context owns nothing: closing it finalizes nothing and
+  // does not release the stream tag the moved-to context still holds.
+  RTF_ASSERT(a.close() == 0);
+  RTF_ASSERT_THROWS(db.create_write_context("moved_stream", "second writer"),
+                    nanots_exception);
+
+  db.write(b, (uint8_t*)"frame_1", 7, 0, 2000);
+
+  // Move-assignment closes what the target held before taking over.
+  auto c = db.create_write_context("other_stream", "move assign");
+  db.write(c, (uint8_t*)"other", 5, 0, 1000);
+  c = std::move(b);
+  RTF_ASSERT_NO_THROW(db.create_write_context("other_stream", "reopened"));
+
+  db.write(c, (uint8_t*)"frame_2", 7, 0, 3000);
+  RTF_ASSERT(c.close() == 0);
+
+  nanots_iterator iter("nanots_test_4mb.nts", "moved_stream");
+  int n = 0;
+  while (iter.valid()) {
+    RTF_ASSERT(std::string((char*)iter->data, iter->size) == "frame_" + std::to_string(n));
+    ++n;
+    ++iter;
+  }
+  RTF_ASSERT(n == 3);
+}
+
+void test_nanots::test_nanots_write_context_flush() {
+  nanots_writer db("nanots_test_4mb.nts", false);
+
+  auto wctx = db.create_write_context("flush_stream", "flush test");
+  RTF_ASSERT(wctx.flush() == 0);  // no block open yet: a no-op
+
+  db.write(wctx, (uint8_t*)"frame_0", 7, 0, 1000);
+  db.write(wctx, (uint8_t*)"frame_1", 7, 0, 2000);
+  RTF_ASSERT(wctx.flush() == 0);
+  RTF_ASSERT(wctx.flush() == 0);
+
+  // flush() is not close(): the context still owns the stream...
+  RTF_ASSERT_THROWS(db.create_write_context("flush_stream", "second writer"),
+                    nanots_exception);
+
+  // ...and the block stays open: later frames land in it and find() still
+  // reaches them.
+  db.write(wctx, (uint8_t*)"frame_2", 7, 0, 3000);
+  {
+    nanots_iterator iter("nanots_test_4mb.nts", "flush_stream");
+    RTF_ASSERT(iter.find(3000));
+    RTF_ASSERT(iter.valid());
+    RTF_ASSERT(std::string((char*)iter->data, iter->size) == "frame_2");
+  }
+
+  RTF_ASSERT(wctx.close() == 0);
+  RTF_ASSERT(wctx.flush() == 0);  // after close: a no-op
+}

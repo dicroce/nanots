@@ -1734,12 +1734,6 @@ int write_context::close() noexcept {
     return 0;
   _closed = true;
 
-  try {
-    std::lock_guard<std::mutex> g(current_stream_tags_lok);
-    current_stream_tags.erase(file_name + ":" + stream_tag);
-  } catch (...) {
-  }
-
   int rc = 0;
 
   if (last_timestamp && current_block) {
@@ -1770,6 +1764,17 @@ int write_context::close() noexcept {
   }
 
   current_block.reset();
+  mm = nts_memory_map();
+  file = nts_file();
+
+  // Release the stream tag only now that the block is finalized, so a new
+  // writer for this stream can't start while this one's block is still open.
+  try {
+    std::lock_guard<std::mutex> g(current_stream_tags_lok);
+    current_stream_tags.erase(file_name + ":" + stream_tag);
+  } catch (...) {
+  }
+
   return rc;
 }
 
@@ -2069,6 +2074,11 @@ void nanots_writer::write(write_context& wctx,
                           uint32_t flags,
                           int64_t timestamp,
                           int64_t secondary_key) {
+  // A closed context no longer owns its stream tag, and nothing would ever
+  // finalize a block it opened.
+  if (wctx._closed)
+    throw nanots_exception(NANOTS_EC_INVALID_ARGUMENT, "Write to a closed write_context.", __FILE__, __LINE__);
+
   // Composite (timestamp, secondary_key) must be strictly greater than the
   // previous frame's composite. When the caller doesn't pass a sec_key, the
   // default is NANOTS_SEC_KEY_UNSET (= INT64_MIN); for a stream that never
@@ -3436,13 +3446,13 @@ nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
 nanots_ec_t nanots_write_context_flush(nanots_write_context_t context) {
   if (!context)
     return NANOTS_EC_INVALID_ARGUMENT;
-  return (context->context.flush() == 0) ? NANOTS_EC_OK : NANOTS_EC_UNKNOWN;
+  return (context->context.flush() == 0) ? NANOTS_EC_OK : NANOTS_EC_IO_ERROR;
 }
 
 nanots_ec_t nanots_write_context_close(nanots_write_context_t context) {
   if (!context)
     return NANOTS_EC_INVALID_ARGUMENT;
-  return (context->context.close() == 0) ? NANOTS_EC_OK : NANOTS_EC_UNKNOWN;
+  return (context->context.close() == 0) ? NANOTS_EC_OK : NANOTS_EC_IO_ERROR;
 }
 
 void nanots_write_context_destroy(nanots_write_context_t context) {

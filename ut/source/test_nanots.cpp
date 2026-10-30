@@ -3408,6 +3408,13 @@ void test_nanots::test_nanots_write_context_close() {
   RTF_ASSERT(wctx.close() == 0);
   RTF_ASSERT(wctx.close() == 0);  // a second close is a no-op
 
+  // close() let go of the block's mapping without waiting for the destructor.
+  RTF_ASSERT(wctx.mm.map() == nullptr);
+
+  // A closed context can't be written to: it no longer owns the stream, and
+  // nothing would ever finalize a block it opened.
+  RTF_ASSERT_THROWS(db.write(wctx, (uint8_t*)"late", 4, 0, 2000), nanots_exception);
+
   // close() released the stream tag while the context object is still alive.
   RTF_ASSERT_NO_THROW(db.create_write_context("close_stream", "reopened"));
 

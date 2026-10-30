@@ -61,6 +61,7 @@ pub enum ErrorCode {
     NotFound = 13,
     BadMagic = 14,
     BadVersion = 15,
+    IoError = 16,
 }
 
 impl ErrorCode {
@@ -81,6 +82,7 @@ impl ErrorCode {
             13 => ErrorCode::NotFound,
             14 => ErrorCode::BadMagic,
             15 => ErrorCode::BadVersion,
+            16 => ErrorCode::IoError,
             _ => ErrorCode::Unknown,
         }
     }
@@ -105,6 +107,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::NotFound => "Not found",
             ErrorCode::BadMagic => "Not a nanots v2 file (bad magic)",
             ErrorCode::BadVersion => "Unsupported nanots format version",
+            ErrorCode::IoError => "Storage I/O error",
         };
         write!(f, "{}", msg)
     }

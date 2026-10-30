@@ -22,7 +22,8 @@ enum nanots_ec_t {
   NANOTS_EC_UNKNOWN = 12,
   NANOTS_EC_NOT_FOUND = 13,
   NANOTS_EC_BAD_MAGIC = 14,
-  NANOTS_EC_BAD_VERSION = 15
+  NANOTS_EC_BAD_VERSION = 15,
+  NANOTS_EC_IO_ERROR = 16
 };
 
 }
@@ -327,6 +328,7 @@ struct NANOTS_API write_context final {
     // release the stream tag), but the caller learns whether it worked.
     // Returns 0 or a positive errno; never throws; a second call is a no-op.
     // The destructor calls it and, being noexcept, can only ignore a failure.
+    // A closed context can't be written to again: write() throws.
     int close() noexcept;
 
     ~write_context();
@@ -757,8 +759,9 @@ NANOTS_API nanots_write_context_t nanots_writer_create_context(
 );
 
 // C analogues of write_context::flush() and close(): NANOTS_EC_OK, or
-// NANOTS_EC_UNKNOWN when the storage reported an error. destroy() after
-// close() only frees the handle.
+// NANOTS_EC_IO_ERROR when the storage reported an error. destroy() after
+// close() only frees the handle; writing to a closed context returns
+// NANOTS_EC_INVALID_ARGUMENT.
 NANOTS_API nanots_ec_t nanots_write_context_flush(nanots_write_context_t context);
 NANOTS_API nanots_ec_t nanots_write_context_close(nanots_write_context_t context);
 

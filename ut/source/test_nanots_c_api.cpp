@@ -496,6 +496,9 @@ void test_nanots_c_api::test_c_api_write_context_flush_close() {
   RTF_ASSERT(nanots_write_context_flush(context) == NANOTS_EC_OK);
   RTF_ASSERT(nanots_write_context_close(context) == NANOTS_EC_OK);
   RTF_ASSERT(nanots_write_context_close(context) == NANOTS_EC_OK);
+  RTF_ASSERT(nanots_writer_write(writer, context, (const uint8_t*)data, 4, 0,
+                                 2000, NANOTS_SEC_KEY_UNSET) ==
+             NANOTS_EC_INVALID_ARGUMENT);
   nanots_write_context_destroy(context);
 
   // The stream tag was released by close().

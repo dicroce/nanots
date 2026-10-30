@@ -49,6 +49,7 @@ const (
 	ErrNotFound                   ErrorCode = C.NANOTS_EC_NOT_FOUND
 	ErrBadMagic                   ErrorCode = C.NANOTS_EC_BAD_MAGIC
 	ErrBadVersion                 ErrorCode = C.NANOTS_EC_BAD_VERSION
+	ErrIOError                    ErrorCode = C.NANOTS_EC_IO_ERROR
 )
 
 // SecKeyUnset is the sentinel for "no secondary key" (mirrors the C-level
@@ -104,6 +105,8 @@ func newError(code ErrorCode) error {
 		msg = "not a nanots v2 file (bad magic)"
 	case ErrBadVersion:
 		msg = "unsupported nanots format version"
+	case ErrIOError:
+		msg = "storage I/O error"
 	default:
 		msg = "unknown error"
 	}

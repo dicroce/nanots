@@ -3429,12 +3429,19 @@ void test_nanots::test_nanots_write_context_close() {
 }
 
 void test_nanots::test_nanots_write_context_close_reports_storage_failure() {
-  // The catalog deleted under a live writer: the destructor can only swallow
-  // this, close() has to report it.
-  nanots_writer db("nanots_test_4mb.nts", false);
+  // The catalog deleted under a live write context: the destructor can only
+  // swallow this, close() has to report it.
+  //
+  // The writer is released before the catalog is removed. A writer keeps its
+  // catalog connection open for its whole lifetime, and Windows will not
+  // remove an open file, so with the writer alive the delete silently fails,
+  // the catalog survives, and close() correctly succeeds. A write context
+  // outlives its writer by design (close() opens its own connection).
+  auto db = std::make_unique<nanots_writer>("nanots_test_4mb.nts", false);
 
-  auto wctx = db.create_write_context("doomed_stream", "doomed");
-  db.write(wctx, (uint8_t*)"frame", 5, 0, 1000);
+  auto wctx = db->create_write_context("doomed_stream", "doomed");
+  db->write(wctx, (uint8_t*)"frame", 5, 0, 1000);
+  db.reset();
 
   rtf_remove_file("nanots_test_4mb.db");
   rtf_remove_file("nanots_test_4mb.db-wal");

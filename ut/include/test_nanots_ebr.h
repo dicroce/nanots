@@ -16,6 +16,8 @@ class test_nanots_ebr : public test_fixture {
     TEST(test_nanots_ebr::test_stress_concurrent_writer_readers);
     TEST(test_nanots_ebr::test_ts_index_refresh_finds_new_blocks);
     TEST(test_nanots_ebr::test_blocked_reclaim_advances_past_pinned_victim);
+    TEST(test_nanots_ebr::test_concurrent_contexts_share_catalog_connection);
+    TEST(test_nanots_ebr::test_block_transition_latency_bounded);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots_ebr() throw() {}
@@ -32,6 +34,8 @@ class test_nanots_ebr : public test_fixture {
   void test_stress_concurrent_writer_readers();
   void test_ts_index_refresh_finds_new_blocks();
   void test_blocked_reclaim_advances_past_pinned_victim();
+  void test_concurrent_contexts_share_catalog_connection();
+  void test_block_transition_latency_bounded();
 };
 
 #endif

@@ -589,13 +589,35 @@ static std::optional<segment> _db_create_segment(const nts_sqlite_conn& conn,
 
 static std::optional<segment_block> _db_create_segment_block(
     const nts_sqlite_conn& conn,
-    int64_t segment_id,
-    int64_t sequence,
+    const segment& seg,
     int64_t block_id,
     int64_t block_idx,
     int64_t start_timestamp,
     int64_t start_secondary_key,
     const uint8_t* uuid) {
+  const int64_t segment_id = seg.id;
+  const int64_t sequence = seg.sequence;
+
+  // The segment row may have been deleted out from under this write context.
+  // The delete_empty_segments trigger drops a segment the moment its last
+  // segment_block goes away, and between finalizing one block and claiming
+  // the next a live context has no open block: if auto-reclaim (from this or
+  // another context) or free_blocks() takes its last finalized block in that
+  // window, the segment vanishes. Foreign keys are not enforced, so the
+  // insert below would still succeed and every later block of this stream
+  // would reference a dead segment id, invisible to readers (which join
+  // through segments) until the context was recreated. Re-creating the row
+  // under its original id, inside the same transaction, makes the catalog
+  // self-healing. AUTOINCREMENT accepts an explicit id, and sqlite_sequence is
+  // already past it, so no future segment can collide.
+  auto seg_stmt = conn.prepare(
+      "INSERT OR IGNORE INTO segments (id, stream_tag, metadata) "
+      "VALUES (?, ?, ?)");
+  seg_stmt.bind(1, segment_id)
+      .bind(2, seg.stream_tag)
+      .bind(3, seg.metadata)
+      .exec_no_result();
+
   auto stmt = conn.prepare(
       "INSERT INTO segment_blocks ("
       "segment_id, "
@@ -848,6 +870,7 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
       _n_blocks(*(uint32_t*)(_file_header_p + FILE_HEADER_N_BLOCKS_OFFSET)),
       _max_blocks(*(uint32_t*)(_file_header_p + FILE_HEADER_MAX_BLOCKS_OFFSET)),
       _auto_reclaim(auto_reclaim),
+      _conn(_database_name(file_name), true, true),
       _epoch(nanots_epoch_registry::get_or_create(file_name)) {
   // Validate v2 magic + version up front. Legacy v1 files (which had
   // block_size at offset 0) are rejected by design.
@@ -865,11 +888,23 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   if (_block_size < 4096 || _block_size > 1024 * 1024 * 1024)
     throw nanots_exception(NANOTS_EC_INVALID_BLOCK_SIZE, "Invalid block size in file header.", __FILE__, __LINE__);
 
-  auto db_name = _database_name(_file_name);
-  nts_sqlite_conn db(db_name, true, true);
-  _upgrade_db(db, _file_name);
+  // WAL + synchronous=NORMAL: a commit appends to the WAL without an fsync;
+  // only checkpoints sync. The catalog stays atomic and self-consistent
+  // across a crash or power loss, and at worst the last few catalog commits
+  // before the cut are lost. That is no weaker than the block bytes
+  // themselves, which are written through a shared mapping and never
+  // synced per frame, and every path that could observe a catalog behind
+  // the data already copes: readers check each frame's uuid against the
+  // segment_block, _validate_blocks() reconciles open blocks at startup, and
+  // _recover_orphaned_blocks() frees blocks the catalog lost track of. With
+  // FULL, each of the three or four commits on a block transition cost an
+  // fsync, a few milliseconds each on an idle SSD and far more on a disk
+  // busy with other streams.
+  _conn.exec("PRAGMA synchronous=NORMAL;");
+
+  _upgrade_db(_conn, _file_name);
   _validate_blocks(_file_name);
-  _recover_orphaned_blocks(db);
+  _recover_orphaned_blocks(_conn);
 }
 
 nanots_writer::~nanots_writer() {
@@ -905,8 +940,7 @@ nanots_writer::~nanots_writer() {
   // A destructor must not throw. If the catalog is momentarily unavailable at
   // shutdown the blocks simply stay 'reserved' and are recovered on next open.
   try {
-    nts_sqlite_conn conn(_database_name(_file_name), true, true);
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    _catalog_tx([&](const nts_sqlite_conn& conn) {
       // The predicate mirrors _recover_orphaned_blocks: only flip a block that
       // is genuinely a retired victim (reserved, no segment_block). Belt and
       // suspenders — a _ready entry is always exactly that.
@@ -1022,7 +1056,7 @@ void nanots_writer::_scan_limbo() {
   }
 }
 
-block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
+block nanots_writer::_acquire_writable_block() {
   auto take_ready = [&]() -> std::optional<block> {
     std::lock_guard<std::mutex> g(_limbo_mu);
     if (!_ready.empty()) {
@@ -1046,7 +1080,7 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
   // catalog operation; otherwise two writer instances can select the same
   // physical block (or both grow starting at the same block index).
   std::optional<block> available;
-  nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+  _catalog_tx([&](const nts_sqlite_conn& tx) {
     // Maintenance: promote aged live-writer 'reserved' rows to 'used'. Block
     // transitions are the one event every healthy writer performs regularly;
     // running the sweep here keeps catalog status labels current for
@@ -1089,7 +1123,7 @@ block nanots_writer::_acquire_writable_block(const nts_sqlite_conn& conn) {
         // SQLite's transaction serializes victim choice across writer
         // instances and write contexts; a row can only be reclaimed once.
         std::optional<block> victim;
-        nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& tx) {
+        _catalog_tx([&](const nts_sqlite_conn& tx) {
           victim = _db_reclaim_oldest_used_block(tx);
         });
 
@@ -1152,8 +1186,7 @@ void nanots_writer::write(write_context& wctx,
 
   // First write to this context: lazily create the segment row.
   if (!wctx.current_segment) {
-    nts_sqlite_conn conn(_database_name(_file_name), true, true);
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    _catalog_tx([&](const nts_sqlite_conn& conn) {
       wctx.current_segment = _db_create_segment(
           conn, wctx.stream_tag, wctx.metadata);
       if (!wctx.current_segment)
@@ -1162,22 +1195,20 @@ void nanots_writer::write(write_context& wctx,
   }
 
   if (!wctx.current_block) {
-    nts_sqlite_conn conn(_database_name(_file_name), true, true);
-
     // Acquire a physical block under EBR. The returned block is always safe
     // to overwrite: it is either a freshly-free block, a newly-grown block,
     // or a retired block that has cleared EBR safety. Acquisition uses short
     // internal IMMEDIATE transactions to serialize each catalog claim; it
     // does not hold a SQLite transaction while waiting on readers.
-    block phys = _acquire_writable_block(conn);
+    block phys = _acquire_writable_block();
 
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    _catalog_tx([&](const nts_sqlite_conn& conn) {
       uint8_t uuid[16];
       generate_entropy_id(uuid);
 
       wctx.current_block = _db_create_segment_block(
-          conn, wctx.current_segment->id, wctx.current_segment->sequence,
-          phys.id, phys.idx, timestamp, secondary_key, uuid);
+          conn, *wctx.current_segment, phys.id, phys.idx, timestamp,
+          secondary_key, uuid);
 
       if (!wctx.current_block)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
@@ -1185,7 +1216,11 @@ void nanots_writer::write(write_context& wctx,
       wctx.current_segment->sequence++;
     });
 
-    wctx.file = nts_file::open(_file_name, "r+");
+    // The data file is opened once per write context and kept open across
+    // block transitions; only the mapping moves. Reopening it per block cost
+    // several milliseconds on Windows.
+    if (!wctx.file)
+      wctx.file = nts_file::open(_file_name, "r+");
 
     wctx.mm = nts_memory_map(
         filenum(wctx.file),
@@ -1226,12 +1261,17 @@ void nanots_writer::write(write_context& wctx,
   }
 
   if (!fits) {
-    nts_sqlite_conn conn(_database_name(_file_name), true, true);
-
-    wctx.mm.flush(wctx.mm.map(), _block_size, true);
+    // Hand the finished block's dirty pages to the kernel without waiting
+    // for them to reach the platter (MS_ASYNC). A synchronous flush of a
+    // whole block here was the single largest source of write stalls on a
+    // busy disk, and it bought nothing: the block was never synced per frame
+    // while it was live, readers validate every frame's uuid, and a block is
+    // only ever zeroed for reuse (with a synchronous flush, in
+    // _recycle_block) long after it was finalized.
+    wctx.mm.flush(wctx.mm.map(), _block_size, false);
 
     int64_t end_sk = wctx.last_secondary_key.value_or(NANOTS_SEC_KEY_UNSET);
-    nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
+    _catalog_tx([&](const nts_sqlite_conn& conn) {
       _db_finalize_block(conn, wctx.current_block->id,
                          wctx.last_timestamp.value(), end_sk);
     });

@@ -2,7 +2,9 @@
 #include "test_nanots_ebr.h"
 #include "nanots.h"
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -458,4 +460,131 @@ void test_nanots_ebr::test_blocked_reclaim_advances_past_pinned_victim() {
   RTF_ASSERT_EQUAL(verify->timestamp, static_cast<int64_t>(1800));
   RTF_ASSERT(verify.find(1900));
   RTF_ASSERT_EQUAL(verify->timestamp, static_cast<int64_t>(1900));
+}
+
+// ---------------------------------------------------------------------------
+// Test: several write contexts on one writer, driven from separate threads,
+// all cycle through block transitions at once. Every transition runs its
+// catalog transactions on the writer's single persistent SQLite connection,
+// so this exercises the _conn_mu serialization (SQLite is opened NOMUTEX; an
+// unguarded shared connection would corrupt state or trip SQLITE_MISUSE).
+// Each stream's most recent window must read back intact afterwards.
+// ---------------------------------------------------------------------------
+void test_nanots_ebr::test_concurrent_contexts_share_catalog_connection() {
+  constexpr int    N_STREAMS   = 3;
+  constexpr size_t FRAME_SIZE  = 4096;
+  // ~15 frames per 64 KB block; 20 blocks' worth per stream means each
+  // stream goes through ~20 transitions and the 8-block ring reclaims
+  // constantly while the other streams are mid-transition.
+  constexpr int    N_FRAMES    = 300;
+
+  nanots_writer writer(EBR_FILE, /*auto_reclaim=*/true);
+
+  std::vector<write_context> contexts;
+  contexts.reserve(N_STREAMS);
+  for (int i = 0; i < N_STREAMS; ++i)
+    contexts.push_back(
+        writer.create_write_context("stream_" + std::to_string(i), "shared"));
+
+  std::atomic<int>  failures{0};
+  std::vector<int>  frames_written(N_STREAMS, 0);
+  std::vector<std::thread> threads;
+  threads.reserve(N_STREAMS);
+  for (int i = 0; i < N_STREAMS; ++i) {
+    threads.emplace_back([&, i]() {
+      std::vector<uint8_t> payload(FRAME_SIZE, 0);
+      int64_t ts = 1000;
+      for (int n = 0; n < N_FRAMES; ++n) {
+        _fill_payload_with_ts(payload, ts);
+        try {
+          writer.write(contexts[i], payload.data(), payload.size(), 0, ts);
+          frames_written[i] = n + 1;
+        } catch (const nanots_exception&) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
+        ts += 100;
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+
+  RTF_ASSERT_EQUAL(failures.load(), 0);
+
+  // The ring holds 8 blocks for 3 streams, and reclaim takes the oldest
+  // finalized block regardless of stream, so how much history each stream
+  // keeps depends on thread timing. What is guaranteed: each stream's open
+  // block survives, so its newest frame reads back, and everything that
+  // reads back is intact.
+  for (int i = 0; i < N_STREAMS; ++i) {
+    RTF_ASSERT_EQUAL(frames_written[i], N_FRAMES);
+    int64_t hi = 1000 + (int64_t)(N_FRAMES - 1) * 100;
+    int64_t lo = hi - 20 * 100;
+    nanots_reader reader(EBR_FILE);
+    int     got     = 0;
+    int64_t last_ts = -1;
+    bool    ok      = true;
+    reader.read("stream_" + std::to_string(i), lo, NANOTS_SEC_KEY_UNSET, hi,
+                INT64_MAX,
+                [&](const uint8_t* data, size_t size, uint32_t /*flags*/,
+                    int64_t ts, int64_t /*sec_key*/, int64_t /*block_seq*/,
+                    const std::string& /*meta*/) {
+                  if (!_verify_payload_matches_ts(data, size, ts)) ok = false;
+                  if (ts <= last_ts) ok = false;  // must stay ordered
+                  last_ts = ts;
+                  ++got;
+                });
+    printf("stream_%d: %d frames read back, last ts %lld (expected %lld)\n",
+           i, got, (long long)last_ts, (long long)hi);
+    RTF_ASSERT(ok);
+    RTF_ASSERT(got >= 1);
+    RTF_ASSERT_EQUAL(last_ts, hi);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Test: a block transition must not stall the writer. Before the persistent
+// catalog connection, synchronous=NORMAL, the reused file handle and the
+// asynchronous finalize flush, a transition cost ~30 ms on an idle SSD
+// (three connection opens, four fsync'd commits, a synchronous whole-block
+// msync and a file reopen) and 70+ ms on a disk busy with other streams.
+// It now costs a few milliseconds. The bound below is deliberately loose so
+// it holds on slow CI disks while still failing if any of those costs come
+// back; the median is used so a single OS hiccup can't fail the run.
+// ---------------------------------------------------------------------------
+void test_nanots_ebr::test_block_transition_latency_bounded() {
+  constexpr size_t FRAME_SIZE    = 4096;
+  constexpr int    N_TRANSITIONS = 40;
+  constexpr double MEDIAN_BOUND_MS = 20.0;
+
+  nanots_writer writer(EBR_FILE, /*auto_reclaim=*/true);
+  auto wctx = writer.create_write_context("stream_a", "latency");
+  std::vector<uint8_t> payload(FRAME_SIZE, 0);
+
+  // Frames per block for this block size, measured on the first block.
+  // The writes that roll over to a new block are the slow ones.
+  const size_t frames_per_block =
+      (EBR_BLOCK_SIZE - 64) / (FRAME_SIZE + 64);
+  const size_t n_frames = frames_per_block * (N_TRANSITIONS + 1);
+
+  std::vector<double> write_ms;
+  write_ms.reserve(n_frames);
+  int64_t ts = 1000;
+  for (size_t n = 0; n < n_frames; ++n) {
+    _fill_payload_with_ts(payload, ts);
+    int64_t t0 = _now_us_test();
+    writer.write(wctx, payload.data(), payload.size(), 0, ts);
+    write_ms.push_back((_now_us_test() - t0) / 1000.0);
+    ts += 100;
+  }
+
+  // A plain write is a memcpy into the mapping (microseconds), so the
+  // N_TRANSITIONS slowest writes are the block transitions. Judge their
+  // median: one OS hiccup can't fail the run, a systematic regression will.
+  std::sort(write_ms.begin(), write_ms.end(), std::greater<double>());
+  double median = write_ms[N_TRANSITIONS / 2];
+  printf("block transition latency: median=%.3f ms max=%.3f ms "
+         "(slowest %d of %zu writes)\n",
+         median, write_ms.front(), N_TRANSITIONS, write_ms.size());
+  RTF_ASSERT(median < MEDIAN_BOUND_MS);
 }

@@ -422,6 +422,16 @@ class NANOTS_API nanots_writer {
 
  private:
 
+    // Run one IMMEDIATE catalog transaction on this writer's persistent
+    // connection. The connection lock is held only for the duration of the
+    // transaction, never across a wait on readers, so write contexts on
+    // other threads only ever contend for a few hundred microseconds.
+    template <typename F>
+    void _catalog_tx(F f) {
+        std::lock_guard<std::mutex> g(_conn_mu);
+        nts_sqlite_transaction(_conn, true, f);
+    }
+
     // EBR limbo: blocks the writer has retired (catalog ops done, but bytes
     // not yet overwritten). _limbo entries that have cleared EBR safety get
     // migrated to _ready, ready to be consumed by the next acquire.
@@ -437,7 +447,7 @@ class NANOTS_API nanots_writer {
     // pass through
     // _recycle_block: either truly free (already zeroed), freshly grown, or
     // an EBR-cleared retired block.
-    block _acquire_writable_block(const nts_sqlite_conn& conn);
+    block _acquire_writable_block();
 
     // Move limbo entries that have cleared EBR safety into the ready queue.
     // Caller must NOT hold _limbo_mu.
@@ -453,6 +463,17 @@ class NANOTS_API nanots_writer {
     uint32_t _max_blocks;     // growable cap; 0 == unbounded; ignored if !growable
     bool _auto_reclaim;
     std::set<std::string> _active_stream_tags;
+
+    // One read-write catalog connection for the lifetime of the writer.
+    // Opening a connection per block transition (the old scheme) was the
+    // dominant cost of a transition: closing the last connection to a WAL
+    // database checkpoints and deletes the WAL, and the next open recreates
+    // it, so every transition paid for a checkpoint, two file creations and
+    // several fsyncs before it did any useful work. write() may be called
+    // from one thread per write_context, so the connection is guarded by
+    // _conn_mu (SQLite is opened in NOMUTEX mode).
+    nts_sqlite_conn _conn;
+    std::mutex _conn_mu;
 
     // EBR state. _epoch is shared with every iterator and writer on this file.
     std::shared_ptr<nanots_epoch_registry> _epoch;

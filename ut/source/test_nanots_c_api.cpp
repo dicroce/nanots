@@ -478,3 +478,33 @@ void test_nanots_c_api::test_c_api_query_stream_tags() {
 
   nanots_reader_destroy(reader);
 }
+
+void test_nanots_c_api::test_c_api_write_context_flush_close() {
+  RTF_ASSERT(nanots_write_context_flush(nullptr) == NANOTS_EC_INVALID_ARGUMENT);
+  RTF_ASSERT(nanots_write_context_close(nullptr) == NANOTS_EC_INVALID_ARGUMENT);
+
+  nanots_writer_t writer = nanots_writer_create("nanots_c_api_test.nts", 0);
+  RTF_ASSERT(writer != nullptr);
+
+  nanots_write_context_t context =
+      nanots_writer_create_context(writer, "close_stream", "close test");
+  RTF_ASSERT(context != nullptr);
+
+  const char* data = "test";
+  RTF_ASSERT(nanots_writer_write(writer, context, (const uint8_t*)data, 4, 0,
+                                 1000, NANOTS_SEC_KEY_UNSET) == NANOTS_EC_OK);
+  RTF_ASSERT(nanots_write_context_flush(context) == NANOTS_EC_OK);
+  RTF_ASSERT(nanots_write_context_close(context) == NANOTS_EC_OK);
+  RTF_ASSERT(nanots_write_context_close(context) == NANOTS_EC_OK);
+  RTF_ASSERT(nanots_writer_write(writer, context, (const uint8_t*)data, 4, 0,
+                                 2000, NANOTS_SEC_KEY_UNSET) ==
+             NANOTS_EC_INVALID_ARGUMENT);
+  nanots_write_context_destroy(context);
+
+  // The stream tag was released by close().
+  context = nanots_writer_create_context(writer, "close_stream", "reopened");
+  RTF_ASSERT(context != nullptr);
+  nanots_write_context_destroy(context);
+
+  nanots_writer_destroy(writer);
+}

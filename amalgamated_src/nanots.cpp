@@ -956,6 +956,7 @@ void s_to_entropy_id(const std::string& idS, uint8_t* id) {
 
 
 #include <cctype>
+#include <cerrno>
 #include <filesystem>
 
 std::mutex current_stream_tags_lok;
@@ -1671,19 +1672,81 @@ static void _recycle_block(write_context& wctx, int64_t timestamp) {
                 true);
 }
 
-write_context::~write_context() {
-  std::lock_guard<std::mutex> g(current_stream_tags_lok);
-  std::string key = file_name + ":" + stream_tag;
-  current_stream_tags.erase(key);
+write_context::write_context(write_context&& other) noexcept
+    : metadata(std::move(other.metadata)),
+      stream_tag(std::move(other.stream_tag)),
+      last_timestamp(other.last_timestamp),
+      last_secondary_key(other.last_secondary_key),
+      current_segment(std::move(other.current_segment)),
+      current_block(std::move(other.current_block)),
+      file(std::move(other.file)),
+      mm(std::move(other.mm)),
+      file_name(std::move(other.file_name)),
+      _block_size(other._block_size),
+      _closed(other._closed) {
+  other._disown();
+}
+
+write_context& write_context::operator=(write_context&& other) noexcept {
+  if (this == &other)
+    return *this;
+
+  close();  // finalize what this context still holds
+
+  metadata = std::move(other.metadata);
+  stream_tag = std::move(other.stream_tag);
+  last_timestamp = other.last_timestamp;
+  last_secondary_key = other.last_secondary_key;
+  current_segment = std::move(other.current_segment);
+  current_block = std::move(other.current_block);
+  file = std::move(other.file);
+  mm = std::move(other.mm);
+  file_name = std::move(other.file_name);
+  _block_size = other._block_size;
+  _closed = other._closed;
+
+  other._disown();
+  return *this;
+}
+
+void write_context::_disown() noexcept {
+  current_segment.reset();
+  current_block.reset();
+  last_timestamp.reset();
+  last_secondary_key.reset();
+  _closed = true;
+}
+
+int write_context::flush() noexcept {
+  if (_closed || !current_block || mm.map() == nullptr)
+    return 0;
+
+  try {
+    mm.flush(mm.map(), _block_size, true);
+  } catch (...) {
+    return EIO;
+  }
+  return 0;
+}
+
+int write_context::close() noexcept {
+  if (_closed)
+    return 0;
+  _closed = true;
+
+  int rc = 0;
 
   if (last_timestamp && current_block) {
-    // Destructors are noexcept: an exception escaping here (e.g. the database
-    // was deleted or became unwritable under a live writer) calls
-    // std::terminate. Finalizing is best effort: on failure the block is left
-    // exactly as a crash would leave it.
+    // Each step reports its own failure and the next still runs, so the
+    // catalog is left as consistent as the failure allows (e.g. the database
+    // was deleted or became unwritable under a live writer).
     try {
       mm.flush(mm.map(), _block_size, true);
+    } catch (...) {
+      rc = EIO;
+    }
 
+    try {
       auto db_name = _database_name(file_name);
       nts_sqlite_conn conn(db_name, true, true);
 
@@ -1695,8 +1758,31 @@ write_context::~write_context() {
         _db_trans_finalize_reserved_blocks(conn);
       });
     } catch (...) {
+      if (rc == 0)
+        rc = EIO;
     }
   }
+
+  current_block.reset();
+  mm = nts_memory_map();
+  file = nts_file();
+
+  // Release the stream tag only now that the block is finalized, so a new
+  // writer for this stream can't start while this one's block is still open.
+  try {
+    std::lock_guard<std::mutex> g(current_stream_tags_lok);
+    current_stream_tags.erase(file_name + ":" + stream_tag);
+  } catch (...) {
+  }
+
+  return rc;
+}
+
+write_context::~write_context() {
+  // Destructors are noexcept: finalizing is best effort, and on failure the
+  // block is left exactly as a crash would leave it. A caller that needs to
+  // know calls close() first.
+  close();
 }
 
 nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
@@ -1988,6 +2074,11 @@ void nanots_writer::write(write_context& wctx,
                           uint32_t flags,
                           int64_t timestamp,
                           int64_t secondary_key) {
+  // A closed context no longer owns its stream tag, and nothing would ever
+  // finalize a block it opened.
+  if (wctx._closed)
+    throw nanots_exception(NANOTS_EC_INVALID_ARGUMENT, "Write to a closed write_context.", __FILE__, __LINE__);
+
   // Composite (timestamp, secondary_key) must be strictly greater than the
   // previous frame's composite. When the caller doesn't pass a sec_key, the
   // default is NANOTS_SEC_KEY_UNSET (= INT64_MIN); for a stream that never
@@ -3350,6 +3441,18 @@ nanots_write_context_t nanots_writer_create_context(nanots_writer_t writer,
   } catch (...) {
     return nullptr;
   }
+}
+
+nanots_ec_t nanots_write_context_flush(nanots_write_context_t context) {
+  if (!context)
+    return NANOTS_EC_INVALID_ARGUMENT;
+  return (context->context.flush() == 0) ? NANOTS_EC_OK : NANOTS_EC_IO_ERROR;
+}
+
+nanots_ec_t nanots_write_context_close(nanots_write_context_t context) {
+  if (!context)
+    return NANOTS_EC_INVALID_ARGUMENT;
+  return (context->context.close() == 0) ? NANOTS_EC_OK : NANOTS_EC_IO_ERROR;
 }
 
 void nanots_write_context_destroy(nanots_write_context_t context) {

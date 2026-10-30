@@ -36,6 +36,7 @@ cdef extern from "nanots.h":
         NANOTS_EC_NOT_FOUND = 13
         NANOTS_EC_BAD_MAGIC = 14
         NANOTS_EC_BAD_VERSION = 15
+        NANOTS_EC_IO_ERROR = 16
 
     ctypedef struct nanots_contiguous_segment_t:
         int segment_id
@@ -187,6 +188,9 @@ class BadMagicError(NanoTSError):
 class BadVersionError(NanoTSError):
     pass
 
+class StorageIOError(NanoTSError):
+    pass
+
 # Helper function to check results and raise appropriate exceptions
 cdef void _check_result(nanots_ec_t result):
     if result == NANOTS_EC_OK:
@@ -219,6 +223,8 @@ cdef void _check_result(nanots_ec_t result):
         raise BadMagicError("Not a nanots v2 file (bad magic)")
     elif result == NANOTS_EC_BAD_VERSION:
         raise BadVersionError("Unsupported nanots format version")
+    elif result == NANOTS_EC_IO_ERROR:
+        raise StorageIOError("Storage I/O error")
     else:
         raise NanoTSError(f"Unknown error: {result}")
 

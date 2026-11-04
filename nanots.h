@@ -316,9 +316,11 @@ struct NANOTS_API write_context final {
 
     // Make the frames written so far into the open block durable, without
     // closing it: msync(MS_SYNC) of the block, which covers the frame bytes
-    // and the index counter readers navigate by. The catalog is not touched:
-    // an open block is what end_timestamp IS NULL means. Returns 0 or a
-    // positive errno; never throws; 0 when no block is open.
+    // and the index counter readers navigate by, then an fsync of the
+    // catalog's WAL, so the rows that locate this block and the blocks before
+    // it survive a power cut too. The catalog is not written: an open block is
+    // what end_timestamp IS NULL means. Returns 0 or a positive errno; never
+    // throws; 0 when no block is open.
     //
     // Without it a stream's data becomes durable only at block rollover and
     // at close, which for a sparse stream can be hours.

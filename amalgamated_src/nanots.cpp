@@ -635,6 +635,39 @@ int fallocate(FILE* file, uint64_t size) {
 #endif
 }
 
+int sync_file(const std::string& path) noexcept {
+#ifdef _WIN32
+  // FlushFileBuffers needs GENERIC_WRITE; share everything, SQLite holds the
+  // file open.
+  HANDLE h = CreateFileW(convert_multi_byte_string_to_wide_string(path).c_str(),
+                         GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    const DWORD e = GetLastError();
+    return (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 0 : EIO;
+  }
+  const int rc = FlushFileBuffers(h) ? 0 : EIO;
+  CloseHandle(h);
+  return rc;
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return (errno == ENOENT) ? 0 : ((errno != 0) ? errno : EIO);
+  int rc = 0;
+#if defined(__APPLE__)
+  // On macOS fsync() does not reach the platter; F_FULLFSYNC does.
+  if (fcntl(fd, F_FULLFSYNC) != 0 && ::fsync(fd) != 0)
+    rc = (errno != 0) ? errno : EIO;
+#else
+  if (::fsync(fd) != 0)
+    rc = (errno != 0) ? errno : EIO;
+#endif
+  ::close(fd);
+  return rc;
+#endif
+}
+
 std::string errno_string(int err) {
 #ifdef _WIN32
   char buf[256];
@@ -1748,7 +1781,13 @@ int write_context::flush() noexcept {
   } catch (...) {
     return EIO;
   }
-  return 0;
+
+  // The catalog commits with synchronous=NORMAL (see nanots_writer's
+  // constructor): a block transition reaches the WAL but not the disk. Synced
+  // block bytes whose catalog row was lost in a power cut are bytes no reader
+  // can find, so the frames flushed above are durable only once the WAL is.
+  // Block first, then the catalog that points at it.
+  return sync_file(_database_name(file_name) + "-wal");
 }
 
 int write_context::close() noexcept {
@@ -1851,7 +1890,9 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   // _recover_orphaned_blocks() frees blocks the catalog lost track of. With
   // FULL, each of the three or four commits on a block transition cost an
   // fsync, a few milliseconds each on an idle SSD and far more on a disk
-  // busy with other streams.
+  // busy with other streams. A caller that needs the catalog durable calls
+  // write_context::flush(), which syncs the WAL: one fsync per flush, not
+  // per commit.
   _conn.exec("PRAGMA synchronous=NORMAL;");
 
   _upgrade_db(_conn, _file_name);

@@ -3514,3 +3514,25 @@ void test_nanots::test_nanots_write_context_flush() {
   RTF_ASSERT(wctx.close() == 0);
   RTF_ASSERT(wctx.flush() == 0);  // after close: a no-op
 }
+
+void test_nanots::test_nanots_sync_file() {
+  // write_context::flush() syncs the catalog WAL through sync_file(); its
+  // contract is what makes that safe to call on every flush.
+  {
+    nanots_writer db("nanots_test_4mb.nts", false);
+    auto wctx = db.create_write_context("sync_stream", "sync test");
+    db.write(wctx, (uint8_t*)"frame", 5, 0, 1000);
+    RTF_ASSERT(file_exists("nanots_test_4mb.db-wal"));
+    RTF_ASSERT(sync_file("nanots_test_4mb.db-wal") == 0);
+    RTF_ASSERT(wctx.flush() == 0);
+    RTF_ASSERT(wctx.close() == 0);
+  }
+
+  // No file: nothing to sync, not an error (no WAL after a clean close).
+  RTF_ASSERT(sync_file("nanots_test_no_such_file") == 0);
+
+#ifndef _WIN32
+  // Any other failure is reported, as a positive errno.
+  RTF_ASSERT(sync_file("nanots_test_4mb.nts/not_a_dir") == ENOTDIR);
+#endif
+}

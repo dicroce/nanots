@@ -230,6 +230,10 @@ uint64_t file_size(const std::string& fileName);
 // sees ENOSPC or EFBIG. The Windows and macOS branches are normalised to the
 // same convention here so every caller can use one test (`!= 0`).
 int fallocate(FILE* file, uint64_t size);
+// Make what has been written to `path` durable (fsync / FlushFileBuffers),
+// through a descriptor of its own. RETURNS 0 on success, 0 when the file does
+// not exist (nothing to sync), and a POSITIVE errno on failure. Never throws.
+int sync_file(const std::string& path) noexcept;
 // strerror() without MSVC's C4996 deprecation warning.
 std::string errno_string(int err);
 void remove_file(const std::string& path);
@@ -694,9 +698,11 @@ struct NANOTS_API write_context final {
 
     // Make the frames written so far into the open block durable, without
     // closing it: msync(MS_SYNC) of the block, which covers the frame bytes
-    // and the index counter readers navigate by. The catalog is not touched:
-    // an open block is what end_timestamp IS NULL means. Returns 0 or a
-    // positive errno; never throws; 0 when no block is open.
+    // and the index counter readers navigate by, then an fsync of the
+    // catalog's WAL, so the rows that locate this block and the blocks before
+    // it survive a power cut too. The catalog is not written: an open block is
+    // what end_timestamp IS NULL means. Returns 0 or a positive errno; never
+    // throws; 0 when no block is open.
     //
     // Without it a stream's data becomes durable only at block rollover and
     // at close, which for a sparse stream can be hours.

@@ -631,6 +631,39 @@ int fallocate(FILE* file, uint64_t size) {
 #endif
 }
 
+int sync_file(const std::string& path) noexcept {
+#ifdef _WIN32
+  // FlushFileBuffers needs GENERIC_WRITE; share everything, SQLite holds the
+  // file open.
+  HANDLE h = CreateFileW(convert_multi_byte_string_to_wide_string(path).c_str(),
+                         GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) {
+    const DWORD e = GetLastError();
+    return (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 0 : EIO;
+  }
+  const int rc = FlushFileBuffers(h) ? 0 : EIO;
+  CloseHandle(h);
+  return rc;
+#else
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return (errno == ENOENT) ? 0 : ((errno != 0) ? errno : EIO);
+  int rc = 0;
+#if defined(__APPLE__)
+  // On macOS fsync() does not reach the platter; F_FULLFSYNC does.
+  if (fcntl(fd, F_FULLFSYNC) != 0 && ::fsync(fd) != 0)
+    rc = (errno != 0) ? errno : EIO;
+#else
+  if (::fsync(fd) != 0)
+    rc = (errno != 0) ? errno : EIO;
+#endif
+  ::close(fd);
+  return rc;
+#endif
+}
+
 std::string errno_string(int err) {
 #ifdef _WIN32
   char buf[256];

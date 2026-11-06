@@ -63,6 +63,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_write_context_close_reports_storage_failure);
   TEST(test_nanots::test_nanots_write_context_move_keeps_ownership);
   TEST(test_nanots::test_nanots_write_context_flush);
+  TEST(test_nanots::test_nanots_sync_file);
   RTF_FIXTURE_END();
 
   virtual ~test_nanots() throw() {}
@@ -130,4 +131,5 @@ class test_nanots : public test_fixture {
   void test_nanots_write_context_close_reports_storage_failure();
   void test_nanots_write_context_move_keeps_ownership();
   void test_nanots_write_context_flush();
+  void test_nanots_sync_file();
 };

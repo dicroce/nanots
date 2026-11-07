@@ -107,6 +107,10 @@ bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
 }
 
 bool nanots_epoch_registry::block_pinned(int64_t block_idx) const {
+  // The caller has just committed the catalog change that retired the block.
+  // That commit must be ordered before these pin loads, as the reader's pin
+  // is before its re-check of the catalog (see nanots_slot_guard::pin_block).
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   std::lock_guard<std::mutex> g(_slots_mu);
   for (const auto& slot_ptr : _slots) {
     if (slot_ptr->epoch.load(std::memory_order_acquire) == INACTIVE) continue;
@@ -1563,15 +1567,17 @@ static int _compare_index_entry_composite(uint8_t* index_entry_p,
   return 0;
 }
 
-// Whether the catalog still maps block_idx to a block with this uuid. The
-// writer gives a block a new uuid every time it reuses it, and deletes the
-// old catalog row when it reclaims it.
-static bool _block_still_ours(const nts_sqlite_conn& db, int64_t block_idx,
+// Whether this use of the physical block is still in the catalog: the row with
+// this id and uuid. segment_blocks.id is AUTOINCREMENT, so an id is never
+// reused, and the writer deletes the row when it reclaims the block. This is a
+// primary-key lookup; block_idx has no index and would scan the table.
+static bool _block_still_ours(const nts_sqlite_conn& db,
+                              int64_t segment_block_id,
                               const std::string& uuid_hex) {
-  auto stmt = db.prepare("SELECT uuid FROM segment_blocks WHERE block_idx = ?");
-  auto rows = stmt.bind(1, block_idx).exec();
-  return !rows.empty() && rows[0]["uuid"].has_value() &&
-         rows[0]["uuid"].value() == uuid_hex;
+  auto stmt = db.prepare(
+      "SELECT 1 AS present FROM segment_blocks WHERE id = ? AND uuid = ?");
+  auto rows = stmt.bind(1, segment_block_id).bind(2, uuid_hex).exec();
+  return !rows.empty();
 }
 
 void nanots_reader::read(
@@ -1606,6 +1612,7 @@ void nanots_reader::read(
   auto stmt = db.prepare(
       "SELECT "
       "s.metadata as metadata, "
+      "sb.id as segment_block_id, "
       "sb.sequence as block_sequence, "
       "sb.block_idx as block_idx, "
       "sb.start_timestamp as block_start_timestamp, "
@@ -1631,6 +1638,7 @@ void nanots_reader::read(
     std::string metadata = (row["metadata"])?row["metadata"].value():std::string();
     int64_t block_sequence = std::stoll(row["block_sequence"].value());
     int64_t block_idx = std::stoll(row["block_idx"].value());
+    int64_t segment_block_id = std::stoll(row["segment_block_id"].value());
     std::string uuid_hex = row["uuid"].value();
 
     uint8_t uuid[16];
@@ -1647,7 +1655,7 @@ void nanots_reader::read(
     // that the pin is published: the writer deletes the row, commits, and only
     // then looks at the pins, so either it saw our pin and keeps the block, or
     // the row is already gone/changed here. Its uuid is new on every reuse.
-    if (!_block_still_ours(db, block_idx, uuid_hex)) {
+    if (!_block_still_ours(db, segment_block_id, uuid_hex)) {
       _slot_guard.pin_block(-1);
       continue;  // recycled since the snapshot: that data is gone, skip it
     }
@@ -1902,6 +1910,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
     _stmt_get_block_by_id.emplace(_ensure_db_connection().prepare(
         "SELECT "
         "s.metadata as metadata, "
+        "sb.id as segment_block_id, "
         "sb.segment_id as segment_id, "
         "sb.sequence as block_sequence, "
         "sb.block_idx as block_idx, "
@@ -1925,6 +1934,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   auto& row = results[0];
   block_info block;
   block.block_idx = std::stoll(row["block_idx"].value());
+  block.segment_block_id = std::stoll(row["segment_block_id"].value());
   block.block_sequence = std::stoll(row["block_sequence"].value());
   block.segment_id = std::stoll(row["segment_id"].value());
   // Metadata may legitimately be the empty string, which the sqlite wrapper
@@ -2190,11 +2200,8 @@ bool nanots_iterator::_pin_block(block_info& block) {
   _slot_guard.pin_block(idx);
   _pinned_checked_idx = -1;
 
-  auto& db = _ensure_db_connection();
-  auto stmt = db.prepare("SELECT uuid FROM segment_blocks WHERE block_idx = ?");
-  auto rows = stmt.bind(1, idx).exec();
-  if (rows.empty() || !rows[0]["uuid"].has_value() ||
-      rows[0]["uuid"].value() != block.uuid_hex) {
+  if (!_block_still_ours(_ensure_db_connection(), block.segment_block_id,
+                         block.uuid_hex)) {
     _slot_guard.pin_block(-1);
     _block_cache.erase(std::to_string(block.segment_id) + ":" +
                        std::to_string(block.block_sequence));

@@ -9,6 +9,9 @@
 #include <inttypes.h>
 #include "nanots.h"
 
+// nanots.cpp, tests only: the next N segment or block-row transactions in write() fail before COMMIT.
+extern std::atomic<int> nanots_testing_failed_catalog_commits;
+
 #ifdef __linux__
 #include <signal.h>
 #include <sys/resource.h>
@@ -3286,6 +3289,73 @@ void test_nanots::test_nanots_timestamp_zero_and_null_open_block() {
                              NANOTS_SEC_KEY_UNSET, 0, INT64_MAX);
   nanots_iterator after_free(file_name, "zero_ts");
   RTF_ASSERT(!after_free.valid());
+}
+
+// A block's catalog row that fails to commit (an I/O error on the WAL, say) fails that write, and the next write
+// opens the block again: every frame written after the failure is still readable, and no block is left claimed with no
+// row. The same for a context's first segment row.
+void test_nanots::test_nanots_failed_block_commit_keeps_frames() {
+  const char* file_name = "nanots_test_16mb.nts";
+  const std::string db_name = _database_name(file_name);
+  // About ten of these fill a 1 MB block, so frame 10 opens the second block.
+  std::vector<uint8_t> frame(100000, 0x33);
+  int written = 0;
+  {
+    nanots_writer db(file_name, false);
+    auto wctx = db.create_write_context("video", "{}");
+    int64_t ts = 1000;
+    auto write = [&]() { db.write(wctx, frame.data(), frame.size(), 0, ts); ts += 10; ++written; };
+    for (int i = 0; i < 10; ++i)
+      write();
+
+    // The second block's row fails to commit: that write throws, and the next one opens a block again.
+    nanots_testing_failed_catalog_commits = 1;
+    bool threw = false;
+    try {
+      write();
+    } catch (const nanots_exception&) {
+      threw = true;
+    }
+    RTF_ASSERT(threw);
+    RTF_ASSERT(nanots_testing_failed_catalog_commits == 0);
+    for (int i = 0; i < 15; ++i)
+      write();
+
+    // A new context's segment row fails to commit: the same. Another context's segment, made meanwhile, takes the
+    // id the rolled-back one had, and the two must stay apart.
+    auto audio = db.create_write_context("audio", "{}");
+    nanots_testing_failed_catalog_commits = 1;
+    threw = false;
+    try {
+      db.write(audio, frame.data(), 10, 0, 1000);
+    } catch (const nanots_exception&) {
+      threw = true;
+    }
+    RTF_ASSERT(threw);
+    auto meta = db.create_write_context("meta", "{}");
+    db.write(meta, frame.data(), 10, 0, 1000);
+    db.write(audio, frame.data(), 10, 0, 1000);
+    db.write(audio, frame.data(), 10, 0, 1010);
+  }
+  RTF_ASSERT(written == 25);
+
+  auto count = [&](const char* tag) {
+    nanots_iterator it(file_name, tag);
+    int n = 0;
+    while (it.valid()) { ++n; ++it; }
+    return n;
+  };
+  RTF_ASSERT(count("video") == 25);
+  RTF_ASSERT(count("audio") == 2);
+  RTF_ASSERT(count("meta") == 1);
+
+  nts_sqlite_conn conn(db_name, false, false);
+  // Nothing claimed without a row: the failed transition's block went back to free.
+  auto stranded = conn.exec("SELECT COUNT(*) AS n FROM blocks WHERE status != 'free' AND "
+                            "id NOT IN (SELECT block_id FROM segment_blocks);");
+  RTF_ASSERT(std::stoll(stranded[0]["n"].value()) == 0);
+  auto audio_segments = conn.exec("SELECT COUNT(*) AS n FROM segments WHERE stream_tag = 'audio';");
+  RTF_ASSERT(std::stoll(audio_segments[0]["n"].value()) == 1);
 }
 
 // A writer that didn't close its blocks (a crash, a kill) leaves them open. The next writer closes each at its last

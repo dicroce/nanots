@@ -3,6 +3,7 @@
 
 #include "nanots.h"
 
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <filesystem>
@@ -14,6 +15,20 @@ std::set<std::string> current_stream_tags;
 // format. Version 3 makes an open segment_block explicit with SQL NULL instead
 // of overloading the valid timestamp value zero.
 static constexpr int NANOTS_CATALOG_VERSION = 3;
+
+// Tests only (ut/source/test_nanots.cpp declares it): while above zero, each
+// segment or block-row transaction in nanots_writer::write() throws at its
+// end, after its rows are written and before COMMIT, so the transaction rolls
+// back as a failed COMMIT would. Not part of the API; nothing else sets it.
+std::atomic<int> nanots_testing_failed_catalog_commits{0};
+
+static void _testing_maybe_fail_catalog_commit() {
+  int left = nanots_testing_failed_catalog_commits.load();
+  while (left > 0) {
+    if (nanots_testing_failed_catalog_commits.compare_exchange_weak(left, left - 1))
+      throw nanots_exception(NANOTS_EC_IO_ERROR, "Catalog commit failed (test).", __FILE__, __LINE__);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Epoch-Based Reclamation registry implementation
@@ -1219,14 +1234,20 @@ void nanots_writer::write(write_context& wctx,
       _block_size - (FRAME_HEADER_SIZE + INDEX_ENTRY_SIZE + BLOCK_HEADER_SIZE))
     throw nanots_exception(NANOTS_EC_ROW_SIZE_TOO_BIG, "Frame size is too large. Use a much larger block size.", __FILE__, __LINE__);
 
-  // First write to this context: lazily create the segment row.
+  // First write to this context: lazily create the segment row. The context
+  // takes it only once the transaction has committed: a failed COMMIT rolls
+  // the row (and its id) back, and a context still holding that id would
+  // later re-create it under an id another segment may since have been given.
   if (!wctx.current_segment) {
+    std::optional<segment> created;
     _catalog_tx([&](const nts_sqlite_conn& conn) {
-      wctx.current_segment = _db_create_segment(
+      created = _db_create_segment(
           conn, wctx.stream_tag, wctx.metadata);
-      if (!wctx.current_segment)
+      if (!created)
         throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT, "Unable to create segment.", __FILE__, __LINE__);
+      _testing_maybe_fail_catalog_commit();
     });
+    wctx.current_segment = std::move(created);
   }
 
   if (!wctx.current_block) {
@@ -1237,19 +1258,46 @@ void nanots_writer::write(write_context& wctx,
     // does not hold a SQLite transaction while waiting on readers.
     block phys = _acquire_writable_block();
 
-    _catalog_tx([&](const nts_sqlite_conn& conn) {
-      uint8_t uuid[16];
-      generate_entropy_id(uuid);
+    // The block's row is the only way a reader finds its frames, so the
+    // context takes the block only once the row has committed. Taken inside
+    // the transaction, a COMMIT that then failed (an I/O error on the WAL, say)
+    // rolled the row back but left the context writing into the block: every
+    // frame until the next block was stored where no reader could find it, and
+    // the next writer to open the file freed the block as an orphan.
+    std::optional<segment_block> created;
+    try {
+      _catalog_tx([&](const nts_sqlite_conn& conn) {
+        uint8_t uuid[16];
+        generate_entropy_id(uuid);
 
-      wctx.current_block = _db_create_segment_block(
-          conn, *wctx.current_segment, phys.id, phys.idx, timestamp,
-          secondary_key, uuid);
+        created = _db_create_segment_block(
+            conn, *wctx.current_segment, phys.id, phys.idx, timestamp,
+            secondary_key, uuid);
 
-      if (!wctx.current_block)
-        throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
-
-      wctx.current_segment->sequence++;
-    });
+        if (!created)
+          throw nanots_exception(NANOTS_EC_UNABLE_TO_CREATE_SEGMENT_BLOCK, "Unable to create segment block.", __FILE__, __LINE__);
+        _testing_maybe_fail_catalog_commit();
+      });
+    } catch (...) {
+      // No row points at the block, so no reader can be pinning it: it goes
+      // back to free rather than sit 'reserved' until the next writer's
+      // startup recovery. Best effort; the write still fails, and the next
+      // one tries the transition again.
+      try {
+        _catalog_tx([&](const nts_sqlite_conn& conn) {
+          conn.prepare(
+                  "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE id = ? "
+                  "AND status = 'reserved' AND id NOT IN "
+                  "(SELECT block_id FROM segment_blocks);")
+              .bind(1, phys.id)
+              .exec_no_result();
+        });
+      } catch (...) {
+      }
+      throw;
+    }
+    wctx.current_block = std::move(created);
+    wctx.current_segment->sequence++;
 
     // The data file is opened once per write context and kept open across
     // block transitions; only the mapping moves. Reopening it per block cost

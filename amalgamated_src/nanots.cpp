@@ -2243,7 +2243,10 @@ void nanots_writer::write(write_context& wctx,
       // one tries the transition again.
       try {
         _catalog_tx([&](const nts_sqlite_conn& conn) {
-          conn.prepare("UPDATE blocks SET status = 'free', reserved_at = NULL WHERE id = ?")
+          conn.prepare(
+                  "UPDATE blocks SET status = 'free', reserved_at = NULL WHERE id = ? "
+                  "AND status = 'reserved' AND id NOT IN "
+                  "(SELECT block_id FROM segment_blocks);")
               .bind(1, phys.id)
               .exec_no_result();
         });

@@ -107,6 +107,10 @@ bool nanots_epoch_registry::can_recycle(uint64_t retired_epoch,
 }
 
 bool nanots_epoch_registry::block_pinned(int64_t block_idx) const {
+  // The caller has just committed the catalog change that retired the block.
+  // That commit must be ordered before these pin loads, as the reader's pin
+  // is before its re-check of the catalog (see nanots_slot_guard::pin_block).
+  std::atomic_thread_fence(std::memory_order_seq_cst);
   std::lock_guard<std::mutex> g(_slots_mu);
   for (const auto& slot_ptr : _slots) {
     if (slot_ptr->epoch.load(std::memory_order_acquire) == INACTIVE) continue;
@@ -175,6 +179,9 @@ void nanots_slot_guard::pin_block(int64_t block_idx) {
   if (_slot_id == UINT32_MAX) return;
   auto& s = _registry->slot(_slot_id);
   s.pinned_block_idx.store(block_idx, std::memory_order_seq_cst);
+  // The caller re-checks the catalog next: the pin must be visible before
+  // that read, as the writer reads the pins after its catalog commit.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void nanots_slot_guard::_release() noexcept {
@@ -1560,6 +1567,19 @@ static int _compare_index_entry_composite(uint8_t* index_entry_p,
   return 0;
 }
 
+// Whether this use of the physical block is still in the catalog: the row with
+// this id and uuid. segment_blocks.id is AUTOINCREMENT, so an id is never
+// reused, and the writer deletes the row when it reclaims the block. This is a
+// primary-key lookup; block_idx has no index and would scan the table.
+static bool _block_still_ours(const nts_sqlite_conn& db,
+                              int64_t segment_block_id,
+                              const std::string& uuid_hex) {
+  auto stmt = db.prepare(
+      "SELECT 1 AS present FROM segment_blocks WHERE id = ? AND uuid = ?");
+  auto rows = stmt.bind(1, segment_block_id).bind(2, uuid_hex).exec();
+  return !rows.empty();
+}
+
 void nanots_reader::read(
     const std::string& stream_tag,
     int64_t start_timestamp,
@@ -1592,6 +1612,7 @@ void nanots_reader::read(
   auto stmt = db.prepare(
       "SELECT "
       "s.metadata as metadata, "
+      "sb.id as segment_block_id, "
       "sb.sequence as block_sequence, "
       "sb.block_idx as block_idx, "
       "sb.start_timestamp as block_start_timestamp, "
@@ -1617,6 +1638,7 @@ void nanots_reader::read(
     std::string metadata = (row["metadata"])?row["metadata"].value():std::string();
     int64_t block_sequence = std::stoll(row["block_sequence"].value());
     int64_t block_idx = std::stoll(row["block_idx"].value());
+    int64_t segment_block_id = std::stoll(row["segment_block_id"].value());
     std::string uuid_hex = row["uuid"].value();
 
     uint8_t uuid[16];
@@ -1624,6 +1646,19 @@ void nanots_reader::read(
 
     // Pin before the first dereference of this block's bytes.
     _slot_guard.pin_block(block_idx);
+
+    // The SELECT above is a snapshot taken before the scan began, and the
+    // callbacks for earlier blocks can take a while. In that time the writer
+    // may have reclaimed this block (its catalog row deleted, its pin check
+    // passed before our pin was visible) and be rewriting it. A pin only
+    // protects a block that is still the one we selected, so look again now
+    // that the pin is published: the writer deletes the row, commits, and only
+    // then looks at the pins, so either it saw our pin and keeps the block, or
+    // the row is already gone/changed here. Its uuid is new on every reuse.
+    if (!_block_still_ours(db, segment_block_id, uuid_hex)) {
+      _slot_guard.pin_block(-1);
+      continue;  // recycled since the snapshot: that data is gone, skip it
+    }
 
     auto mm = nts_memory_map(
         filenum(_file), FILE_HEADER_BLOCK_SIZE + (block_idx * _block_size),
@@ -1875,6 +1910,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
     _stmt_get_block_by_id.emplace(_ensure_db_connection().prepare(
         "SELECT "
         "s.metadata as metadata, "
+        "sb.id as segment_block_id, "
         "sb.segment_id as segment_id, "
         "sb.sequence as block_sequence, "
         "sb.block_idx as block_idx, "
@@ -1898,6 +1934,7 @@ block_info* nanots_iterator::_get_block_by_segment_and_sequence(int64_t segment_
   auto& row = results[0];
   block_info block;
   block.block_idx = std::stoll(row["block_idx"].value());
+  block.segment_block_id = std::stoll(row["segment_block_id"].value());
   block.block_sequence = std::stoll(row["block_sequence"].value());
   block.segment_id = std::stoll(row["segment_id"].value());
   // Metadata may legitimately be the empty string, which the sqlite wrapper
@@ -2157,6 +2194,23 @@ bool nanots_iterator::_refresh_committed_index_count(block_info& block) {
   return true;
 }
 
+bool nanots_iterator::_pin_block(block_info& block) {
+  if (block.block_idx == _pinned_checked_idx) return true;
+  const int64_t idx = block.block_idx;
+  _slot_guard.pin_block(idx);
+  _pinned_checked_idx = -1;
+
+  if (!_block_still_ours(_ensure_db_connection(), block.segment_block_id,
+                         block.uuid_hex)) {
+    _slot_guard.pin_block(-1);
+    _block_cache.erase(std::to_string(block.segment_id) + ":" +
+                       std::to_string(block.block_sequence));
+    return false;  // recycled since the lookup; `block` is gone
+  }
+  _pinned_checked_idx = idx;
+  return true;
+}
+
 bool nanots_iterator::_load_current_frame() {
   auto* block = _get_block_by_segment_and_sequence(_current_segment_id, _current_block_sequence);
   if (!block) {
@@ -2167,7 +2221,10 @@ bool nanots_iterator::_load_current_frame() {
   // Pin before the first dereference of the block's bytes; the writer will
   // not recycle a pinned block, which is what keeps _current_frame.data valid
   // until the next operation on this iterator.
-  _slot_guard.pin_block(block->block_idx);
+  if (!_pin_block(*block)) {
+    _valid = false;
+    return false;
+  }
 
   if (!_load_block_data(*block)) {
     _valid = false;
@@ -2285,7 +2342,10 @@ nanots_iterator& nanots_iterator::operator--() {
       return *this;
     }
 
-    _slot_guard.pin_block(prev_block->block_idx);
+    if (!_pin_block(*prev_block)) {
+      _valid = false;
+      return *this;
+    }
 
     if (!_load_block_data(*prev_block)) {
       _valid = false;
@@ -2331,7 +2391,10 @@ bool nanots_iterator::find(int64_t timestamp, int64_t secondary_key) {
 
   // Pin before the first byte dereference (committed-count read inside
   // _load_block_data, then the binary search below).
-  _slot_guard.pin_block(block->block_idx);
+  if (!_pin_block(*block)) {
+    _valid = false;
+    return false;
+  }
 
   if (!_load_block_data(*block)) {
     _valid = false;
@@ -2405,7 +2468,10 @@ bool nanots_iterator::seek_end() {
     return false;
   }
 
-  _slot_guard.pin_block(block->block_idx);
+  if (!_pin_block(*block)) {
+    _valid = false;
+    return false;
+  }
 
   if (!_load_block_data(*block)) {
     _valid = false;

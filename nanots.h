@@ -564,6 +564,9 @@ struct frame_info {
 
 struct block_info {
     int64_t block_idx{0};
+    // segment_blocks.id: AUTOINCREMENT, so never reused. Identifies this use of
+    // the physical block, unlike block_idx, which the writer reuses.
+    int64_t segment_block_id{0};
     int64_t block_sequence{0};
     int64_t segment_id{0};
     std::string metadata;
@@ -664,6 +667,12 @@ class NANOTS_API nanots_iterator {
     bool _load_block_data(block_info& block);
     bool _refresh_committed_index_count(block_info& block);
     bool _load_current_frame();
+    // Pins block and checks, after the pin is visible, that the catalog
+    // still has the row (segment_block_id, uuid) we looked up: the writer deletes
+    // the row when it reclaims a block and gives a reused block a new one. A block
+    // looked up before the pin could have been recycled in between. On a
+    // mismatch it unpins, drops the stale cache entry and returns false.
+    bool _pin_block(block_info& block);
     void _select_block(const block_info& block, size_t frame_idx);
 
     std::string _file_name;
@@ -683,6 +692,9 @@ class NANOTS_API nanots_iterator {
     // Cache of visited blocks (segment_id:sequence -> block_info)
     // Using string key for simplicity: "segment_id:sequence"
     std::unordered_map<std::string, block_info> _block_cache;
+    // The block_idx this iterator has pinned and checked since it last moved
+    // its pin (-1 none): the same block needs no second check.
+    int64_t _pinned_checked_idx = -1;
 
     // Timestamp index. See BlockRange above. _ts_index_pos tracks the position
     // in _ts_index corresponding to (_current_segment_id, _current_block_sequence)

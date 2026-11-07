@@ -14,6 +14,7 @@ class test_nanots_ebr : public test_fixture {
     TEST(test_nanots_ebr::test_equivalent_paths_share_registry);
     TEST(test_nanots_ebr::test_iterator_op_advances_epoch);
     TEST(test_nanots_ebr::test_stress_concurrent_writer_readers);
+    TEST(test_nanots_ebr::test_stress_concurrent_writer_iterators);
     TEST(test_nanots_ebr::test_ts_index_refresh_finds_new_blocks);
     TEST(test_nanots_ebr::test_blocked_reclaim_advances_past_pinned_victim);
     TEST(test_nanots_ebr::test_concurrent_contexts_share_catalog_connection);
@@ -32,6 +33,7 @@ class test_nanots_ebr : public test_fixture {
   void test_equivalent_paths_share_registry();
   void test_iterator_op_advances_epoch();
   void test_stress_concurrent_writer_readers();
+  void test_stress_concurrent_writer_iterators();
   void test_ts_index_refresh_finds_new_blocks();
   void test_blocked_reclaim_advances_past_pinned_victim();
   void test_concurrent_contexts_share_catalog_connection();

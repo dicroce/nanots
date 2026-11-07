@@ -58,6 +58,7 @@ class test_nanots : public test_fixture {
   TEST(test_nanots::test_nanots_exact_max_size_frame);
   TEST(test_nanots::test_nanots_unfinalized_block_with_max_frame_survives);
   TEST(test_nanots::test_nanots_timestamp_zero_and_null_open_block);
+  TEST(test_nanots::test_nanots_writer_reports_open_blocks);
   TEST(test_nanots::test_nanots_failed_block_commit_keeps_frames);
   TEST(test_nanots::test_nanots_catalog_v2_to_v3_migration);
   TEST(test_nanots::test_nanots_write_context_close);
@@ -127,6 +128,7 @@ class test_nanots : public test_fixture {
   void test_nanots_exact_max_size_frame();
   void test_nanots_unfinalized_block_with_max_frame_survives();
   void test_nanots_timestamp_zero_and_null_open_block();
+  void test_nanots_writer_reports_open_blocks();
   void test_nanots_failed_block_commit_keeps_frames();
   void test_nanots_catalog_v2_to_v3_migration();
   void test_nanots_write_context_close();

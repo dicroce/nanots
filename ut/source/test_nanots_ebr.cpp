@@ -342,6 +342,105 @@ void test_nanots_ebr::test_stress_concurrent_writer_readers() {
 }
 
 // ---------------------------------------------------------------------------
+// Stress test: concurrent writer + iterators with auto_reclaim.
+// ---------------------------------------------------------------------------
+//
+// The same payload-vs-timestamp check as above, through nanots_iterator: each
+// reader finds a frame near the start of the newest window and walks forward
+// to the end of it, forward and then back. The iterator looks a block up in
+// the catalog and only then pins it, so the writer can recycle a block it has
+// just looked up unless the pin is checked afterwards.
+//
+void test_nanots_ebr::test_stress_concurrent_writer_iterators() {
+  constexpr size_t FRAME_SIZE   = 1024;
+  constexpr int    N_READERS    = 4;
+  constexpr int    RUN_SECONDS  = 2;
+
+  std::atomic<bool>     stop{false};
+  std::atomic<uint64_t> frames_written{0};
+  std::atomic<uint64_t> frames_read{0};
+  std::atomic<uint64_t> integrity_failures{0};
+  std::atomic<int64_t>  max_written_ts{0};
+
+  std::thread writer_thread([&]() {
+    nanots_writer writer(EBR_FILE, /*auto_reclaim=*/true);
+    auto wctx = writer.create_write_context("stream_a", "stress");
+    std::vector<uint8_t> payload(FRAME_SIZE, 0);
+
+    int64_t ts = 1000;
+    while (!stop.load(std::memory_order_relaxed)) {
+      _fill_payload_with_ts(payload, ts);
+      try {
+        writer.write(wctx, payload.data(), payload.size(), 0, ts);
+        frames_written.fetch_add(1, std::memory_order_relaxed);
+        max_written_ts.store(ts, std::memory_order_relaxed);
+        ts += 100;
+      } catch (const nanots_exception&) {
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  std::vector<std::thread> reader_threads;
+  reader_threads.reserve(N_READERS);
+  for (int r = 0; r < N_READERS; ++r) {
+    reader_threads.emplace_back([&]() {
+      while (!stop.load(std::memory_order_relaxed)) {
+        int64_t hi = max_written_ts.load(std::memory_order_relaxed);
+        if (hi < 1000) {
+          std::this_thread::yield();
+          continue;
+        }
+        int64_t lo = hi > 100000 ? hi - 100000 : 1000;
+        try {
+          nanots_iterator iter(EBR_FILE, "stream_a");
+          if (!iter.find(lo, NANOTS_SEC_KEY_UNSET)) continue;
+          int64_t last_ts = lo;
+          int steps = 0;
+          // Forward over the window...
+          while (iter.valid() && iter->timestamp <= hi && steps < 5000 &&
+                 !stop.load(std::memory_order_relaxed)) {
+            if (!_verify_payload_matches_ts(iter->data, iter->size,
+                                            iter->timestamp))
+              integrity_failures.fetch_add(1, std::memory_order_relaxed);
+            frames_read.fetch_add(1, std::memory_order_relaxed);
+            last_ts = iter->timestamp;
+            ++iter;
+            ++steps;
+          }
+          // ...and back again, which moves into earlier blocks.
+          (void)last_ts;
+          int back = 0;
+          if (iter.valid() || iter.seek_end()) {
+            while (iter.valid() && back < 2000 &&
+                   !stop.load(std::memory_order_relaxed)) {
+              if (!_verify_payload_matches_ts(iter->data, iter->size,
+                                              iter->timestamp))
+                integrity_failures.fetch_add(1, std::memory_order_relaxed);
+              frames_read.fetch_add(1, std::memory_order_relaxed);
+              --iter;
+              ++back;
+            }
+          }
+        } catch (const nanots_exception&) {
+          // Empty stream or a range recycled under us — tolerate.
+        }
+      }
+    });
+  }
+
+  std::this_thread::sleep_for(std::chrono::seconds(RUN_SECONDS));
+  stop.store(true, std::memory_order_relaxed);
+
+  writer_thread.join();
+  for (auto& t : reader_threads) t.join();
+
+  RTF_ASSERT(frames_written.load() > 100);
+  RTF_ASSERT(frames_read.load() > 100);
+  RTF_ASSERT_EQUAL(integrity_failures.load(), 0u);
+}
+
+// ---------------------------------------------------------------------------
 // Test: ts_index refresh picks up new blocks written after construction.
 // ---------------------------------------------------------------------------
 //

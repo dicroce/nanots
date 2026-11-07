@@ -1,6 +1,7 @@
 #include "test_nanots.h"
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <set>
 #include <thread>
@@ -3414,7 +3415,31 @@ void test_nanots::test_nanots_catalog_v2_to_v3_migration() {
   }
 
   // Opening any NanoTS writer performs and completes the catalog migration.
-  { nanots_writer migrated(file_name, false); }
+  // The migration's recovery is reported like the constructor's: both blocks
+  // were open in v3 terms, and each keeps its one frame.
+  {
+    nanots_writer migrated(file_name, false);
+    std::map<std::string, nanots_open_block_recovery> by_tag;
+    for (const auto& r : migrated.recovered_open_blocks())
+      by_tag[r.stream_tag] = r;
+    RTF_ASSERT(migrated.recovered_open_blocks().size() == 2);
+    RTF_ASSERT(by_tag.count("migrate_zero") == 1);
+    RTF_ASSERT(by_tag.count("migrate_positive") == 1);
+    const auto& zero = by_tag["migrate_zero"];
+    RTF_ASSERT(zero.reason == "closed");
+    RTF_ASSERT(!zero.freed);
+    RTF_ASSERT(zero.committed_frames == 1);
+    RTF_ASSERT(zero.frames_kept == 1);
+    RTF_ASSERT(zero.start_timestamp == 0);
+    RTF_ASSERT(zero.end_timestamp == 0);
+    const auto& positive = by_tag["migrate_positive"];
+    RTF_ASSERT(positive.reason == "closed");
+    RTF_ASSERT(!positive.freed);
+    RTF_ASSERT(positive.committed_frames == 1);
+    RTF_ASSERT(positive.frames_kept == 1);
+    RTF_ASSERT(positive.start_timestamp == 4242);
+    RTF_ASSERT(positive.end_timestamp == 4242);
+  }
 
   {
     nts_sqlite_conn conn(db_name, false, false);

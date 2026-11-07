@@ -3287,6 +3287,97 @@ void test_nanots::test_nanots_timestamp_zero_and_null_open_block() {
   RTF_ASSERT(!after_free.valid());
 }
 
+// A writer that didn't close its blocks (a crash, a kill) leaves them open. The next writer closes each at its last
+// good frame, or frees it, and reports every one, so the caller can log what was kept and what was lost.
+void test_nanots::test_nanots_writer_reports_open_blocks() {
+  const char* file_name = "nanots_test_16mb.nts";
+  const std::string db_name = _database_name(file_name);
+  const char* tags[] = {"closed", "cut", "gone", "empty", "big"};
+
+  {
+    nanots_writer db(file_name, false);
+    for (const char* tag : tags) {
+      auto wctx = db.create_write_context(tag, "{}");
+      std::vector<uint8_t> frame(100, 0x5a);
+      for (int i = 0; i < 10; ++i)
+        db.write(wctx, frame.data(), frame.size(), 0, 1000 + i * 10);
+    }
+  }
+
+  // As a writer that died leaves them: every block open again, then each damaged its own way.
+  auto block_of = [&](const char* tag) {
+    nts_sqlite_conn conn(db_name, false, false);
+    auto rows = conn.exec(std::string("SELECT sb.block_idx FROM segment_blocks sb JOIN segments s ON s.id = sb.segment_id "
+                                      "WHERE s.stream_tag = '") + tag + "';");
+    RTF_ASSERT(rows.size() == 1);
+    return std::stoll(rows[0]["block_idx"].value());
+  };
+  auto poke = [&](int64_t block_idx, uint64_t at, const void* p, size_t n) {
+    FILE* f = fopen(file_name, "r+b");
+    RTF_ASSERT(f != nullptr);
+    fseek(f, (long)(FILE_HEADER_BLOCK_SIZE + block_idx * (1024 * 1024) + at), SEEK_SET);
+    fwrite(p, 1, n, f);
+    fclose(f);
+  };
+  {
+    nts_sqlite_conn conn(db_name, true, true);
+    conn.exec("UPDATE segment_blocks SET end_timestamp = NULL, end_secondary_key = NULL;");
+    // No frame carries the row's uuid.
+    conn.exec("UPDATE segment_blocks SET uuid = '00000000000000000000000000000000' WHERE segment_id IN "
+              "(SELECT id FROM segments WHERE stream_tag = 'gone');");
+  }
+  const uint64_t zero = 0;
+  // The last frame's index entry lost: kept up to the one before.
+  poke(block_of("cut"), BLOCK_HEADER_SIZE + 9 * INDEX_ENTRY_SIZE + INDEX_ENTRY_OFFSET_OFFSET, &zero, sizeof(zero));
+  // A committed count of 0, and one past half the block.
+  const uint32_t none = 0, too_many = (1024 * 1024 / 2) / INDEX_ENTRY_SIZE + 1;
+  poke(block_of("empty"), 8, &none, sizeof(none));
+  poke(block_of("big"), 8, &too_many, sizeof(too_many));
+
+  std::vector<nanots_open_block_recovery> report;
+  {
+    nanots_writer reopened(file_name, false);
+    report = reopened.recovered_open_blocks();
+  }
+  RTF_ASSERT(report.size() == 5);
+  auto find = [&](const std::string& tag) -> const nanots_open_block_recovery& {
+    for (const auto& r : report)
+      if (r.stream_tag == tag)
+        return r;
+    RTF_ASSERT(false);
+    return report.front();
+  };
+  const auto& closed = find("closed");
+  RTF_ASSERT(!closed.freed && closed.reason == "closed");
+  RTF_ASSERT(closed.start_timestamp == 1000 && closed.committed_frames == 10 && closed.frames_kept == 10);
+  RTF_ASSERT(closed.end_timestamp == 1090);
+  const auto& cut = find("cut");
+  RTF_ASSERT(!cut.freed && cut.reason == "truncated");
+  RTF_ASSERT(cut.committed_frames == 10 && cut.frames_kept == 9 && cut.end_timestamp == 1080);
+  const auto& gone = find("gone");
+  RTF_ASSERT(gone.freed && gone.reason == "no_valid_frame" && gone.committed_frames == 10 && gone.frames_kept == 0);
+  const auto& empty = find("empty");
+  RTF_ASSERT(empty.freed && empty.reason == "no_frames" && empty.committed_frames == 0);
+  const auto& big = find("big");
+  RTF_ASSERT(big.freed && big.reason == "count_too_big" && big.committed_frames == too_many);
+  RTF_ASSERT(big.start_timestamp == 1000);
+
+  // What the report says is what reads back: the kept frames, and nothing from a freed block.
+  auto count = [&](const char* tag) {
+    nanots_iterator it(file_name, tag);
+    int n = 0;
+    while (it.valid()) { ++n; ++it; }
+    return n;
+  };
+  RTF_ASSERT(count("closed") == 10);
+  RTF_ASSERT(count("cut") == 9);
+  RTF_ASSERT(count("gone") == 0 && count("empty") == 0 && count("big") == 0);
+
+  // A writer that opens a file closed cleanly reports nothing.
+  nanots_writer clean(file_name, false);
+  RTF_ASSERT(clean.recovered_open_blocks().empty());
+}
+
 // A v2 catalog cannot distinguish an open block from a finalized block ending
 // at timestamp zero. The v3 migration resolves both from the committed indexes.
 void test_nanots::test_nanots_catalog_v2_to_v3_migration() {

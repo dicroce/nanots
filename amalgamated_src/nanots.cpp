@@ -1274,7 +1274,8 @@ static bool _is_valid_frame_at_index(uint8_t* block_p, uint32_t block_size,
   return true;
 }
 
-static void _validate_blocks(const std::string& file_name) {
+static void _validate_blocks(const std::string& file_name,
+                             std::vector<nanots_open_block_recovery>* report = nullptr) {
   auto f = nts_file::open(file_name, "r+");
 
   if (!f)
@@ -1306,7 +1307,7 @@ static void _validate_blocks(const std::string& file_name) {
   while(!doneValidating) {
     if(rowsToProcess.empty()) {
       rowsToProcess = conn.exec(
-          "SELECT sb.id, sb.block_idx, sb.block_id, sb.uuid, s.stream_tag "
+          "SELECT sb.id, sb.block_idx, sb.block_id, sb.uuid, s.stream_tag, sb.start_timestamp "
           "FROM segment_blocks sb "
           "JOIN segments s ON sb.segment_id = s.id "
           "WHERE sb.end_timestamp IS NULL");
@@ -1340,8 +1341,20 @@ static void _validate_blocks(const std::string& file_name) {
       uint32_t n_valid_indexes =
           _load_committed_index_count(valid_counter);
 
+      nanots_open_block_recovery rec;
+      rec.stream_tag = row["stream_tag"].value_or("");
+      rec.start_timestamp = row["start_timestamp"].has_value() ? std::stoll(row["start_timestamp"].value()) : 0;
+      rec.committed_frames = n_valid_indexes;
+      auto freed = [&](const char* why) {
+        rec.freed = true;
+        rec.frames_kept = 0;
+        rec.reason = why;
+        if (report) report->push_back(rec);
+      };
+
       if((n_valid_indexes * INDEX_ENTRY_SIZE) >= (block_size / 2) || n_valid_indexes == 0) {
         _free_block(conn, sb_id, block_id);
+        freed(n_valid_indexes == 0 ? "no_frames" : "count_too_big");
         rowsToProcess.clear();
         continue;
       }
@@ -1357,6 +1370,7 @@ static void _validate_blocks(const std::string& file_name) {
 
       if(last_valid < 0) {
         _free_block(conn, sb_id, block_id);
+        freed("no_valid_frame");
         rowsToProcess.clear();
         continue;
       } else {
@@ -1377,7 +1391,11 @@ static void _validate_blocks(const std::string& file_name) {
               .bind(3, block_idx)
               .bind(4, uuid_hex)
               .exec_no_result();
+          rec.end_timestamp = actual_last_timestamp;
         });
+        rec.frames_kept = (uint32_t)(last_valid + 1);
+        rec.reason = rec.frames_kept == n_valid_indexes ? "closed" : "truncated";
+        if (report) report->push_back(rec);
       }
     }
   }
@@ -1439,7 +1457,8 @@ static void _set_db_version(const nts_sqlite_conn& conn, int version) {
 }
 
 static void _upgrade_db(const nts_sqlite_conn& conn,
-                        const std::string& file_name) {
+                        const std::string& file_name,
+                        std::vector<nanots_open_block_recovery>* report = nullptr) {
   auto current_version = _get_db_version(conn);
 
   // The v2 binary format is still current, but pre-v2 catalog schemas remain
@@ -1478,7 +1497,7 @@ static void _upgrade_db(const nts_sqlite_conn& conn,
             "WHERE end_timestamp = 0;");
       });
 
-      _validate_blocks(file_name);
+      _validate_blocks(file_name, report);
 
       nts_sqlite_transaction(conn, true, [&](const nts_sqlite_conn& conn) {
         _set_db_version(conn, NANOTS_CATALOG_VERSION);
@@ -1895,8 +1914,9 @@ nanots_writer::nanots_writer(const std::string& file_name, bool auto_reclaim)
   // per commit.
   _conn.exec("PRAGMA synchronous=NORMAL;");
 
-  _upgrade_db(_conn, _file_name);
-  _validate_blocks(_file_name);
+  // Both may close or free open blocks a writer that didn't close left behind: each is recorded for the caller.
+  _upgrade_db(_conn, _file_name, &_recovered_open_blocks);
+  _validate_blocks(_file_name, &_recovered_open_blocks);
   _recover_orphaned_blocks(_conn);
 }
 

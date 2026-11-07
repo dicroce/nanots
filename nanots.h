@@ -351,6 +351,25 @@ struct NANOTS_API write_context final {
     void _disown() noexcept;
 };
 
+// An open block the writer found when it opened the file: a writer that didn't close it (a crash, a kill, a power
+// loss) left it without an end. The writer closes it at its last good frame, or frees it when nothing in it can be
+// read. Either way the frames after that point are gone, so a caller should log every one of these.
+struct nanots_open_block_recovery {
+    std::string stream_tag;
+    int64_t start_timestamp{0};
+    // The committed frame count read from the block, before any truncation.
+    uint32_t committed_frames{0};
+    // Frames kept; 0 when the block was freed.
+    uint32_t frames_kept{0};
+    // The kept frames' last timestamp; meaningless when the block was freed.
+    int64_t end_timestamp{0};
+    bool freed{false};
+    // Why: "closed" (all frames kept), "truncated" (frames past the last good one dropped), or, when freed,
+    // "no_frames" (count 0), "count_too_big" (an index past half the block) or "no_valid_frame" (no frame carries the
+    // block's uuid).
+    std::string reason;
+};
+
 class NANOTS_API nanots_writer {
  public:
     nanots_writer(const std::string& file_name, bool auto_reclaim = false);
@@ -414,6 +433,10 @@ class NANOTS_API nanots_writer {
 
     bool is_growable() const { return _n_blocks == 0; }
 
+    // The open blocks this writer closed or freed when it opened the file (see nanots_open_block_recovery). Empty after
+    // a clean close.
+    const std::vector<nanots_open_block_recovery>& recovered_open_blocks() const { return _recovered_open_blocks; }
+
     // Grow the file by some number of blocks (BoltDB-style: doubles up to a
     // 1 GiB-per-grow cap, then linear). Caller must already hold a sqlite
     // IMMEDIATE transaction. Returns the first new block (status='reserved');
@@ -465,6 +488,7 @@ class NANOTS_API nanots_writer {
     uint32_t _max_blocks;     // growable cap; 0 == unbounded; ignored if !growable
     bool _auto_reclaim;
     std::set<std::string> _active_stream_tags;
+    std::vector<nanots_open_block_recovery> _recovered_open_blocks;
 
     // One read-write catalog connection for the lifetime of the writer.
     // Opening a connection per block transition (the old scheme) was the
